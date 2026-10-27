@@ -6,83 +6,78 @@
 
 use std::path::{Path, PathBuf};
 
-use futures::{Future, Sink, Stream, future};
-
-use tokio_core::reactor::Core;
-use tokio_io::AsyncRead;
-use tokio_io::codec::{FramedRead, FramedWrite};
-
-use tokio_uds::UnixStream;
-
 use clap::ArgMatches;
-
-use errors::*;
-
+use futures::{SinkExt, StreamExt, TryFutureExt};
+use futures_ext::StreamExt as _;
 use sshrelay::{SshDecoder, SshEncoder, SshMsg, SshStream};
-use futures_ext::StreamExt;
+use tokio_util::codec::{FramedRead, FramedWrite};
+
+#[cfg(windows)]
+use mononoke::uds::UnixStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+use crate::bail;
+use crate::errors::{Error, Result};
 
 mod fdio;
 
 pub fn cmd(main: &ArgMatches, sub: &ArgMatches) -> Result<()> {
-    if sub.is_present("stdio") {
-        if let Some(repo) = main.value_of("repository") {
+    if sub.get_flag("stdio") {
+        if let Some(repo) = main.get_one::<String>("repository") {
             let mut path = PathBuf::from(repo);
             path.push(".hg");
             path.push("mononoke.sock");
-
             return ssh_relay(path);
         }
-        bail!("Missing repository");
+        return Err("Missing repository".into());
     }
-    bail!("Only stdio server is supported");
+    Err("Only stdio server is supported".into())
 }
 
 fn ssh_relay<P: AsRef<Path>>(path: P) -> Result<()> {
-    let path = path.as_ref();
+    let path = path.as_ref().to_path_buf();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?;
+    rt.block_on(relay(path))
+}
 
-    let mut reactor = Core::new()?;
-    let handle = reactor.handle();
-
-    // Get Streams for stdin/out/err
+async fn relay(path: PathBuf) -> Result<()> {
     let stdin = fdio::stdin();
     let stdout = fdio::stdout();
     let stderr = fdio::stderr();
 
-    // Open socket
-    let socket = UnixStream::connect(&path, &handle)?;
-
-    // Wrap the socket with the ssh codec
-    let (socket_read, socket_write) = socket.split();
+    let socket = UnixStream::connect(&path).await?;
+    let (socket_read, socket_write) = tokio::io::split(socket);
     let rx = FramedRead::new(socket_read, SshDecoder::new());
     let tx = FramedWrite::new(socket_write, SshEncoder::new());
 
-    // Start a task to copy from stdin to the socket
     let stdin_future = stdin
-        .map(|buf| SshMsg::new(SshStream::Stdin, buf))
+        .map(|chunk| chunk.map(|buf| SshMsg::new(SshStream::Stdin, buf)))
         .forward(tx)
         .map_err(Error::from)
-        .map(|_| ());
+        .map_ok(|_| ());
 
-    // A task to copy from the socket, then use streamfork() to split the
-    // input between stdout and stderr.
-    let stdout_future = rx.streamfork(
-        // a sink each for stdout and stderr, prefixed with With to remove the
-        // SshMsg framing and expose the raw data
-        stdout.with(|m| future::ok::<_, Error>(SshMsg::data(m))),
-        stderr.with(|m| future::ok::<_, Error>(SshMsg::data(m))),
-        |msg| -> Result<bool> {
-            // Select a sink based on the stream
-            match msg.stream() {
-                SshStream::Stdout => Ok(false),
-                SshStream::Stderr => Ok(true),
-                bad => bail!("Bad stream: {:?}", bad),
-            }
-        })
-    .map(|_| ());
+    let stdout_future = rx
+        .streamfork(
+            stdout.with(|msg: SshMsg| futures::future::ready(Ok::<_, Error>(msg.data()))),
+            stderr.with(|msg: SshMsg| futures::future::ready(Ok::<_, Error>(msg.data()))),
+            |msg| -> Result<bool> {
+                match msg.stream() {
+                    SshStream::Stdout => Ok(false),
+                    SshStream::Stderr => Ok(true),
+                    bad => bail!("Bad stream: {:?}", bad),
+                }
+            },
+        )
+        .map_ok(|_| ());
 
-    // Run the reactor to completion and collect the results from the tasks
-    match reactor.run(stdout_future.select(stdin_future)) {
-        Ok(_) => Ok(()),
-        Err((e, _)) => Err(e),
+    match futures::future::select(stdout_future, stdin_future).await {
+        futures::future::Either::Left((Ok(_), _)) | futures::future::Either::Right((Ok(_), _)) => {
+            Ok(())
+        }
+        futures::future::Either::Left((Err(err), _)) => Err(err),
+        futures::future::Either::Right((Err(err), _)) => Err(err),
     }
 }

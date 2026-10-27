@@ -1,0 +1,25 @@
+[package]
+name = "mononoke"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-compression = { path = "../async-compression" }
+bookmarks = { path = "../bookmarks" }
+bytes = "1"
+clap = "4"
+futures = "0.3"
+futures-ext = { path = "../futures-ext" }
+hgproto = { path = "../hgproto" }
+mercurial = { path = "../mercurial" }
+mercurial-bundles = { path = "../mercurial-bundles" }
+mercurial-types = { path = "../mercurial-types" }
+slog = "2"
+slog-term = "2"
+sshrelay = { path = "../sshrelay" }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[target.'cfg(windows)'.dependencies]
+socket2 = "0.6"

@@ -4,17 +4,44 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use bytes::Bytes;
+use thiserror::Error;
 
-#[recursion_limit = "1024"]
-error_chain! {
-    errors {
+#[macro_export]
+macro_rules! bail {
+    ($e:expr) => {
+        return Err($crate::errors::Error::from($e))
+    };
+    ($fmt:expr, $($arg:tt)+) => {
+        return Err($crate::errors::Error::from(format!($fmt, $($arg)+)))
+    };
+}
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("{0}")]
+    Msg(String),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("send failed")]
+    Send,
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<&str> for Error {
+    fn from(msg: &str) -> Self {
+        Error::Msg(msg.to_owned())
     }
+}
 
-    foreign_links {
-        Fmt(::std::fmt::Error);
-        Io(::std::io::Error);
-        Nix(::nix::Error);
-        SendError(::futures::sync::mpsc::SendError<Bytes>);
+impl From<String> for Error {
+    fn from(msg: String) -> Self {
+        Error::Msg(msg)
+    }
+}
+
+impl From<futures::channel::mpsc::SendError> for Error {
+    fn from(_err: futures::channel::mpsc::SendError) -> Self {
+        Error::Send
     }
 }

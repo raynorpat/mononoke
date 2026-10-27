@@ -6,63 +6,23 @@
 
 #![deny(warnings)]
 
-#[macro_use]
-extern crate futures;
-extern crate bytes;
-extern crate tokio_core;
-extern crate tokio_io;
-extern crate tokio_uds;
-
-extern crate clap;
-
-#[macro_use]
-extern crate error_chain;
-
-#[macro_use]
-extern crate slog;
-extern crate slog_term;
-extern crate kvfilter;
-
-#[macro_use]
-extern crate maplit;
-
-extern crate async_compression;
-extern crate bookmarks;
-extern crate hgproto;
-extern crate mercurial;
-extern crate mercurial_bundles;
-extern crate mercurial_types;
-extern crate sshrelay;
-extern crate futures_ext;
-
-use std::thread;
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
 use std::panic;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::io;
-
-use futures::{Future, Sink, Stream};
-use futures::sink::Wait;
-use futures::sync::mpsc;
-
-use clap::App;
-
-use slog::{Drain, Level, LevelFilter, Logger};
-use kvfilter::KVFilter;
+use std::thread;
 
 use bytes::Bytes;
+use clap::{Arg, ArgAction, Command};
+use futures::{SinkExt, Stream, StreamExt, TryStreamExt};
+use futures_ext::{encode, StreamLayeredExt};
 use hgproto::sshproto::{HgSshCommandDecode, HgSshCommandEncode};
 use hgproto::HgService;
-use errors::ResultExt;
-use futures_ext::{StreamLayeredExt, encode};
-
-mod errors;
-mod repo;
-mod listener;
-
-use errors::*;
-
-use listener::{Stdio, ssh_server_mux};
+use mononoke::errors::{Error, Result, ResultExt};
+use mononoke::listener::{self, ssh_server_mux, Stdio};
+use mononoke::repo::{self, RepoClient};
+use slog::{crit, error, info, o, Drain, Level, Logger, OwnedKVList, Record, KV};
+use slog_term::PlainSyncDecorator;
 
 fn init_repo<P: AsRef<Path>>(parent_logger: &Logger, repopath: P) -> Result<(PathBuf, repo::Repo)> {
     let repopath = repopath.as_ref();
@@ -79,122 +39,163 @@ fn init_repo<P: AsRef<Path>>(parent_logger: &Logger, repopath: P) -> Result<(Pat
 }
 
 struct SenderBytesWrite {
-    chan: Wait<mpsc::Sender<Bytes>>,
+    chan: futures::channel::mpsc::UnboundedSender<Bytes>,
 }
 
-impl io::Write for SenderBytesWrite {
+impl Write for SenderBytesWrite {
     fn flush(&mut self) -> io::Result<()> {
-        self.chan
-            .flush()
-            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
+        Ok(())
     }
 
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.chan
-            .send(Bytes::from(buf))
-            .map(|_| buf.len())
-            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))
+            .unbounded_send(Bytes::copy_from_slice(buf))
+            .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err))?;
+        Ok(buf.len())
     }
 }
 
-// Listener thread for a specific repo
-fn repo_listen(sockname: &Path, repo: repo::Repo, listen_log: &Logger) -> Result<()> {
-    let mut core = tokio_core::reactor::Core::new()?;
-    let handle = core.handle();
-    let repo = Arc::new(repo);
+/// Pass Critical records, and records explicitly marked for the remote client.
+struct RemoteFilter<D> {
+    inner: D,
+}
 
-    let server = listener::listener(sockname, &handle)?
-        .map_err(Error::from)
-        .for_each(move |sock| {
-            match sock.peer_addr() {
-                Ok(addr) => info!(listen_log, "New connection from {:?}", addr),
-                Err(err) => error!(listen_log, "Failed to get peer addr: {}", err),
-            };
+impl<D> Drain for RemoteFilter<D>
+where
+    D: Drain<Ok = (), Err = slog::Never>,
+{
+    type Ok = ();
+    type Err = slog::Never;
 
-            // Have a connection. Extract std{in,out,err} streams for socket
-            let Stdio {
-                stdin,
-                stdout,
-                stderr,
-            } = ssh_server_mux(sock, &handle);
-
-            let stderr_write = SenderBytesWrite { chan: stderr.clone().wait() };
-            let drain = slog_term::PlainSyncDecorator::new(stderr_write);
-            let drain = slog_term::FullFormat::new(drain).build();
-            let drain = KVFilter::new(
-                drain,
-                Level::Critical,
-                vec![(String::from("remote"), hashset![String::from("true")])],
-            );
-            let drain = slog::Duplicate::new(drain, listen_log.clone()).fuse();
-            let conn_log = slog::Logger::root(drain, o![]);
-
-            // Construct a repo
-            let client = repo::RepoClient::new(repo.clone(), &conn_log);
-            let service = Arc::new(HgService::new_with_logger(client, &conn_log));
-
-            // Map stdin into mercurial requests
-            let reqs = stdin.decode(HgSshCommandDecode);
-
-            // process requests
-            let resps = reqs.and_then(move |req| service.clone().command(req));
-
-            // send responses back
-            let endres = encode::encode(resps, HgSshCommandEncode)
-                .map_err(Error::from)
-                .forward(stdout)
-                .map(|_| ());
-
-            // If we got an error at this point, then catch it, print a message and return
-            // Ok (if we allow the Error to propagate further it will shutdown the listener
-            // rather than just the connection). Unfortunately there's no way to print what the
-            // actual failing command was.
-            // TODO: seems to leave the client hanging?
-            let conn_log = conn_log.clone();
-            let endres = endres.or_else(move |err| {
-                error!(conn_log, "Command failed: {}", err; "remote" => "true");
-
-                for e in err.iter().skip(1) {
-                    error!(conn_log, "caused by: {}", e; "remote" => "true");
-                }
-                Ok(())
-            });
-
-            // Run the whole future asynchronously to allow new connections
-            handle.spawn(endres);
-
+    fn log(&self, record: &Record, values: &OwnedKVList) -> std::result::Result<(), slog::Never> {
+        if record.level().is_at_least(Level::Critical) || record_is_remote(record, values) {
+            self.inner.log(record, values)
+        } else {
             Ok(())
-        });
+        }
+    }
+}
 
-    core.run(server)?;
+fn record_is_remote(record: &Record, values: &OwnedKVList) -> bool {
+    struct Find(bool);
 
+    impl slog::Serializer for Find {
+        fn emit_arguments(&mut self, key: slog::Key, val: &std::fmt::Arguments) -> slog::Result {
+            if key == "remote" && val.to_string() == "true" {
+                self.0 = true;
+            }
+            Ok(())
+        }
+    }
+
+    let mut find = Find(false);
+    let _ = record.kv().serialize(record, &mut find);
+    let _ = values.serialize(record, &mut find);
+    find.0
+}
+
+fn log_causes(log: &Logger, err: &Error, remote: bool) {
+    let mut cause = std::error::Error::source(err);
+    while let Some(next) = cause {
+        if remote {
+            error!(log, "caused by: {}", next; "remote" => "true");
+        } else {
+            error!(log, "caused by: {}", next);
+        }
+        cause = next.source();
+    }
+}
+
+fn encoded_responses<S>(
+    reqs: S,
+    service: Arc<HgService<RepoClient>>,
+) -> impl Stream<Item = std::result::Result<Bytes, io::Error>> + Send
+where
+    S: Stream<Item = std::result::Result<hgproto::Request, hgproto::Error>> + Unpin + Send,
+{
+    let resps = reqs.and_then(move |req| {
+        let service = Arc::clone(&service);
+        service.command(req)
+    });
+    encode::encode(resps, HgSshCommandEncode)
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+}
+
+async fn serve_connection<S>(sock: S, repo: Arc<repo::Repo>, listen_log: Logger) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let Stdio {
+        stdin,
+        stdout,
+        stderr,
+    } = ssh_server_mux(sock);
+
+    let stderr_write = SenderBytesWrite { chan: stderr };
+    let decorator = PlainSyncDecorator::new(stderr_write);
+    let stderr_drain = RemoteFilter {
+        inner: slog_term::FullFormat::new(decorator).build().fuse(),
+    };
+    let drain = slog::Duplicate::new(stderr_drain, listen_log.clone()).fuse();
+    let conn_log = Logger::root(drain, o!());
+
+    let client = RepoClient::new(Arc::clone(&repo), &conn_log);
+    let service = Arc::new(HgService::new_with_logger(client, &conn_log));
+
+    let stdout = stdout.sink_map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err));
+    let drive = encoded_responses(stdin.decode(HgSshCommandDecode), service).forward(stdout);
+
+    // A command error closes this connection, not the listener.
+    if let Err(err) = drive.await {
+        let err = Error::from(err);
+        error!(conn_log, "Command failed: {}", err; "remote" => "true");
+        log_causes(&conn_log, &err, true);
+    }
     Ok(())
+}
+
+async fn repo_listen(sockname: &Path, repo: repo::Repo, listen_log: &Logger) -> Result<()> {
+    let repo = Arc::new(repo);
+    let bound = listener::listener(sockname).await?;
+
+    loop {
+        let (sock, addr) = bound.accept().await?;
+        info!(listen_log, "New connection from {:?}", addr);
+
+        let repo = Arc::clone(&repo);
+        let listen_log = listen_log.clone();
+        tokio::spawn(async move {
+            if let Err(err) = serve_connection(sock, repo, listen_log.clone()).await {
+                error!(listen_log, "connection failed: {}", err);
+                log_causes(&listen_log, &err, false);
+            }
+        });
+    }
 }
 
 fn run<'a, I>(repos: I, root_log: &Logger) -> Result<()>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    // Given the list of paths to repos:
-    // - initialize the repo
-    // - create a thread for it
-    // - wait for connections in that thread
     let threads = repos
         .into_iter()
         .map(|repopath| {
-            init_repo(root_log, &repopath).and_then(|(sockname, repo)| {
+            init_repo(root_log, repopath).and_then(|(sockname, repo)| {
                 let repopath = PathBuf::from(repopath);
                 let listen_log = root_log.new(o!("repo" => format!("{:?}", repopath)));
                 info!(listen_log, "Listening for connections");
 
-                // start a thread for each repo to own the reactor and start listening for
-                // connections
                 let t = thread::spawn(move || {
-                    // Not really sure this is actually Unwind Safe
-                    // (future version of slog will make this explicit)
-                    let unw = panic::catch_unwind(panic::AssertUnwindSafe(
-                        || repo_listen(&sockname, repo, &listen_log),
-                    ));
+                    let rt = match tokio::runtime::Builder::new_current_thread()
+                        .enable_io()
+                        .build()
+                    {
+                        Ok(rt) => rt,
+                        Err(err) => return Err(Error::from(err)),
+                    };
+                    let unw = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        rt.block_on(repo_listen(&sockname, repo, &listen_log))
+                    }));
                     match unw {
                         Err(err) => {
                             crit!(
@@ -205,7 +206,7 @@ where
                             );
                             Ok(())
                         }
-                        Ok(v) => v,
+                        Ok(result) => result,
                     }
                 });
                 Ok(t)
@@ -213,15 +214,11 @@ where
         })
         .collect::<Vec<_>>();
 
-    // Check for an report any repo initialization errors
     for err in threads.iter().filter_map(|t| t.as_ref().err()) {
         error!(root_log, "{}", err);
-        for chain_link in err.iter().skip(1) {
-            error!(root_log, "Reason: {}", chain_link)
-        }
+        log_causes(root_log, err, false);
     }
 
-    // Wait for all threads, and report any problem they have
     for thread in threads.into_iter().filter_map(Result::ok) {
         if let Err(err) = thread.join().expect("thread join failed") {
             error!(root_log, "Listener failure: {:?}", err);
@@ -232,38 +229,48 @@ where
 }
 
 fn main() {
-    let matches = App::new("mononoke server")
+    let matches = Command::new("mononoke server")
         .version("0.0.0")
         .about("serve repos")
-        .args_from_usage("[debug] -d, --debug     'print debug level output'")
-        .args_from_usage(
-            "<REPODIR>...            'paths to repo dirs (parent of .hg)'",
+        .arg(
+            Arg::new("debug")
+                .short('d')
+                .long("debug")
+                .action(ArgAction::SetTrue)
+                .help("print debug level output"),
+        )
+        .arg(
+            Arg::new("REPODIR")
+                .help("paths to repo dirs (parent of .hg)")
+                .required(true)
+                .num_args(1..)
+                .action(ArgAction::Append),
         )
         .get_matches();
 
-    let level = if matches.is_present("debug") {
+    let level = if matches.get_flag("debug") {
         Level::Debug
     } else {
         Level::Info
     };
 
-    // TODO: switch to TermDecorator, which supports color
-    let drain = slog_term::PlainSyncDecorator::new(io::stdout());
-    let drain = slog_term::FullFormat::new(drain).build();
-    let drain = LevelFilter::new(drain, level).fuse();
-    let root_log = slog::Logger::root(drain, o![]);
+    let decorator = PlainSyncDecorator::new(io::stdout());
+    let drain = slog_term::FullFormat::new(decorator).build().fuse();
+    let drain = slog::LevelFilter::new(drain, level).fuse();
+    let root_log = Logger::root(drain, o!());
 
     info!(root_log, "Starting up");
 
-    let repos = matches.values_of("REPODIR").unwrap();
+    let repos: Vec<&str> = matches
+        .get_many::<String>("REPODIR")
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .collect();
 
-    if let Err(ref e) = run(repos, &root_log) {
-        error!(root_log, "Failed: {}", e);
-
-        for e in e.iter().skip(1) {
-            error!(root_log, "caused by: {}", e);
-        }
-
+    if let Err(ref err) = run(repos, &root_log) {
+        error!(root_log, "Failed: {}", err);
+        log_causes(&root_log, err, false);
         std::process::exit(1);
     }
 }

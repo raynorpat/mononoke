@@ -11,4 +11,6 @@ members = [
     "mercurial",
     "mercurial-bundles",
     "hgproto",
+    "server",
+    "hgcli",
 ]

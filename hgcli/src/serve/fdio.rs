@@ -8,15 +8,16 @@
 //!
 //! Adapter for blocking IO source (implements std::io::Read) or
 //! sink (implements std::io::Write) to an async Stream or Sink.
-//! The async portion is implemented with a `futures::sync::mpsc`
+//! The async portion is implemented with a `futures::channel::mpsc`
 //! bounded channel pair.
-use std::thread;
 use std::io::{self, Read, Write};
+use std::thread;
 
 use bytes::Bytes;
-use futures::sync::mpsc::{Receiver, Sender, channel};
-use futures::stream::BoxStream;
-use futures::{Future, Sink, Stream};
+use futures::channel::mpsc::{channel, Receiver, Sender};
+use futures::executor::block_on;
+use futures::SinkExt;
+use futures::StreamExt;
 
 const BUFSZ: usize = 8192;
 const NUMBUFS: usize = 2;
@@ -33,7 +34,7 @@ where
 {
     /// Construct an adapter for a synchronous source.
     pub fn new(reader: R) -> Self {
-        Reader { reader: reader }
+        Reader { reader }
     }
 
     /// Return an async Stream containing chunks of data read from the
@@ -52,41 +53,31 @@ where
     ///
     /// The bufsz must be > 0; it will panic if it is zero.
     pub fn source(self, nbuffers: usize, bufsz: usize) -> Receiver<io::Result<Bytes>> {
-        let (tx, rx) = channel(nbuffers);
+        let (mut tx, rx) = channel(nbuffers);
         let mut reader = self.reader;
 
         if bufsz == 0 {
             panic!("Must have non-zero buffer size")
         }
 
-        thread::spawn(move || {
-            let mut tx = tx;
-            loop {
-                let mut buf = vec![0; bufsz];
+        thread::spawn(move || loop {
+            let mut buf = vec![0; bufsz];
 
-                // Fill the buffer, and trim it to the size we actually filled
-                let r = match reader.read(&mut buf[..]) {
-                    Ok(0) => break, // EOF
-                    Ok(sz) => {
-                        buf.truncate(sz);
-                        Ok(Bytes::from(buf))
-                    }
-                    Err(e) => Err(e),
-                };
-
-                // The send consumes the result, so remember if it was an error
-                let iserr = r.is_err();
-
-                // Send the result. This synchronously waits for the send to complete.
-                tx = match tx.send(r).wait() {
-                    Ok(tx) => tx,
-                    Err(_) => break,    // send failed - probably the Receiver was closed
-                };
-
-                // We're done
-                if iserr {
-                    break;
+            let read = match reader.read(&mut buf[..]) {
+                Ok(0) => break,
+                Ok(sz) => {
+                    buf.truncate(sz);
+                    Ok(Bytes::from(buf))
                 }
+                Err(err) => Err(err),
+            };
+
+            let iserr = read.is_err();
+            if block_on(tx.send(read)).is_err() {
+                break;
+            }
+            if iserr {
+                break;
             }
         });
 
@@ -106,7 +97,7 @@ where
 {
     /// Construct an adapter for a synchronous sink.
     pub fn new(writer: W) -> Self {
-        Writer { writer: writer }
+        Writer { writer }
     }
 
     /// Construct an async Sink
@@ -116,23 +107,16 @@ where
     /// producer and its sink.
     ///
     /// This method creates a thread to manage the synchronous sink. The thread
-    /// exits if either the `Sender` is closed or if the write fails. There's no
-    /// path to return a write failure, so the sender will simply start to get
-    /// errors.
-    ///
-    // TODO(jsgf): return a second Future with results?
+    /// exits if either the `Sender` is closed or if the write fails.
     pub fn sink(self, nbuffers: usize) -> Sender<Bytes> {
-        let (tx, rx) = channel::<Bytes>(nbuffers);
+        let (tx, mut rx) = channel::<Bytes>(nbuffers);
         let mut writer = self.writer;
 
         thread::spawn(move || {
-            // Block on the `Receiver` waiting for new things to write.
-            for buf in rx.wait().map(Result::unwrap) {
+            while let Some(buf) = block_on(rx.next()) {
                 if writer.write_all(&buf[..]).is_err() {
                     break;
-                };
-                // The writer might be buffering internally, especially if
-                // there's no newline at the end of buf.
+                }
                 if writer.flush().is_err() {
                     break;
                 }
@@ -144,11 +128,8 @@ where
 }
 
 /// Helper to produce an async stream for stdin
-pub fn stdin() -> BoxStream<Bytes, io::Error> {
-    Reader::new(io::stdin())
-        .source(NUMBUFS, BUFSZ)
-        .then(Result::unwrap)
-        .boxed()
+pub fn stdin() -> Receiver<io::Result<Bytes>> {
+    Reader::new(io::stdin()).source(NUMBUFS, BUFSZ)
 }
 
 /// Helper to produce an async sink for stdout

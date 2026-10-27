@@ -6,29 +6,27 @@
 
 //! State for a single source control Repo
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::io::Cursor;
-use std::path::Path;
-use std::sync::Arc;
-use std::collections::{HashMap, HashSet};
 use std::mem;
-
-use bytes::Bytes;
-use futures::{Async, BoxFuture, Future, IntoFuture, Poll, Stream, future, stream};
-use futures_ext::StreamExt;
-
-use slog::Logger;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use async_compression::CompressorType;
 use bookmarks::{Bookmarks, ListBookmarks};
-use mercurial;
-use mercurial::changeset;
-use mercurial_bundles::{Bundle2EncodeBuilder, parts};
-use mercurial_types::{Changeset, NULL_HASH, NodeHash, Parents, percent_encode};
-
+use bytes::Bytes;
+use futures::future::BoxFuture;
+use futures::{future, stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use hgproto::{self, GetbundleArgs, HgCommandRes, HgCommands};
+use mercurial::changeset::RevlogChangeset;
+use mercurial_bundles::{parts, Bundle2EncodeBuilder};
+use mercurial_types::{percent_encode, Changeset, NodeHash, Parents, NULL_HASH};
+use slog::{info, o, Logger};
 
-use errors::Result;
+use crate::errors::Result;
 
 pub struct Repo {
     path: String,
@@ -46,21 +44,18 @@ fn wireprotocaps() -> Vec<String> {
 }
 
 fn bundle2caps() -> String {
-    let caps = hashmap! {
-        "HG20" => vec![],
-        "listkeys" => vec![],
-        "changegroup" => vec!["02"],
-    };
+    let caps = [
+        ("HG20", Vec::<&str>::new()),
+        ("listkeys", Vec::new()),
+        ("changegroup", vec!["02"]),
+    ];
 
-    let mut encodedcaps = vec![];
-
+    let mut encodedcaps = Vec::new();
     for (key, value) in &caps {
-        let encodedkey = key.to_string();
-        if value.len() > 0 {
-            let encodedvalue = value.join(",");
-            encodedcaps.push([encodedkey, encodedvalue].join("="));
+        if value.is_empty() {
+            encodedcaps.push((*key).to_string());
         } else {
-            encodedcaps.push(encodedkey)
+            encodedcaps.push(format!("{}={}", key, value.join(",")));
         }
     }
 
@@ -73,7 +68,7 @@ impl Repo {
 
         Ok(Repo {
             path: format!("{:?}", path),
-            hgrepo: mercurial::RevlogRepo::open(&path)?,
+            hgrepo: mercurial::RevlogRepo::open(path)?,
             logger: parent_logger.new(o!("repo" => format!("{:?}", path))),
         })
     }
@@ -93,8 +88,8 @@ pub struct RepoClient {
 impl RepoClient {
     pub fn new(repo: Arc<Repo>, parent_logger: &Logger) -> Self {
         RepoClient {
-            repo: repo,
-            logger: parent_logger.new(o!()), // connection details?
+            repo,
+            logger: parent_logger.new(o!()),
         }
     }
 
@@ -102,47 +97,96 @@ impl RepoClient {
     pub fn get_logger(&self) -> &Logger {
         &self.logger
     }
+}
 
-    fn create_bundle(&self, args: GetbundleArgs) -> hgproto::Result<HgCommandRes<Bytes>> {
-        let writer = Cursor::new(Vec::new());
-        let mut bundle = Bundle2EncodeBuilder::new(writer);
-        // TODO: select an appropriate compressor. zstd appears to hang -- need to figure out
-        // whether it's a framing issue or something else.
-        bundle.set_compressor_type(CompressorType::Uncompressed);
+async fn create_bundle(repo: &Repo, args: GetbundleArgs) -> hgproto::Result<Bytes> {
+    let writer = Cursor::new(Vec::new());
+    let mut bundle = Bundle2EncodeBuilder::new(writer);
+    // TODO: select an appropriate compressor. zstd appears to hang -- need to figure out
+    // whether it's a framing issue or something else.
+    bundle.set_compressor_type(CompressorType::Uncompressed);
 
-        // TODO: generalize this to other listkey types
-        // (note: just calling &b"bookmarks"[..] doesn't work because https://fburl.com/0p0sq6kp)
-        if args.listkeys.contains(&b"bookmarks".to_vec()) {
-            let bookmarks = self.repo.hgrepo.bookmarks()?;
-            let bookmark_names = bookmarks.keys();
-            let items = bookmark_names.and_then(move |name| {
-                // For each bookmark name, grab the corresponding value.
-                bookmarks.get(&name).and_then(|result| {
-                    // If the name somehow wasn't found, it's possible a race happened. where the
-                    // bookmark was deleted from underneath. Skip it.
-                    // Boxing is necessary here to make the match arms return the same types.
-                    match result {
-                        Some((hash, _version)) => {
-                            // AsciiString doesn't currently implement AsRef<[u8]>, so switch to
-                            // Vec which does
-                            let hash: Vec<u8> = hash.to_hex().into();
-                            Ok((name, hash)).into_future().boxed()
-                        }
-                        None => future::empty().boxed(),
-                    }
-                })
-            });
-            bundle.add_part(parts::listkey_part("bookmarks", items)?);
+    // Bookmark listkeys only. History in getbundle is a later task.
+    if args
+        .listkeys
+        .iter()
+        .any(|key| key.as_slice() == b"bookmarks")
+    {
+        let bookmarks = repo.hgrepo.bookmarks()?;
+        let names: Vec<Vec<u8>> = bookmarks
+            .keys()
+            .map_err(|err| hgproto::Error::from(mercurial::Error::from(err)))
+            .try_collect()
+            .await?;
+        let mut pairs = Vec::new();
+        for name in names {
+            if let Some((hash, _version)) = bookmarks
+                .get(&name)
+                .await
+                .map_err(|err| hgproto::Error::from(mercurial::Error::from(err)))?
+            {
+                // AsciiString doesn't currently implement AsRef<[u8]>, so switch to Vec which does.
+                let hash = hash.to_hex().as_str().as_bytes().to_vec();
+                pairs.push((name, hash));
+            }
+        }
+        let items = stream::iter(pairs.into_iter().map(Ok::<_, std::io::Error>));
+        bundle.add_part(parts::listkey_part("bookmarks", items)?);
+    }
+
+    let cursor = bundle.build().await?;
+    Ok(Bytes::from(cursor.into_inner()))
+}
+
+struct ParentStream {
+    repo: Arc<Repo>,
+    n: NodeHash,
+    bottom: NodeHash,
+    wait_cs: Option<BoxFuture<'static, std::result::Result<RevlogChangeset, mercurial::Error>>>,
+}
+
+impl ParentStream {
+    fn new(repo: Arc<Repo>, top: NodeHash, bottom: NodeHash) -> Self {
+        ParentStream {
+            repo,
+            n: top,
+            bottom,
+            wait_cs: None,
+        }
+    }
+}
+
+impl Stream for ParentStream {
+    type Item = std::result::Result<NodeHash, hgproto::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.n == this.bottom || this.n == NULL_HASH {
+            return Poll::Ready(None);
         }
 
-        let encode_fut = bundle.build();
+        if this.wait_cs.is_none() {
+            this.wait_cs = Some(this.repo.hgrepo.get_changeset_by_nodeid(&this.n));
+        }
+        let cs = match this.wait_cs.as_mut().unwrap().as_mut().poll(cx) {
+            Poll::Ready(Ok(cs)) => {
+                this.wait_cs = None;
+                cs
+            }
+            Poll::Ready(Err(err)) => {
+                this.wait_cs = None;
+                return Poll::Ready(Some(Err(err.into())));
+            }
+            Poll::Pending => return Poll::Pending,
+        };
 
-        Ok(
-            encode_fut
-                .map(|cursor| Bytes::from(cursor.into_inner()))
-                .from_err()
-                .boxed(),
-        )
+        let parent = match *cs.parents() {
+            Parents::None => NULL_HASH,
+            Parents::One(p) => p,
+            Parents::Two(p, _) => p,
+        };
+        let prev_n = mem::replace(&mut this.n, parent);
+        Poll::Ready(Some(Ok(prev_n)))
     }
 }
 
@@ -151,69 +195,23 @@ impl HgCommands for RepoClient {
     fn between(&self, pairs: Vec<(NodeHash, NodeHash)>) -> HgCommandRes<Vec<Vec<NodeHash>>> {
         info!(self.logger, "between pairs {:?}", pairs);
 
-        struct ParentStream<CS> {
-            repo: Arc<Repo>,
-            n: NodeHash,
-            bottom: NodeHash,
-            wait_cs: Option<CS>,
-        };
-
-        impl<CS> ParentStream<CS> {
-            fn new(repo: Arc<Repo>, top: NodeHash, bottom: NodeHash) -> Self {
-                ParentStream {
-                    repo: repo,
-                    n: top,
-                    bottom: bottom,
-                    wait_cs: None,
-                }
-            }
-        }
-
-        impl Stream for ParentStream<BoxFuture<changeset::RevlogChangeset, mercurial::Error>> {
-            type Item = NodeHash;
-            type Error = hgproto::Error;
-
-            fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-                if self.n == self.bottom || self.n == NULL_HASH {
-                    return Ok(Async::Ready(None));
-                }
-
-                self.wait_cs = self.wait_cs
-                    .take()
-                    .or_else(|| Some(self.repo.hgrepo.get_changeset_by_nodeid(&self.n)));
-                let cs = try_ready!(self.wait_cs.as_mut().unwrap().poll());
-                self.wait_cs = None; // got it
-
-                let p = match cs.parents() {
-                    &Parents::None => NULL_HASH,
-                    &Parents::One(ref p) => *p,
-                    &Parents::Two(ref p, _) => *p,
-                };
-
-                let prev_n = mem::replace(&mut self.n, p);
-
-                Ok(Async::Ready(Some(prev_n)))
-            }
-        }
-
-        // TODO(jsgf): do pairs in parallel?
-        // TODO: directly return stream of streams
-        let repo = self.repo.clone();
-        stream::iter(pairs.into_iter().map(|p| Ok(p)))
+        let repo = Arc::clone(&self.repo);
+        stream::iter(pairs.into_iter().map(Ok::<_, hgproto::Error>))
             .and_then(move |(top, bottom)| {
-                let mut f = 1;
-                ParentStream::new(repo.clone(), top, bottom)
+                let mut step = 1usize;
+                ParentStream::new(Arc::clone(&repo), top, bottom)
                     .enumerate()
-                    .filter(move |&(i, _)| if i == f {
-                        f *= 2;
-                        true
-                    } else {
-                        false
+                    .filter(move |(i, _)| {
+                        let take = *i == step;
+                        if take {
+                            step *= 2;
+                        }
+                        future::ready(take)
                     })
-                    .map(|(_, v)| v)
-                    .collect()
+                    .map(|(_, node)| node)
+                    .try_collect::<Vec<_>>()
             })
-            .collect()
+            .try_collect::<Vec<_>>()
             .boxed()
     }
 
@@ -221,43 +219,45 @@ impl HgCommands for RepoClient {
     fn changegroup(&self, roots: Vec<NodeHash>) -> HgCommandRes<()> {
         // TODO: streaming something
         info!(self.logger, "changegroup roots {:?}", roots);
-
         future::ok(()).boxed()
     }
 
     // @wireprotocommand('heads')
     fn heads(&self) -> HgCommandRes<HashSet<NodeHash>> {
-        // Get a stream of heads and collect them into a HashSet
-        // TODO: directly return stream of heads
-        self.repo
-            .hgrepo
-            .get_heads()
-            .collect()
-            .from_err()
-            .and_then(|v| Ok(v.into_iter().collect()))
-            .boxed()
+        let repo = Arc::clone(&self.repo);
+        async move {
+            let heads = repo
+                .hgrepo
+                .get_heads()
+                .map_err(hgproto::Error::from)
+                .try_collect::<Vec<_>>()
+                .await?;
+            Ok(heads.into_iter().collect())
+        }
+        .boxed()
     }
 
     // @wireprotocommand('known', 'nodes *'), but the '*' is ignored
     fn known(&self, nodes: Vec<NodeHash>) -> HgCommandRes<Vec<bool>> {
         info!(self.logger, "known: {:?}", nodes);
-        let known_futures: Vec<_> = nodes
-            .iter()
-            .map(|node| self.repo.hgrepo.changeset_exists(node))
-            .collect();
-        future::join_all(known_futures)
-            .from_err::<hgproto::Error>()
-            .boxed()
+        let repo = Arc::clone(&self.repo);
+        async move {
+            let checks: Vec<_> = nodes
+                .iter()
+                .map(|node| repo.hgrepo.changeset_exists(node))
+                .collect();
+            future::try_join_all(checks)
+                .await
+                .map_err(hgproto::Error::from)
+        }
+        .boxed()
     }
 
     // @wireprotocommand('getbundle', '*')
     fn getbundle(&self, args: GetbundleArgs) -> HgCommandRes<Bytes> {
         info!(self.logger, "Getbundle: {:?}", args);
-
-        match self.create_bundle(args) {
-            Ok(res) => res,
-            Err(err) => Err(err).into_future().boxed(),
-        }
+        let repo = Arc::clone(&self.repo);
+        async move { create_bundle(&repo, args).await }.boxed()
     }
 
     // @wireprotocommand('hello')
@@ -273,11 +273,9 @@ impl HgCommands for RepoClient {
     }
 
     // @wireprotocommand('unbundle', 'heads')
-    fn unbundle(
-        &self,
-        heads: Vec<NodeHash>, /* , _stream: BoxStream<Vec<u8>, Error> */
-    ) -> HgCommandRes<()> {
+    fn unbundle(&self, heads: Vec<NodeHash>, _bundle: Bytes) -> HgCommandRes<Bytes> {
+        // Push is a later task. The bytes are discarded by Response::Unbundle.
         info!(self.logger, "unbundle heads {:?}", heads);
-        future::ok(()).boxed()
+        future::ok(Bytes::new()).boxed()
     }
 }
