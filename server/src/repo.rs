@@ -42,6 +42,8 @@ fn wireprotocaps() -> Vec<String> {
         "lookup".to_string(),
         "known".to_string(),
         "getbundle".to_string(),
+        "unbundle".to_string(),
+        "pushkey".to_string(),
     ]
 }
 
@@ -73,6 +75,10 @@ impl Repo {
             hgrepo: mercurial::RevlogRepo::open(path)?,
             logger: parent_logger.new(o!("repo" => format!("{:?}", path))),
         })
+    }
+
+    pub fn heads_match(&self, heads: &[NodeHash]) -> Result<bool> {
+        crate::push::heads_match(&self.hgrepo, heads)
     }
 }
 
@@ -332,9 +338,16 @@ impl HgCommands for RepoClient {
     }
 
     // @wireprotocommand('unbundle', 'heads')
-    fn unbundle(&self, heads: Vec<NodeHash>, _bundle: Bytes) -> HgCommandRes<Bytes> {
-        // Push is a later task. The bytes are discarded by Response::Unbundle.
+    fn unbundle(&self, heads: Vec<NodeHash>, bundle: Bytes) -> HgCommandRes<Bytes> {
         info!(self.logger, "unbundle heads {:?}", heads);
-        future::ok(Bytes::new()).boxed()
+        let repo = Arc::clone(&self.repo);
+        async move {
+            let applied = crate::push::apply_repo(&repo.hgrepo, &heads, &bundle)
+                .map_err(|err| hgproto::Error::from(err.to_string()))?;
+            crate::push::reply_bundle(&applied.body, &applied.changegroup_ids)
+                .await
+                .map_err(|err| hgproto::Error::from(err.to_string()))
+        }
+        .boxed()
     }
 }

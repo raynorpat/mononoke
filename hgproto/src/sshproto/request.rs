@@ -254,6 +254,24 @@ fn hashlist(input: &[u8]) -> ParseRes<'_, Vec<NodeHash>> {
     separated(input, b" ", nodehash)
 }
 
+/// `encodelist([b'force'])` is the hex of the five bytes `force`.
+fn force_unbundle_head() -> NodeHash {
+    let mut raw = [0u8; 20];
+    raw[..5].copy_from_slice(b"force");
+    NodeHash::from_bytes(&raw).expect("force head is 20 bytes")
+}
+
+pub fn unbundle_heads_are_force(heads: &[NodeHash]) -> bool {
+    heads.len() == 1 && heads[0] == force_unbundle_head()
+}
+
+fn unbundle_heads(input: &[u8]) -> ParseRes<'_, Vec<NodeHash>> {
+    if input == b"666f726365" || input == b"force" {
+        return Ok((b"", vec![force_unbundle_head()]));
+    }
+    hashlist(input)
+}
+
 fn separated<'a, T, F>(input: &'a [u8], sep: &[u8], mut one: F) -> ParseRes<'a, Vec<T>>
 where
     F: FnMut(&'a [u8]) -> ParseRes<'a, T>,
@@ -529,7 +547,7 @@ fn parse_request<'a>(input: &'a [u8], parse_params: ParamParser) -> ParseRes<'a,
     }
     if let Some(val) = attempt(parse_named(input, b"unbundle", parse_params, 1, |kv| {
         Ok(Request::Unbundle {
-            heads: parseval(&kv, "heads", hashlist)?,
+            heads: parseval(&kv, "heads", unbundle_heads)?,
             bundle: Bytes::new(),
         })
     }))? {

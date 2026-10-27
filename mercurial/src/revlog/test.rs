@@ -137,8 +137,9 @@ fn append_snapshot_round_trips_zstd() {
 
     let entry = revlog.get_entry(RevIdx::from(idx)).expect("entry");
     assert_eq!(entry.baserev, Some(RevIdx::from(idx)));
-    // Header occupies the high bytes of rev 0's offset; the data follows the 64-byte entry.
-    assert_eq!(entry.offset, 64);
+    // Rev 0's offset field is the logical data offset. The header covers its
+    // high bytes, and the chunk itself still follows the 64-byte entry.
+    assert_eq!(entry.offset, 0);
     assert_eq!(entry.nodeid, node);
     assert_eq!(entry.p1, None);
     assert_eq!(entry.p2, None);

@@ -137,14 +137,14 @@ pub enum Response {
     Known(Vec<bool>),
     Pushkey,
     Streamout,
-    Unbundle,
+    Unbundle(Bytes),
 }
 
 impl Response {
     /// Whether this represents a streaming response. Streaming responses don't have any framing.
     pub fn is_stream(&self) -> bool {
         match self {
-            Response::Getbundle(_) | Response::Unbundle => true,
+            Response::Getbundle(_) | Response::Unbundle(_) => true,
             _ => false,
         }
     }

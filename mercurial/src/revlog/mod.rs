@@ -305,6 +305,14 @@ impl Revlog {
         let mut inner = self.inner.lock().expect("lock poisoned");
         inner.append_snapshot(rev, compression)
     }
+
+    pub fn len(&self) -> Result<u32> {
+        self.inner.lock().expect("lock poisoned").revision_count()
+    }
+
+    pub fn index_of(&self, node: &NodeHash) -> Result<u32> {
+        self.get_idx_by_nodeid(node).map(|idx| idx.as_u32())
+    }
 }
 
 impl RevlogInner {
@@ -872,7 +880,16 @@ impl RevlogInner {
             rev_idx as usize * fixed
         };
         let data_off = if inline {
-            (entry_off + fixed) as u64
+            // Mercurial stores the offset into the logical data stream, the
+            // same value a `.d` file would use. Its reader adds
+            // `(rev + 1) * entry_size` to reach the bytes after this entry.
+            let logical = entry_off.checked_sub(rev_idx as usize * fixed).ok_or_else(|| {
+                ErrorKind::Revlog(format!(
+                    "inline offset {} is shorter than {} entries",
+                    entry_off, rev_idx
+                ))
+            })?;
+            logical as u64
         } else {
             self.data.as_ref().map(|d| d.as_slice().len()).unwrap_or(0) as u64
         };

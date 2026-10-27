@@ -12,17 +12,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use clap::{Arg, ArgAction, Command};
-use futures::{SinkExt, Stream, StreamExt, TryStreamExt};
-use futures_ext::{encode, StreamLayeredExt};
-use hgproto::sshproto::{HgSshCommandDecode, HgSshCommandEncode};
+use futures::{SinkExt, StreamExt};
+use hgproto::sshproto::HgSshCommandDecode;
 use hgproto::HgService;
+use mercurial_types::NodeHash;
 use mononoke::errors::{Error, Result, ResultExt};
 use mononoke::listener::{self, ssh_server_mux, Stdio};
 use mononoke::repo::{self, RepoClient};
 use slog::{crit, error, info, o, Drain, Level, Logger, OwnedKVList, Record, KV};
 use slog_term::PlainSyncDecorator;
+use tokio_util::codec::Decoder;
 
 fn init_repo<P: AsRef<Path>>(parent_logger: &Logger, repopath: P) -> Result<(PathBuf, repo::Repo)> {
     let repopath = repopath.as_ref();
@@ -106,19 +107,116 @@ fn log_causes(log: &Logger, err: &Error, remote: bool) {
     }
 }
 
-fn encoded_responses<S>(
-    reqs: S,
-    service: Arc<HgService<RepoClient>>,
-) -> impl Stream<Item = std::result::Result<Bytes, io::Error>> + Send
+fn command_failed(log: &Logger, err: Error) {
+    error!(log, "Command failed: {}", err; "remote" => "true");
+    log_causes(log, &err, true);
+}
+
+async fn read_request(
+    stdin: &mut futures::stream::BoxStream<'static, std::result::Result<Bytes, io::Error>>,
+    buf: &mut BytesMut,
+    decoder: &mut HgSshCommandDecode,
+) -> Result<Option<hgproto::Request>> {
+    loop {
+        if let Some(req) = decoder.decode(buf)? {
+            return Ok(Some(req));
+        }
+        match stdin.next().await {
+            Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
+            Some(Err(err)) => return Err(err.into()),
+            None => {
+                return if buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Err("stdin closed during command".into())
+                };
+            }
+        }
+    }
+}
+
+async fn read_line(
+    stdin: &mut futures::stream::BoxStream<'static, std::result::Result<Bytes, io::Error>>,
+    buf: &mut BytesMut,
+) -> Result<Option<BytesMut>> {
+    loop {
+        if let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
+            let mut line = buf.split_to(pos + 1);
+            line.truncate(pos);
+            return Ok(Some(line));
+        }
+        match stdin.next().await {
+            Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
+            Some(Err(err)) => return Err(err.into()),
+            None => return Ok(None),
+        }
+    }
+}
+
+async fn read_exact(
+    stdin: &mut futures::stream::BoxStream<'static, std::result::Result<Bytes, io::Error>>,
+    buf: &mut BytesMut,
+    len: usize,
+) -> Result<Option<Bytes>> {
+    while buf.len() < len {
+        match stdin.next().await {
+            Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
+            Some(Err(err)) => return Err(err.into()),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(buf.split_to(len).freeze()))
+}
+
+fn frame_len(line: &[u8]) -> Result<usize> {
+    let text = std::str::from_utf8(line).map_err(|_| Error::from("frame length is not utf-8"))?;
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("bad frame length {text:?}").into());
+    }
+    text.parse()
+        .map_err(|_| Error::from("frame length overflows"))
+}
+
+async fn read_framed_payload(
+    stdin: &mut futures::stream::BoxStream<'static, std::result::Result<Bytes, io::Error>>,
+    buf: &mut BytesMut,
+) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    loop {
+        let line = read_line(stdin, buf)
+            .await?
+            .ok_or_else(|| Error::from("stdin closed during bundle"))?;
+        let len = frame_len(&line)?;
+        if len == 0 {
+            return Ok(payload);
+        }
+        let chunk = read_exact(stdin, buf, len)
+            .await?
+            .ok_or_else(|| Error::from("stdin closed during bundle"))?;
+        payload.extend_from_slice(&chunk);
+    }
+}
+
+async fn accept_unbundle<Si>(
+    repo: &repo::Repo,
+    stdin: &mut futures::stream::BoxStream<'static, std::result::Result<Bytes, io::Error>>,
+    stdout: &mut Si,
+    buf: &mut BytesMut,
+    heads: Vec<NodeHash>,
+) -> Result<Option<hgproto::Request>>
 where
-    S: Stream<Item = std::result::Result<hgproto::Request, hgproto::Error>> + Unpin + Send,
+    Si: futures::Sink<Bytes, Error = io::Error> + Unpin,
 {
-    let resps = reqs.and_then(move |req| {
-        let service = Arc::clone(&service);
-        service.command(req)
-    });
-    encode::encode(resps, HgSshCommandEncode)
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+    if !repo.heads_match(&heads)? {
+        stdout.send(Bytes::from_static(b"2\n0\n")).await?;
+        return Ok(None);
+    }
+    stdout.send(Bytes::from_static(b"0\n")).await?;
+    let payload = read_framed_payload(stdin, buf).await?;
+    Ok(Some(hgproto::Request::Unbundle {
+        heads,
+        bundle: Bytes::from(payload),
+    }))
 }
 
 async fn serve_connection<S>(sock: S, repo: Arc<repo::Repo>, listen_log: Logger) -> Result<()>
@@ -142,14 +240,48 @@ where
     let client = RepoClient::new(Arc::clone(&repo), &conn_log);
     let service = Arc::new(HgService::new_with_logger(client, &conn_log));
 
-    let stdout = stdout.sink_map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err));
-    let drive = encoded_responses(stdin.decode(HgSshCommandDecode), service).forward(stdout);
+    let mut stdin = stdin;
+    let mut stdout = stdout.sink_map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err));
+    let mut buf = BytesMut::new();
+    let mut decoder = HgSshCommandDecode;
 
-    // A command error closes this connection, not the listener.
-    if let Err(err) = drive.await {
-        let err = Error::from(err);
-        error!(conn_log, "Command failed: {}", err; "remote" => "true");
-        log_causes(&conn_log, &err, true);
+    loop {
+        let req = match read_request(&mut stdin, &mut buf, &mut decoder).await {
+            Ok(Some(req)) => req,
+            Ok(None) => break,
+            Err(err) => {
+                command_failed(&conn_log, err);
+                break;
+            }
+        };
+
+        let req = match req {
+            hgproto::Request::Unbundle { heads, bundle } if bundle.is_empty() => {
+                match accept_unbundle(&repo, &mut stdin, &mut stdout, &mut buf, heads).await {
+                    Ok(Some(req)) => req,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        command_failed(&conn_log, err);
+                        break;
+                    }
+                }
+            }
+            other => other,
+        };
+
+        match service.command(req).await {
+            Ok(response) => {
+                let mut out = BytesMut::new();
+                hgproto::sshproto::response::encode(&response, &mut out);
+                if stdout.send(out.freeze()).await.is_err() {
+                    break;
+                }
+            }
+            Err(err) => {
+                command_failed(&conn_log, Error::from(err));
+                break;
+            }
+        }
     }
     Ok(())
 }

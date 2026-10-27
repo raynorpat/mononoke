@@ -9,6 +9,7 @@
 pub mod bundle;
 pub mod errors;
 pub mod listener;
+pub mod push;
 pub mod repo;
 
 #[cfg(windows)]

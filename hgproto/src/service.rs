@@ -91,7 +91,7 @@ impl<H: HgCommands> HgService<H> {
             }),
             Request::Streamout => map_cmd(hgcmds.stream_out(), |_| Response::Streamout),
             Request::Unbundle { heads, bundle } => {
-                map_cmd(hgcmds.unbundle(heads, bundle), |_| Response::Unbundle)
+                map_cmd(hgcmds.unbundle(heads, bundle), Response::Unbundle)
             }
         }
     }

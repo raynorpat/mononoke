@@ -220,6 +220,31 @@ impl RevlogRepo {
         &self.requirements
     }
 
+    /// Live changelog. Clones share the revlog the repo is already serving.
+    pub fn changelog_revlog(&self) -> Revlog {
+        self.inner.lock().expect("poisoned lock").changelog.clone()
+    }
+
+    /// Live manifest. Clones share the revlog the repo is already serving.
+    pub fn manifest_revlog(&self) -> Revlog {
+        self.inner.lock().expect("poisoned lock").manifest.clone()
+    }
+
+    fn file_index_path(&self, path: &Path) -> PathBuf {
+        let dotencode = self.requirements.contains(&Required::Dotencode);
+        let mut index = self
+            .basepath
+            .join("store")
+            .join("data")
+            .join(path.fsencode(dotencode));
+        if let Some(ext) = index.extension().map(|ext| ext.to_string_lossy().into_owned()) {
+            index.set_extension(format!("{}.i", ext));
+        } else {
+            index.set_extension("i");
+        }
+        index
+    }
+
     pub fn get_file_revlog(&self, path: &Path) -> Result<Revlog> {
         let mut inner = self.inner.lock().expect("poisoned lock");
 
@@ -227,22 +252,48 @@ impl RevlogRepo {
             Entry::Occupied(log) => Ok(log.get().clone()),
 
             Entry::Vacant(missing) => {
-                let dotencode = self.requirements.contains(&Required::Dotencode);
-                let mut path = self
-                    .basepath
-                    .join("store")
-                    .join("data")
-                    .join(path.fsencode(dotencode));
-                if let Some(ext) = path.extension().map(|ext| ext.to_string_lossy().into_owned()) {
-                    path.set_extension(format!("{}.i", ext));
-                } else {
-                    path.set_extension("i");
-                }
-
-                let revlog = Revlog::from_idx_data(path, None as Option<String>)?;
+                let index = self.file_index_path(path);
+                let revlog = Revlog::from_idx_data(index, None as Option<String>)?;
                 Ok(missing.insert(revlog).clone())
             }
         }
+    }
+
+    /// Filelog used for appends. Creates an empty index when the file is new.
+    pub fn file_revlog_for_append(&self, path: &Path) -> Result<Revlog> {
+        let index = self.file_index_path(path);
+        if !index.exists() {
+            if let Some(dir) = index.parent() {
+                fs::create_dir_all(dir)?;
+            }
+            fs::write(&index, [])?;
+            self.record_fncache(&index)?;
+        }
+        self.get_file_revlog(path)
+    }
+
+    fn record_fncache(&self, index: &std::path::Path) -> Result<()> {
+        if !self.requirements.contains(&Required::Fncache) {
+            return Ok(());
+        }
+        let store = self.basepath.join("store");
+        let Ok(rel) = index.strip_prefix(&store) else {
+            return Ok(());
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        let fncache = store.join("fncache");
+        let mut bytes = match fs::read(&fncache) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
+        if bytes.split(|byte| *byte == b'\n').any(|line| line == rel.as_bytes()) {
+            return Ok(());
+        }
+        bytes.extend_from_slice(rel.as_bytes());
+        bytes.push(b'\n');
+        fs::write(fncache, bytes)?;
+        Ok(())
     }
 
     pub fn bookmarks(&self) -> Result<StockBookmarks> {

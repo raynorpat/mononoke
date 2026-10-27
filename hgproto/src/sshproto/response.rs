@@ -71,7 +71,9 @@ pub fn encode_cmd(response: &Response) -> Bytes {
             Bytes::from(out)
         }
 
-        Response::Debugwireargs(res) | Response::Getbundle(res) => res.clone(),
+        Response::Debugwireargs(res) | Response::Getbundle(res) | Response::Unbundle(res) => {
+            res.clone()
+        }
 
         Response::Heads(set) => {
             let mut out = Vec::new();
@@ -87,6 +89,19 @@ pub fn encode_cmd(response: &Response) -> Bytes {
                 .map(|known| if *known { b'1' } else { b'0' })
                 .collect();
 
+            Bytes::from(out)
+        }
+
+        Response::Listkeys(pairs) => {
+            let mut names: Vec<_> = pairs.iter().collect();
+            names.sort_by(|left, right| left.0.cmp(right.0));
+            let mut out = Vec::new();
+            for (key, value) in names {
+                out.extend_from_slice(key);
+                out.push(b'\t');
+                out.extend_from_slice(value);
+                out.push(b'\n');
+            }
             Bytes::from(out)
         }
 

@@ -325,3 +325,92 @@ fn ssh_pull_learns_bookmark_without_new_changesets() {
         String::from_utf8_lossy(&logged.stdout)
     );
 }
+
+fn changelog_len(repo: &Path) -> u64 {
+    let index = repo.join(".hg").join("store").join("00changelog.i");
+    fs::metadata(&index)
+        .unwrap_or_else(|err| panic!("changelog {}: {err}", index.display()))
+        .len()
+}
+
+#[test]
+fn ssh_push_appears_in_served_repo() {
+    let temp = TempDir::new("u");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let _server = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let clone = hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "dest"], &shim);
+    assert!(
+        clone.status.success(),
+        "hg clone failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        clone.status,
+        String::from_utf8_lossy(&clone.stdout),
+        String::from_utf8_lossy(&clone.stderr),
+        read_log(&log)
+    );
+
+    let dest = temp.0.join("dest");
+    fs::write(dest.join("a.txt"), b"beta\n").expect("write beta");
+    assert_hg(
+        &hg(&dest, &["commit", "-m", "second", "-u", "test"]),
+        "commit second",
+    );
+    let push = hg_ssh(&dest, &["push"], &shim);
+    assert!(
+        push.status.success(),
+        "hg push failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        push.status,
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr),
+        read_log(&log)
+    );
+
+    let logged = hg(&repo, &["log", "-T", "{desc}"]);
+    assert_hg(&logged, "served hg log");
+    let text = String::from_utf8_lossy(&logged.stdout);
+    assert!(
+        text.contains("second"),
+        "log {text:?} does not contain second\nmononoke:\n{}",
+        read_log(&log)
+    );
+
+    assert_hg(&hg(&repo, &["update", "-C"]), "update served repo");
+    let served = fs::read(repo.join("a.txt")).expect("served a.txt");
+    assert_eq!(served, b"beta\n", "served a.txt {served:?}");
+
+    let again = hg_ssh(
+        &temp.0,
+        &["clone", "ssh://user@dummy/repo", "dest2"],
+        &shim,
+    );
+    assert!(
+        again.status.success(),
+        "second clone failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        again.status,
+        String::from_utf8_lossy(&again.stdout),
+        String::from_utf8_lossy(&again.stderr),
+        read_log(&log)
+    );
+    let cloned = fs::read(temp.0.join("dest2").join("a.txt")).expect("cloned a.txt");
+    assert_eq!(cloned, b"beta\n", "cloned a.txt {cloned:?}");
+}
+
+#[test]
+fn unbundle_rejects_mismatched_heads_without_writing() {
+    let temp = TempDir::new("m");
+    let repo = init_zstd_repo(&temp.0);
+    let before = changelog_len(&repo);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let mut raw = [0u8; 20];
+    raw[..8].copy_from_slice(&(nanos as u64).to_le_bytes());
+    raw[0] |= 0x01;
+    let head = mercurial_types::NodeHash::from_bytes(&raw).expect("fresh node");
+    let reply = mononoke::push::apply_unbundle(&repo.join(".hg"), &[head], b"")
+        .expect("apply_unbundle");
+    assert_eq!(reply, b"0\n");
+    assert_eq!(changelog_len(&repo), before, "changelog length changed");
+}

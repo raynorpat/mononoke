@@ -13,12 +13,13 @@ use std::sync::LazyLock;
 use std::task::{Context, Poll};
 
 use ascii::AsciiStr;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::future::{self, Ready};
 use futures::Stream;
 use futures_ext::{StreamExt, StreamLayeredExt, StreamWrapper, TakeWhile};
 use slog::{self, o};
 use tokio::io::AsyncRead;
+use tokio_util::codec::Decoder;
 
 use crate::bail;
 use crate::changegroup;
@@ -40,6 +41,7 @@ static KNOWN_PARAMS: LazyLock<HashMap<&'static AsciiStr, HashSet<&'static str>>>
     LazyLock::new(|| {
         let mut m: HashMap<&'static AsciiStr, HashSet<&'static str>> = HashMap::new();
         add_part!(m, "changegroup", ["version", "nbchanges", "treemanifest"]);
+        add_part!(m, "pushkey", ["namespace", "key", "old", "new"]);
         m
     });
 
@@ -74,13 +76,40 @@ impl<R> StreamWrapper<PayloadTake<R>> for PayloadBytes<R> {
     }
 }
 
+enum PayloadDecode<R> {
+    Cg2(
+        futures_ext::decode::LayeredDecode<PayloadBytes<R>, changegroup::unpacker::Cg2Unpacker>,
+    ),
+    Skip(futures_ext::decode::LayeredDecode<PayloadBytes<R>, SkipDecoder>),
+}
+
 pub struct Cg2InnerStream<R> {
-    inner: futures_ext::decode::LayeredDecode<PayloadBytes<R>, changegroup::unpacker::Cg2Unpacker>,
+    inner: PayloadDecode<R>,
+}
+
+struct SkipDecoder;
+
+impl Decoder for SkipDecoder {
+    type Item = InnerPart;
+    type Error = Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<InnerPart>> {
+        buf.clear();
+        Ok(None)
+    }
+
+    fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<InnerPart>> {
+        buf.clear();
+        Ok(None)
+    }
 }
 
 impl<R> Cg2InnerStream<R> {
     pub fn into_outer(self) -> OuterStream<R> {
-        let bytes = StreamWrapper::into_inner(self.inner);
+        let bytes = match self.inner {
+            PayloadDecode::Cg2(inner) => StreamWrapper::into_inner(inner),
+            PayloadDecode::Skip(inner) => StreamWrapper::into_inner(inner),
+        };
         let take = StreamWrapper::into_inner(bytes);
         StreamWrapper::into_inner(take)
     }
@@ -93,7 +122,10 @@ where
     type Item = Result<InnerPart>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.get_mut().inner).poll_next(cx)
+        match &mut self.get_mut().inner {
+            PayloadDecode::Cg2(inner) => Pin::new(inner).poll_next(cx),
+            PayloadDecode::Skip(inner) => Pin::new(inner).poll_next(cx),
+        }
     }
 }
 
@@ -155,14 +187,14 @@ where
     let bytes = PayloadBytes {
         inner: stream.take_while_wrapper(is_payload as PayloadPred),
     };
-    match header.part_type_lower().as_str() {
-        "changegroup" => Cg2InnerStream {
-            inner: bytes.decode(changegroup::unpacker::Cg2Unpacker::new(
-                logger.new(o!("stream" => "cg2")),
-            )),
-        },
-        _ => panic!("TODO: make this an error"),
-    }
+    let inner = match header.part_type_lower().as_str() {
+        "changegroup" => PayloadDecode::Cg2(bytes.decode(changegroup::unpacker::Cg2Unpacker::new(
+            logger.new(o!("stream" => "cg2")),
+        ))),
+        // Pushkey data is in the part header. Other recognized parts are not stored.
+        _ => PayloadDecode::Skip(bytes.decode(SkipDecoder)),
+    };
+    Cg2InnerStream { inner }
 }
 
 fn is_payload(item: &OuterFrame) -> Ready<Result<bool>> {
