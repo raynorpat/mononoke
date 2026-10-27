@@ -86,9 +86,7 @@ impl<H: HgCommands> HgService<H> {
                 key,
                 old,
                 new,
-            } => map_cmd(hgcmds.pushkey(namespace, key, old, new), |_| {
-                Response::Pushkey
-            }),
+            } => map_cmd(hgcmds.pushkey(namespace, key, old, new), Response::Pushkey),
             Request::Streamout => map_cmd(hgcmds.stream_out(), |_| Response::Streamout),
             Request::Unbundle { heads, bundle } => {
                 map_cmd(hgcmds.unbundle(heads, bundle), Response::Unbundle)
@@ -287,7 +285,7 @@ pub trait HgCommands {
         _key: String,
         _old: NodeHash,
         _new: NodeHash,
-    ) -> HgCommandRes<()> {
+    ) -> HgCommandRes<bool> {
         unimplemented("pushkey")
     }
 

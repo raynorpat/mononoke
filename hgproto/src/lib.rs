@@ -135,7 +135,7 @@ pub enum Response {
     Listkeys(HashMap<Vec<u8>, Vec<u8>>),
     Lookup(NodeHash),
     Known(Vec<bool>),
-    Pushkey,
+    Pushkey(bool),
     Streamout,
     Unbundle(Bytes),
 }

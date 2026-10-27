@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::str;
 
 use bytes::{Bytes, BytesMut};
-use mercurial_types::NodeHash;
+use mercurial_types::{NodeHash, NULL_HASH};
 
 use crate::batch;
 use crate::errors::{Error, Result};
@@ -137,6 +137,12 @@ fn ident_string(input: &[u8]) -> ParseRes<'_, String> {
     Ok((rest, String::from_utf8_lossy(name).into_owned()))
 }
 
+/// A pushkey value is length-delimited and already complete. Bookmark names may
+/// contain characters `ident` rejects, such as `-`.
+fn value_string(input: &[u8]) -> ParseRes<'_, String> {
+    Ok((b"", String::from_utf8_lossy(input).into_owned()))
+}
+
 /// A "*" parameter's argument is a count of following parameters.
 fn param_star(input: &[u8]) -> ParseRes<'_, HashMap<Vec<u8>, Vec<u8>>> {
     let (input, _) = tag(input, b"* ")?;
@@ -237,6 +243,15 @@ fn nodehash(input: &[u8]) -> ParseRes<'_, NodeHash> {
     let text = str::from_utf8(hex).map_err(|_| WireErr::MapRes)?;
     let hash = text.parse().map_err(|_| WireErr::MapRes)?;
     Ok((rest, hash))
+}
+
+/// Mercurial 7 hexlifies an absent bookmark node as `b''`. Forty hex zeros is
+/// the same absent node.
+fn pushkey_node(input: &[u8]) -> ParseRes<'_, NodeHash> {
+    if input.is_empty() {
+        return Ok((b"", NULL_HASH));
+    }
+    nodehash(input)
 }
 
 fn pair(input: &[u8]) -> ParseRes<'_, (NodeHash, NodeHash)> {
@@ -533,9 +548,9 @@ fn parse_request<'a>(input: &'a [u8], parse_params: ParamParser) -> ParseRes<'a,
     if let Some(val) = attempt(parse_named(input, b"pushkey", parse_params, 4, |kv| {
         Ok(Request::Pushkey {
             namespace: parseval(&kv, "namespace", ident_string)?,
-            key: parseval(&kv, "key", ident_string)?,
-            old: parseval(&kv, "old", nodehash)?,
-            new: parseval(&kv, "new", nodehash)?,
+            key: parseval(&kv, "key", value_string)?,
+            old: parseval(&kv, "old", pushkey_node)?,
+            new: parseval(&kv, "new", pushkey_node)?,
         })
     }))? {
         return Ok(val);
@@ -1333,6 +1348,27 @@ mod test_parse {
                 key: "foobar".to_string(),
                 old: hash_ones(),
                 new: hash_twos(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_parse_pushkey_empty_node() {
+        let inp = "pushkey\n\
+                   namespace 9\n\
+                   bookmarks\
+                   key 6\n\
+                   pushed\
+                   old 0\n\
+                   new 0\n";
+
+        test_parse(
+            inp,
+            Request::Pushkey {
+                namespace: "bookmarks".to_string(),
+                key: "pushed".to_string(),
+                old: mercurial_types::NULL_HASH,
+                new: mercurial_types::NULL_HASH,
             },
         );
     }

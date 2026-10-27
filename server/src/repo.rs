@@ -337,6 +337,27 @@ impl HgCommands for RepoClient {
         future::ok(res).boxed()
     }
 
+    // @wireprotocommand('pushkey', 'namespace key old new')
+    fn pushkey(
+        &self,
+        namespace: String,
+        key: String,
+        old: NodeHash,
+        new: NodeHash,
+    ) -> HgCommandRes<bool> {
+        info!(self.logger, "pushkey {} {}", namespace, key);
+        if namespace != "bookmarks" {
+            return future::ok(false).boxed();
+        }
+        let repo = Arc::clone(&self.repo);
+        let key = key.into_bytes();
+        async move {
+            crate::push::pushkey_bookmark(&repo.hgrepo, &key, old, new)
+                .map_err(|err| hgproto::Error::from(err.to_string()))
+        }
+        .boxed()
+    }
+
     // @wireprotocommand('unbundle', 'heads')
     fn unbundle(&self, heads: Vec<NodeHash>, bundle: Bytes) -> HgCommandRes<Bytes> {
         info!(self.logger, "unbundle heads {:?}", heads);

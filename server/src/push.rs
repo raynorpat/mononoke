@@ -260,6 +260,21 @@ fn apply_pushkey(repo: &RevlogRepo, header: &PartHeader) -> Result<()> {
     let key = param(header, "key")?;
     let old = parse_hex_node(param(header, "old")?)?;
     let new = parse_hex_node(param(header, "new")?)?;
+    // A missed compare-and-swap leaves the file unchanged and must not abort
+    // the changegroup that shares this bundle.
+    let _applied = pushkey_bookmark(repo, key, old, new)?;
+    Ok(())
+}
+
+pub(crate) fn pushkey_bookmark(
+    repo: &RevlogRepo,
+    key: &[u8],
+    old: NodeHash,
+    new: NodeHash,
+) -> Result<bool> {
+    if new != NULL_HASH && repo.changelog_revlog().index_of(&new).is_err() {
+        return Ok(false);
+    }
     let marks = repo.bookmarks()?;
     let current = ready(marks.get(&key))?;
     let matches = match current {
@@ -267,7 +282,7 @@ fn apply_pushkey(repo: &RevlogRepo, header: &PartHeader) -> Result<()> {
         None => old == NULL_HASH,
     };
     if !matches {
-        return Ok(());
+        return Ok(false);
     }
     let version = if current.is_some() {
         Version::from(1)
@@ -279,10 +294,7 @@ fn apply_pushkey(repo: &RevlogRepo, header: &PartHeader) -> Result<()> {
     } else {
         ready(marks.set(&key, &new, &version))?
     };
-    match updated {
-        Some(_) => Ok(()),
-        None => Err("bookmark version changed".into()),
-    }
+    Ok(updated.is_some())
 }
 
 fn param<'a>(header: &'a PartHeader, name: &str) -> Result<&'a [u8]> {
@@ -295,6 +307,9 @@ fn param<'a>(header: &'a PartHeader, name: &str) -> Result<&'a [u8]> {
 }
 
 fn parse_hex_node(bytes: &[u8]) -> Result<NodeHash> {
+    if bytes.is_empty() {
+        return Ok(NULL_HASH);
+    }
     if bytes.len() != 40 {
         return Err(format!("node hash length {}", bytes.len()).into());
     }

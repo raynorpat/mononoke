@@ -397,6 +397,109 @@ fn ssh_push_appears_in_served_repo() {
 }
 
 #[test]
+fn ssh_push_bookmark_updates_served_repo() {
+    let temp = TempDir::new("k");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let _server = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let clone = hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "dest"], &shim);
+    assert!(
+        clone.status.success(),
+        "hg clone failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        clone.status,
+        String::from_utf8_lossy(&clone.stdout),
+        String::from_utf8_lossy(&clone.stderr),
+        read_log(&log)
+    );
+
+    let dest = temp.0.join("dest");
+    fs::write(dest.join("a.txt"), b"beta\n").expect("write beta");
+    assert_hg(
+        &hg(&dest, &["commit", "-m", "second", "-u", "test"]),
+        "commit second",
+    );
+    assert_hg(&hg(&dest, &["bookmark", "pushed"]), "hg bookmark");
+    let tip = hg(&dest, &["log", "-r", ".", "-T", "{node}"]);
+    assert_hg(&tip, "tip node");
+    let tip_node = String::from_utf8_lossy(&tip.stdout).trim().to_owned();
+
+    let push = hg_ssh(&dest, &["push", "-B", "pushed"], &shim);
+    assert!(
+        push.status.success(),
+        "hg push bookmark failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        push.status,
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr),
+        read_log(&log)
+    );
+
+    let marks_path = repo.join(".hg").join("bookmarks");
+    let marks = fs::read(&marks_path).unwrap_or_default();
+    let text = String::from_utf8_lossy(&marks);
+    let expected = format!("{tip_node} pushed\n");
+    assert!(
+        text.contains(&expected),
+        "bookmarks {text:?} missing {expected:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr),
+        read_log(&log)
+    );
+
+    let zeros = "0000000000000000000000000000000000000000";
+    let absent = hg_ssh(
+        &dest,
+        &[
+            "debugpushkey",
+            "ssh://user@dummy/repo",
+            "bookmarks",
+            "absent",
+            zeros,
+            tip_node.as_str(),
+        ],
+        &shim,
+    );
+    assert!(
+        absent.status.success(),
+        "forty-zero old failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        absent.status,
+        String::from_utf8_lossy(&absent.stdout),
+        String::from_utf8_lossy(&absent.stderr),
+        read_log(&log)
+    );
+    let marks = fs::read(&marks_path).unwrap_or_default();
+    let text = String::from_utf8_lossy(&marks);
+    let absent_line = format!("{tip_node} absent\n");
+    assert!(
+        text.contains(&expected) && text.contains(&absent_line),
+        "bookmarks {text:?} missing pushed or absent"
+    );
+
+    let mismatch = hg_ssh(
+        &dest,
+        &[
+            "debugpushkey",
+            "ssh://user@dummy/repo",
+            "bookmarks",
+            "pushed",
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+        ],
+        &shim,
+    );
+    let after = fs::read(&marks_path).unwrap_or_default();
+    assert_eq!(
+        after,
+        marks,
+        "mismatched old changed bookmarks to {}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        String::from_utf8_lossy(&after),
+        String::from_utf8_lossy(&mismatch.stdout),
+        String::from_utf8_lossy(&mismatch.stderr),
+        read_log(&log)
+    );
+}
+
+#[test]
 fn unbundle_rejects_mismatched_heads_without_writing() {
     let temp = TempDir::new("m");
     let repo = init_zstd_repo(&temp.0);
