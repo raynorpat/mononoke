@@ -89,6 +89,7 @@ struct RevlogInner {
     data: Option<Datafile>,
     idxoff: BTreeMap<RevIdx, usize>, // cache of index -> offset
     nodeidx: HashMap<NodeHash, RevIdx>, // cache of nodeid -> index
+    text_cache: Option<(RevIdx, Vec<u8>)>, // last reconstructed text
     idx_path: Option<PathBuf>,
     data_path: Option<PathBuf>,
 }
@@ -158,6 +159,7 @@ impl Revlog {
             data: data,
             idxoff: idxoff,
             nodeidx: HashMap::new(),
+            text_cache: None,
             idx_path: None,
             data_path: None,
         };
@@ -570,6 +572,35 @@ impl RevlogInner {
     fn construct_general(&mut self, tgtidx: RevIdx) -> Result<Vec<u8>> {
         assert!(self.is_general_delta());
 
+        let entry = self.get_entry(tgtidx)?;
+        // Reuse the slot only for a delta against that revision. A snapshot
+        // (`baserev == idx`) and a forward base do not.
+        if let Some(baserev) = entry.baserev {
+            if baserev < tgtidx {
+                let hit = match &self.text_cache {
+                    Some((cached_idx, _)) => *cached_idx == baserev,
+                    None => false,
+                };
+                if hit {
+                    let chunk = self.get_chunk(tgtidx).chain_err::<_, Error>(|| {
+                        format!("construct_general tgtidx {:?} idx {:?}", tgtidx, tgtidx).into()
+                    })?;
+                    let deltas = match chunk {
+                        Chunk::Deltas(_, deltas) => deltas,
+                        _ => panic!("Literal text found in delta chain."),
+                    };
+                    let (_, cached) = self
+                        .text_cache
+                        .take()
+                        .expect("text cache missing after hit");
+                    let data =
+                        delta::compat::apply_deltas(cached.as_ref(), std::iter::once(deltas));
+                    self.text_cache = Some((tgtidx, data.clone()));
+                    return Ok(data);
+                }
+            }
+        }
+
         let mut chunks = Vec::new();
         let mut idx = tgtidx;
 
@@ -626,6 +657,7 @@ impl RevlogInner {
 
         data = delta::compat::apply_deltas(data.as_ref(), chain);
 
+        self.text_cache = Some((tgtidx, data.clone()));
         Ok(data)
     }
 

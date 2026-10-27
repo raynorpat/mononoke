@@ -468,3 +468,49 @@ fn sparse_chain_skips_unrelated_revision() {
     let node = revlog.get_rev(RevIdx::from(2u32)).expect("rev");
     assert_eq!(node.as_blob().as_slice(), Some(&b"baaa"[..]));
 }
+
+/// Generaldelta, not inline. Rev 0 is the literal `hello` (`baserev` 0).
+/// Rev 1 and rev 2 each delta against rev 0, not against each other.
+fn sparse_fixture() -> Revlog {
+    let mut rev0 = vec![b'u'];
+    rev0.extend_from_slice(b"hello");
+    // Insert `!` at offset 5: start=5, end=5, len=1.
+    let mut rev1 = vec![b'u'];
+    rev1.extend_from_slice(&5u32.to_be_bytes());
+    rev1.extend_from_slice(&5u32.to_be_bytes());
+    rev1.extend_from_slice(&1u32.to_be_bytes());
+    rev1.push(b'!');
+    // Insert `?` at offset 5: start=5, end=5, len=1.
+    let mut rev2 = vec![b'u'];
+    rev2.extend_from_slice(&5u32.to_be_bytes());
+    rev2.extend_from_slice(&5u32.to_be_bytes());
+    rev2.extend_from_slice(&1u32.to_be_bytes());
+    rev2.push(b'?');
+
+    let mut entry0 = ng_entry(0, rev0.len() as u32, 0);
+    stamp_separate_header(&mut entry0, 0x0002, 1);
+    let mut entry1 = ng_entry(rev0.len() as u64, rev1.len() as u32, 0);
+    entry1[51] = 2;
+    let mut entry2 = ng_entry((rev0.len() + rev1.len()) as u64, rev2.len() as u32, 0);
+    entry2[51] = 3;
+
+    let mut idx = Vec::with_capacity(192);
+    idx.extend_from_slice(&entry0);
+    idx.extend_from_slice(&entry1);
+    idx.extend_from_slice(&entry2);
+    let mut data = Vec::new();
+    data.extend_from_slice(&rev0);
+    data.extend_from_slice(&rev1);
+    data.extend_from_slice(&rev2);
+
+    Revlog::new(idx, Some(data)).expect("revlog")
+}
+
+#[test]
+fn reconstruction_ignores_cache_when_base_is_not_cached_rev() {
+    let revlog = sparse_fixture(); // the three revisions above
+    let first = revlog.get_rev(RevIdx::from(1u32)).expect("rev 1");
+    assert_eq!(first.as_blob().as_slice(), Some(&b"hello!"[..]));
+    let skipped = revlog.get_rev(RevIdx::from(2u32)).expect("rev 2");
+    assert_eq!(skipped.as_blob().as_slice(), Some(&b"hello?"[..]));
+}
