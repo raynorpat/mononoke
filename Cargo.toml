@@ -9,4 +9,5 @@ members = [
     "async-compression",
     "sshrelay",
     "mercurial",
+    "mercurial-bundles",
 ]

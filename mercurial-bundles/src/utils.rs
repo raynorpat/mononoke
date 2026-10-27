@@ -9,13 +9,13 @@
 use std::ops::Deref;
 use std::str;
 
+use async_compression::{CompressorType, DecompressorType};
 use byteorder::{BigEndian, ByteOrder};
 use bytes::{Bytes, BytesMut};
-
-use async_compression::{CompressorType, DecompressorType};
 use mercurial_types::{NodeHash, Path};
 
-use errors::*;
+use crate::bail;
+use crate::errors::*;
 
 pub trait SplitTo {
     fn split_to(&mut self, at: usize) -> Self;
@@ -67,11 +67,9 @@ where
 
     #[inline]
     fn drain_str(&mut self, len: usize) -> Result<String> {
-        Ok(
-            str::from_utf8(self.split_to(len).as_ref())
-                .chain_err(|| "invalid UTF-8")?
-                .into(),
-        )
+        Ok(str::from_utf8(self.split_to(len).as_ref())
+            .chain_err(|| "invalid UTF-8")?
+            .into())
     }
 
     #[inline]
@@ -116,9 +114,10 @@ pub fn get_decompressor_type(compression: Option<&str>) -> Result<DecompressorTy
         Some("ZS") => Ok(DecompressorType::Zstd),
         Some("UN") => Ok(DecompressorType::Uncompressed),
         Some(s) => {
-            bail!(ErrorKind::Bundle2Decode(
-                format!("unknown compression '{}'", s)
-            ))
+            bail!(ErrorKind::Bundle2Decode(format!(
+                "unknown compression '{}'",
+                s
+            )))
         }
         None => Ok(DecompressorType::Uncompressed),
     }
@@ -126,10 +125,10 @@ pub fn get_decompressor_type(compression: Option<&str>) -> Result<DecompressorTy
 
 pub fn get_compression_param(ct: &CompressorType) -> &'static str {
     match ct {
-        &CompressorType::Bzip2(_) => "BZ",
-        &CompressorType::Gzip => "GZ",
-        &CompressorType::Zstd { .. } => "ZS",
-        &CompressorType::Uncompressed => "UN",
+        CompressorType::Bzip2(_) => "BZ",
+        CompressorType::Gzip => "GZ",
+        CompressorType::Zstd { .. } => "ZS",
+        CompressorType::Uncompressed => "UN",
     }
 }
 
@@ -146,6 +145,8 @@ pub fn capitalize_first(s: String) -> String {
 
 #[cfg(test)]
 mod test {
+    use assert_matches::assert_matches;
+
     use super::*;
 
     #[test]

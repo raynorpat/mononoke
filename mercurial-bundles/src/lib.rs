@@ -5,47 +5,15 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-extern crate ascii;
-#[macro_use]
-#[cfg(test)]
-extern crate assert_matches;
-extern crate bytes;
-extern crate byteorder;
-#[macro_use]
-extern crate error_chain;
-#[macro_use]
-extern crate futures;
-#[macro_use]
-extern crate lazy_static;
-#[cfg(test)]
-extern crate quickcheck;
-#[cfg(test)]
-extern crate rand;
-#[macro_use]
-extern crate slog;
-#[cfg(test)]
-extern crate slog_term;
-#[cfg(test)]
-extern crate tokio_core;
-extern crate tokio_io;
-extern crate tokio_proto;
-extern crate url;
-
-extern crate async_compression;
-extern crate futures_ext;
-extern crate mercurial_types;
-#[cfg(test)]
-extern crate partial_io;
-
 pub mod bundle2;
 pub mod bundle2_encode;
 pub mod changegroup;
 mod chunk;
-pub mod parts;
 pub mod part_encode;
 mod part_header;
 mod part_inner;
 mod part_outer;
+pub mod parts;
 #[cfg(test)]
 mod quickcheck_types;
 mod stream_start;

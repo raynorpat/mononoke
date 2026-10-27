@@ -8,21 +8,23 @@
 #![deny(warnings)]
 
 use std::collections::{HashMap, HashSet};
-use std::str;
-
-use futures::{Stream, future};
-use slog;
+use std::pin::Pin;
+use std::sync::LazyLock;
+use std::task::{Context, Poll};
 
 use ascii::AsciiStr;
 use bytes::Bytes;
-use futures::stream::Map;
-use tokio_io::AsyncRead;
+use futures::future::{self, Ready};
+use futures::Stream;
+use futures_ext::{StreamExt, StreamLayeredExt, StreamWrapper, TakeWhile};
+use slog::{self, o};
+use tokio::io::AsyncRead;
 
-use changegroup;
-use errors::*;
-use futures_ext::{BoxStreamWrapper, StreamExt, StreamLayeredExt, TakeWhile};
-use part_header::PartHeader;
-use part_outer::{OuterFrame, OuterStream};
+use crate::bail;
+use crate::changegroup;
+use crate::errors::*;
+use crate::part_header::PartHeader;
+use crate::part_outer::{OuterFrame, OuterStream};
 
 // --- Part parameters
 
@@ -34,36 +36,66 @@ macro_rules! add_part {
     }}
 }
 
-lazy_static! {
-    static ref KNOWN_PARAMS: HashMap<&'static AsciiStr, HashSet<&'static str>> = {
+static KNOWN_PARAMS: LazyLock<HashMap<&'static AsciiStr, HashSet<&'static str>>> =
+    LazyLock::new(|| {
         let mut m: HashMap<&'static AsciiStr, HashSet<&'static str>> = HashMap::new();
         add_part!(m, "changegroup", ["version", "nbchanges", "treemanifest"]);
         m
-    };
+    });
+
+type PayloadPred = fn(&OuterFrame) -> Ready<Result<bool>>;
+
+type PayloadTake<R> = TakeWhile<OuterStream<R>, PayloadPred, Ready<Result<bool>>, OuterFrame>;
+
+struct PayloadBytes<R> {
+    inner: PayloadTake<R>,
 }
 
-type BoolFuture = future::FutureResult<bool, Error>;
-
-type WrappedStream<T> = Map<
-    TakeWhile<OuterStream<T>, fn(&OuterFrame) -> BoolFuture, BoolFuture>,
-    fn(OuterFrame) -> Bytes,
->;
-
-pub trait InnerStream<T>
-    : Stream<Item = InnerPart, Error = Error> + BoxStreamWrapper<WrappedStream<T>>
+impl<R> Stream for PayloadBytes<R>
 where
-    T: AsyncRead + 'static
+    R: AsyncRead + Unpin,
 {
+    type Item = Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame.get_payload()))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
-impl<T, U> InnerStream<T> for U
+impl<R> StreamWrapper<PayloadTake<R>> for PayloadBytes<R> {
+    fn into_inner(self) -> PayloadTake<R> {
+        self.inner
+    }
+}
+
+pub struct Cg2InnerStream<R> {
+    inner: futures_ext::decode::LayeredDecode<PayloadBytes<R>, changegroup::unpacker::Cg2Unpacker>,
+}
+
+impl<R> Cg2InnerStream<R> {
+    pub fn into_outer(self) -> OuterStream<R> {
+        let bytes = StreamWrapper::into_inner(self.inner);
+        let take = StreamWrapper::into_inner(bytes);
+        StreamWrapper::into_inner(take)
+    }
+}
+
+impl<R> Stream for Cg2InnerStream<R>
 where
-    U: Stream<Item = InnerPart, Error = Error> + BoxStreamWrapper<WrappedStream<T>>,
-    T: AsyncRead + 'static,
+    R: AsyncRead + Unpin,
 {
-}
+    type Item = Result<InnerPart>;
 
-pub type BoxInnerStream<T> = Box<InnerStream<T, Item = InnerPart, Error = Error>>;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum InnerPart {
@@ -73,7 +105,7 @@ pub enum InnerPart {
 impl InnerPart {
     pub fn is_cg2(&self) -> bool {
         match self {
-            &InnerPart::Cg2(_) => true,
+            InnerPart::Cg2(_) => true,
         }
     }
 
@@ -86,13 +118,13 @@ impl InnerPart {
 
 pub fn validate_header(header: PartHeader) -> Result<Option<PartHeader>> {
     match KNOWN_PARAMS.get(header.part_type_lower()) {
-        Some(ref known_params) => {
+        Some(known_params) => {
             // Make sure all the mandatory params are recognized.
             let unknown_params: Vec<_> = header
                 .mparams()
                 .keys()
                 .filter(|param| !known_params.contains(param.as_str()))
-                .map(|param| param.clone())
+                .cloned()
                 .collect();
             if !unknown_params.is_empty() {
                 bail!(ErrorKind::BundleUnknownPartParams(
@@ -112,27 +144,27 @@ pub fn validate_header(header: PartHeader) -> Result<Option<PartHeader>> {
 }
 
 /// Convert an OuterStream into an InnerStream using the part header.
-pub fn inner_stream<R: AsyncRead>(
+pub fn inner_stream<R>(
     header: &PartHeader,
     stream: OuterStream<R>,
     logger: &slog::Logger,
-) -> BoxInnerStream<R> {
-    // The casts are required for Rust to not complain about "expected fn
-    // pointer, found fn item". See http://stackoverflow.com/q/34787928.
-    let wrapped_stream: WrappedStream<R> = stream
-        .take_while_wrapper(is_payload_fut as fn(&OuterFrame) -> BoolFuture)
-        .map(OuterFrame::get_payload as fn(OuterFrame) -> Bytes);
+) -> Cg2InnerStream<R>
+where
+    R: AsyncRead + Unpin,
+{
+    let bytes = PayloadBytes {
+        inner: stream.take_while_wrapper(is_payload as PayloadPred),
+    };
     match header.part_type_lower().as_str() {
-        "changegroup" => {
-            let cg2_stream = wrapped_stream.decode(changegroup::unpacker::Cg2Unpacker::new(
+        "changegroup" => Cg2InnerStream {
+            inner: bytes.decode(changegroup::unpacker::Cg2Unpacker::new(
                 logger.new(o!("stream" => "cg2")),
-            ));
-            Box::new(cg2_stream)
-        }
+            )),
+        },
         _ => panic!("TODO: make this an error"),
     }
 }
 
-fn is_payload_fut(item: &OuterFrame) -> BoolFuture {
-    future::ok(item.is_payload())
+fn is_payload(item: &OuterFrame) -> Ready<Result<bool>> {
+    future::ready(Ok(item.is_payload()))
 }

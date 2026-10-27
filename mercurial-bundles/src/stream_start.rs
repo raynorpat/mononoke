@@ -8,12 +8,13 @@ use std::collections::HashMap;
 
 use byteorder::{BigEndian, ByteOrder};
 use bytes::BytesMut;
-use tokio_io::codec::Decoder;
-use url::percent_encoding;
+use percent_encoding::percent_decode;
+use tokio_util::codec::Decoder;
 
-use errors::*;
-use types::StreamHeader;
-use utils::is_mandatory_param;
+use crate::bail;
+use crate::errors::*;
+use crate::types::StreamHeader;
+use crate::utils::is_mandatory_param;
 
 #[derive(Debug)]
 pub struct StartDecoder;
@@ -47,8 +48,8 @@ impl Decoder for StartDecoder {
         let (m_stream_params, a_stream_params) = decode_stream_params(buf, header_len)?;
 
         Ok(Some(StreamHeader {
-            m_stream_params: m_stream_params,
-            a_stream_params: a_stream_params,
+            m_stream_params,
+            a_stream_params,
         }))
     }
 }
@@ -77,22 +78,17 @@ fn decode_stream_params(
         let val = key_val
             .next()
             .ok_or(ErrorKind::Bundle2Decode("bad stream level val".into()))?;
-        let key_decoded = percent_encoding::percent_decode(key);
-        let val_decoded = percent_encoding::percent_decode(val);
+        let key_decoded = percent_decode(key);
+        let val_decoded = percent_decode(val);
         let key_str = key_decoded
             .decode_utf8()
-            .chain_err(|| {
-                ErrorKind::Bundle2Decode("stream level key is invalid UTF-8".into())
-            })?;
+            .chain_err(|| ErrorKind::Bundle2Decode("stream level key is invalid UTF-8".into()))?;
         let val_str = val_decoded
             .decode_utf8()
-            .chain_err(|| {
-                ErrorKind::Bundle2Decode("stream level val is invalid UTF-8".into())
-            })?;
+            .chain_err(|| ErrorKind::Bundle2Decode("stream level val is invalid UTF-8".into()))?;
         if is_mandatory_param(&key_str)
-            .chain_err(|| {
-                ErrorKind::Bundle2Decode(format!("stream key is invalid"))
-            })? {
+            .chain_err(|| ErrorKind::Bundle2Decode("stream key is invalid".into()))?
+        {
             m_stream_params.insert(key_str.to_lowercase(), val_str.into_owned());
         } else {
             a_stream_params.insert(key_str.to_lowercase(), val_str.into_owned());

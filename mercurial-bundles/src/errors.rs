@@ -7,54 +7,89 @@
 use std::io;
 
 use ascii::AsciiString;
+use thiserror::Error;
 
-use part_header::PartHeader;
+use crate::part_header::PartHeader;
 
-#[recursion_limit = "1024"]
-error_chain! {
-    errors {
-        Bundle2Decode(msg: String) {
-            description("bundle2 decode error")
-                display("{}", msg)
-        }
-        Cg2Decode(msg: String) {
-            description("changegroup2 decode error")
-            display("changegroup2 decode error: {}", msg)
-        }
-        Bundle2Encode(msg: String) {
-            description("bundle2 encode error")
-            display("{}", msg)
-        }
-        Bundle2Chunk(msg: String) {
-            description("bundle2 chunk error")
-            display("bundle2 chunk error: {}", msg)
-        }
-        BundleUnknownPart(header: PartHeader) {
-            description("unknown bundle2 part type")
-            display("unknown part type: {}", header.part_type())
-        }
-        BundleUnknownPartParams(part_type: AsciiString, params: Vec<String>) {
-            description("unknown bundle2 part params")
-            display("unknown params for bundle2 part '{}': {}", part_type, params.join(", "))
-        }
-        ListkeyGeneration {
-            description("error while generating listkey part")
-            display("error while generating listkey part")
+#[macro_export]
+macro_rules! bail {
+    ($e:expr) => {
+        return Err($crate::Error::from($e))
+    };
+    ($fmt:expr, $($arg:tt)+) => {
+        return Err($crate::Error::from(format!($fmt, $($arg)+)))
+    };
+}
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("{0}")]
+    Msg(String),
+    #[error("{0}")]
+    Bundle2Decode(String),
+    #[error("changegroup2 decode error: {0}")]
+    Cg2Decode(String),
+    #[error("{0}")]
+    Bundle2Encode(String),
+    #[error("bundle2 chunk error: {0}")]
+    Bundle2Chunk(String),
+    #[error("unknown part type: {}", .0.part_type())]
+    BundleUnknownPart(PartHeader),
+    #[error("unknown params for bundle2 part '{}': {}", .0, .1.join(", "))]
+    BundleUnknownPartParams(AsciiString, Vec<String>),
+    #[error("error while generating listkey part")]
+    ListkeyGeneration,
+    #[error("{context}")]
+    WithChain {
+        context: String,
+        #[source]
+        cause: Box<Error>,
+    },
+    #[error(transparent)]
+    MercurialTypes(#[from] mercurial_types::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Utf8(#[from] std::str::Utf8Error),
+}
+
+pub type ErrorKind = Error;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    pub fn kind(&self) -> &Self {
+        self
+    }
+
+    pub fn is_app_error(&self) -> bool {
+        match self {
+            Error::BundleUnknownPart(_) | Error::BundleUnknownPartParams(_, _) => true,
+            _ => false,
         }
     }
 
-    foreign_links {
-        Io(io::Error);
+    pub fn with_chain<E, C>(error: E, context: C) -> Self
+    where
+        E: Into<Error>,
+        C: std::fmt::Display,
+    {
+        Error::WithChain {
+            context: context.to_string(),
+            cause: Box::new(error.into()),
+        }
     }
 }
 
-impl Error {
-    pub fn is_app_error(&self) -> bool {
-        match self {
-            &Error(ErrorKind::BundleUnknownPart(_), _) |
-            &Error(ErrorKind::BundleUnknownPartParams(_, _), _) => true,
-            _ => false,
-        }
+impl From<&str> for Error {
+    fn from(msg: &str) -> Self {
+        Error::Msg(msg.to_owned())
+    }
+}
+
+impl From<String> for Error {
+    fn from(msg: String) -> Self {
+        Error::Msg(msg)
     }
 }
 
@@ -64,8 +99,25 @@ impl From<Error> for io::Error {
     }
 }
 
-impl From<ErrorKind> for io::Error {
-    fn from(err: ErrorKind) -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidData, format!("{}", err))
+pub trait ChainErr<T> {
+    fn chain_err<F, D>(self, op: F) -> Result<T>
+    where
+        F: FnOnce() -> D,
+        D: Into<Error>;
+}
+
+impl<T, E> ChainErr<T> for std::result::Result<T, E>
+where
+    E: Into<Error>,
+{
+    fn chain_err<F, D>(self, op: F) -> Result<T>
+    where
+        F: FnOnce() -> D,
+        D: Into<Error>,
+    {
+        self.map_err(|err| {
+            let context = op().into().to_string();
+            Error::with_chain(err, context)
+        })
     }
 }

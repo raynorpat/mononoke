@@ -5,33 +5,32 @@
 // GNU General Public License version 2 or any later version.
 
 use std::collections::HashMap;
-use std::convert::From;
-use std::fmt::Debug;
 use std::io::{self, Cursor};
 use std::str::FromStr;
 
-use futures::stream::Stream;
-use slog::{Drain, Logger};
-use slog_term;
-use tokio_core::reactor::Core;
-use tokio_io::AsyncRead;
-
-use async_compression::membuf::MemBuf;
+use assert_matches::assert_matches;
 use async_compression::{CompressorType, ZSTD_DEFAULT_LEVEL};
-use mercurial_types::{NULL_HASH, NodeHash, Path};
-use partial_io::{GenWouldBlock, PartialAsyncRead, PartialWithErrors};
-use rand;
-use quickcheck::{QuickCheck, StdGen};
+use futures::executor::block_on;
+use futures::StreamExt;
+use mercurial_types::delta::Fragment;
+use mercurial_types::{Delta, NodeHash, Path, NULL_HASH};
+use partial_io::quickcheck_types::{GenWouldBlock, PartialWithErrors};
+use partial_io::PartialAsyncRead;
+use quickcheck::{Gen, QuickCheck};
+use slog::{o, Drain, Logger};
+use slog_term;
+use tokio::io::AsyncRead;
 
-use Bundle2Item;
-use bundle2::Bundle2Stream;
-use bundle2_encode::Bundle2EncodeBuilder;
-use changegroup;
-use errors::*;
-use part_header::PartHeaderBuilder;
-use part_encode::PartEncodeBuilder;
-use types::StreamHeader;
-use utils::get_compression_param;
+use crate::bundle2::Bundle2Stream;
+use crate::bundle2_encode::Bundle2EncodeBuilder;
+use crate::changegroup;
+use crate::errors::*;
+use crate::part_encode::PartEncodeBuilder;
+use crate::part_header::PartHeaderBuilder;
+use crate::parts::changegroup_part;
+use crate::types::StreamHeader;
+use crate::utils::get_compression_param;
+use crate::Bundle2Item;
 
 const BZIP2_BUNDLE2: &[u8] = include_bytes!("fixtures/bzip2.bin");
 const UNCOMP_BUNDLE2: &[u8] = include_bytes!("fixtures/uncompressed.bin");
@@ -49,8 +48,7 @@ const DEF_HASH_STR: &str = "bb969a19e8853962b4347bea4c24796324f10d8b";
 
 #[test]
 fn test_parse_bzip2() {
-    let rng = StdGen::new(rand::thread_rng(), 20);
-    let mut quickcheck = QuickCheck::new().gen(rng);
+    let mut quickcheck = QuickCheck::new().rng(Gen::new(20));
     quickcheck.quickcheck(parse_bzip2 as fn(PartialWithErrors<GenWouldBlock>) -> ());
 }
 
@@ -60,11 +58,8 @@ fn parse_bzip2(read_ops: PartialWithErrors<GenWouldBlock>) {
 
 #[test]
 fn test_parse_uncompressed() {
-    let rng = StdGen::new(rand::thread_rng(), 20);
-    let mut quickcheck = QuickCheck::new().gen(rng);
-    quickcheck.quickcheck(
-        parse_uncompressed as fn(PartialWithErrors<GenWouldBlock>) -> (),
-    );
+    let mut quickcheck = QuickCheck::new().rng(Gen::new(20));
+    quickcheck.quickcheck(parse_uncompressed as fn(PartialWithErrors<GenWouldBlock>) -> ());
 }
 
 fn parse_uncompressed(read_ops: PartialWithErrors<GenWouldBlock>) {
@@ -73,16 +68,17 @@ fn parse_uncompressed(read_ops: PartialWithErrors<GenWouldBlock>) {
 
 #[test]
 fn test_parse_unknown_compression() {
-    let mut core = Core::new().unwrap();
-    let bundle2_buf = MemBuf::from(Vec::from(UNKNOWN_COMPRESSION_BUNDLE2));
-    let outer_stream_err = parse_stream_start(&mut core, bundle2_buf, Some("IL")).unwrap_err();
+    let bundle2_buf = Cursor::new(UNKNOWN_COMPRESSION_BUNDLE2.to_vec());
+    let outer_stream_err = parse_stream_start(bundle2_buf, Some("IL")).unwrap_err();
     assert_matches!(outer_stream_err.kind(),
                     &ErrorKind::Bundle2Decode(ref msg) if msg == "unknown compression 'IL'");
 }
 
 #[test]
 fn test_empty_bundle_roundtrip_zstd() {
-    empty_bundle_roundtrip(CompressorType::Zstd { level: ZSTD_DEFAULT_LEVEL });
+    empty_bundle_roundtrip(CompressorType::Zstd {
+        level: ZSTD_DEFAULT_LEVEL,
+    });
 }
 
 #[test]
@@ -101,16 +97,13 @@ fn empty_bundle_roundtrip(ct: CompressorType) {
     builder
         .add_stream_param("bar".into(), "456".into())
         .unwrap();
-    let encode_fut = builder.build();
-
-    let mut core = Core::new().unwrap();
-    let mut buf = core.run(encode_fut).unwrap();
+    let mut buf = block_on(builder.build()).unwrap();
     buf.set_position(0);
 
     // Now decode it.
     let logger = make_root_logger();
-    let stream = Bundle2Stream::new(buf, logger);
-    let (item, stream) = core.run(stream.into_future()).unwrap();
+    let mut stream = Bundle2Stream::new(buf, logger);
+    let item = next_bundle_item(&mut stream);
 
     let mut mparams = HashMap::new();
     let mut aparams = HashMap::new();
@@ -124,13 +117,15 @@ fn empty_bundle_roundtrip(ct: CompressorType) {
 
     assert_eq!(item, Some(Bundle2Item::Start(expected_header)));
 
-    let (item, _stream) = core.run(stream.into_future()).unwrap();
+    let item = next_bundle_item(&mut stream);
     assert!(item.is_none());
 }
 
 #[test]
 fn test_unknown_part_zstd() {
-    unknown_part(CompressorType::Zstd { level: ZSTD_DEFAULT_LEVEL });
+    unknown_part(CompressorType::Zstd {
+        level: ZSTD_DEFAULT_LEVEL,
+    });
 }
 
 #[test]
@@ -147,32 +142,26 @@ fn unknown_part(ct: CompressorType) {
     let unknown_part = PartEncodeBuilder::mandatory("unknown:unknown").unwrap();
 
     builder.add_part(unknown_part);
-    let encode_fut = builder.build();
-
-    let mut core = Core::new().unwrap();
-    let mut buf = core.run(encode_fut).unwrap();
+    let mut buf = block_on(builder.build()).unwrap();
     buf.set_position(0);
 
     let logger = make_root_logger();
-    let stream = Bundle2Stream::new(buf, logger);
-    let parts = Vec::new();
-
-    let decode_fut = stream
-        .map_err(|e| -> () { panic!("unexpected error: {}", e) })
-        .forward(parts);
-    let (stream, parts) = core.run(decode_fut).unwrap();
+    let mut stream = Bundle2Stream::new(buf, logger);
+    let mut parts = Vec::new();
+    while let Some(part) = next_bundle_item(&mut stream) {
+        parts.push(part);
+    }
 
     // Only the stream header should have been returned.
     let mut m_stream_params = HashMap::new();
     m_stream_params.insert("compression".into(), get_compression_param(&ct).into());
     let expected = StreamHeader {
-        m_stream_params: m_stream_params,
+        m_stream_params,
         a_stream_params: HashMap::new(),
     };
     assert_eq!(parts, vec![Bundle2Item::Start(expected)]);
 
     // Make sure the error was accumulated.
-    let stream = stream.into_inner();
     let app_errors = stream.app_errors();
     assert_eq!(app_errors.len(), 1);
     assert_matches!(app_errors[0].kind(),
@@ -185,14 +174,11 @@ fn parse_bundle(
     compression: Option<&str>,
     read_ops: PartialWithErrors<GenWouldBlock>,
 ) {
-    let mut core = Core::new().unwrap();
-
-    let bundle2_buf = MemBuf::from(Vec::from(input));
+    let bundle2_buf = Cursor::new(input.to_vec());
     let partial_read = PartialAsyncRead::new(bundle2_buf, read_ops);
-    let stream = parse_stream_start(&mut core, partial_read, compression).unwrap();
+    let mut stream = parse_stream_start(partial_read, compression).unwrap();
 
-    let (res, stream) = core.next_stream(stream);
-    let res = res.unwrap();
+    let res = next_bundle_item(&mut stream).unwrap();
 
     let mut header = PartHeaderBuilder::new("CHANGEGROUP").unwrap();
     header.add_mparam("version", "02").unwrap();
@@ -200,18 +186,19 @@ fn parse_bundle(
     let header = header.build(0);
     assert_eq!(res, Bundle2Item::Header(header));
 
-    let stream = verify_cg2(&mut core, stream);
+    verify_cg2(&mut stream);
 
-    let (res, stream) = core.next_stream(stream);
-    assert!(res.is_none());
+    assert!(next_bundle_item(&mut stream).is_none());
 
     // Make sure the stream is fused.
-    let (res, _) = core.next_stream(stream);
-    assert!(res.is_none());
+    assert!(next_bundle_item(&mut stream).is_none());
 }
 
-fn verify_cg2<R: AsyncRead>(core: &mut Core, stream: Bundle2Stream<R>) -> Bundle2Stream<R> {
-    let (res, stream) = next_cg2_part(core, stream);
+fn verify_cg2<R>(stream: &mut Bundle2Stream<R>)
+where
+    R: AsyncRead + Unpin,
+{
+    let res = next_cg2_part(stream);
     assert_eq!(*res.section(), changegroup::Section::Changeset);
     let chunk = res.chunk();
 
@@ -228,7 +215,7 @@ fn verify_cg2<R: AsyncRead>(core: &mut Core, stream: Bundle2Stream<R>) -> Bundle
     assert_eq!(frags[0].end, 0);
     assert_eq!(frags[0].content.len(), 98);
 
-    let (res, stream) = next_cg2_part(core, stream);
+    let res = next_cg2_part(stream);
     assert_eq!(*res.section(), changegroup::Section::Changeset);
     let chunk = res.chunk();
 
@@ -244,12 +231,14 @@ fn verify_cg2<R: AsyncRead>(core: &mut Core, stream: Bundle2Stream<R>) -> Bundle
     assert_eq!(frags[0].end, 0);
     assert_eq!(frags[0].content.len(), 102);
 
-    let (res, stream) = next_cg2_part(core, stream);
-    assert_matches!(res,
-                    changegroup::Part::SectionEnd(changegroup::Section::Changeset));
+    let res = next_cg2_part(stream);
+    assert_matches!(
+        res,
+        changegroup::Part::SectionEnd(changegroup::Section::Changeset)
+    );
 
     // Verify basic properties of manifests.
-    let (res, stream) = next_cg2_part(core, stream);
+    let res = next_cg2_part(stream);
     assert_eq!(*res.section(), changegroup::Section::Manifest);
     let chunk = res.chunk();
 
@@ -260,7 +249,7 @@ fn verify_cg2<R: AsyncRead>(core: &mut Core, stream: Bundle2Stream<R>) -> Bundle
     assert_eq!(chunk.base, NULL_HASH);
     assert_eq!(chunk.linknode, changeset1_hash);
 
-    let (res, stream) = next_cg2_part(core, stream);
+    let res = next_cg2_part(stream);
     assert_eq!(*res.section(), changegroup::Section::Manifest);
     let chunk = res.chunk();
 
@@ -271,11 +260,14 @@ fn verify_cg2<R: AsyncRead>(core: &mut Core, stream: Bundle2Stream<R>) -> Bundle
     assert_eq!(chunk.base, manifest1_hash); // In this case there's a delta.
     assert_eq!(chunk.linknode, changeset2_hash);
 
-    let (res, stream) = next_cg2_part(core, stream);
-    assert_matches!(res, changegroup::Part::SectionEnd(changegroup::Section::Manifest));
+    let res = next_cg2_part(stream);
+    assert_matches!(
+        res,
+        changegroup::Part::SectionEnd(changegroup::Section::Manifest)
+    );
 
     // Filelog section
-    let (res, stream) = next_cg2_part(core, stream);
+    let res = next_cg2_part(stream);
     assert_eq!(*res.section(), changegroup::Section::Filelog(path(b"abc")));
     let chunk = res.chunk();
 
@@ -287,12 +279,14 @@ fn verify_cg2<R: AsyncRead>(core: &mut Core, stream: Bundle2Stream<R>) -> Bundle
     assert_eq!(chunk.linknode, changeset1_hash);
     assert_eq!(chunk.delta.fragments().len(), 0); // empty file
 
-    let (res, stream) = next_cg2_part(core, stream);
-    assert_matches!(res,
-                    changegroup::Part::SectionEnd(ref section)
-                    if *section == changegroup::Section::Filelog(path(b"abc")));
+    let res = next_cg2_part(stream);
+    assert_matches!(
+        res,
+        changegroup::Part::SectionEnd(ref section)
+            if *section == changegroup::Section::Filelog(path(b"abc"))
+    );
 
-    let (res, stream) = next_cg2_part(core, stream);
+    let res = next_cg2_part(stream);
     assert_eq!(*res.section(), changegroup::Section::Filelog(path(b"def")));
     let chunk = res.chunk();
 
@@ -305,46 +299,45 @@ fn verify_cg2<R: AsyncRead>(core: &mut Core, stream: Bundle2Stream<R>) -> Bundle
     assert_eq!(chunk.delta.fragments().len(), 1);
 
     // That's it, wrap this up.
-    let (res, stream) = next_cg2_part(core, stream);
-    assert_matches!(res,
-                    changegroup::Part::SectionEnd(ref section)
-                    if *section == changegroup::Section::Filelog(path(b"def")));
+    let res = next_cg2_part(stream);
+    assert_matches!(
+        res,
+        changegroup::Part::SectionEnd(ref section)
+            if *section == changegroup::Section::Filelog(path(b"def"))
+    );
 
-    let (res, stream) = next_cg2_part(core, stream);
+    let res = next_cg2_part(stream);
     assert_matches!(res, changegroup::Part::End);
-
-    stream
 }
 
 fn path(bytes: &[u8]) -> Path {
     Path::new(bytes).unwrap()
 }
 
-fn parse_stream_start<R: AsyncRead>(
-    core: &mut Core,
-    reader: R,
-    compression: Option<&str>,
-) -> Result<Bundle2Stream<R>> {
+fn parse_stream_start<R>(reader: R, compression: Option<&str>) -> Result<Bundle2Stream<R>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut m_stream_params = HashMap::new();
     let a_stream_params = HashMap::new();
     if let Some(compression) = compression {
         m_stream_params.insert("compression".into(), compression.into());
     }
     let expected = StreamHeader {
-        m_stream_params: m_stream_params,
-        a_stream_params: a_stream_params,
+        m_stream_params,
+        a_stream_params,
     };
 
     let logger = make_root_logger();
 
-    let stream = Bundle2Stream::new(reader, logger);
-    match core.run(stream.into_future()) {
-        Ok((item, stream)) => {
-            let stream_start = item.unwrap();
-            assert_eq!(stream_start.stream_header(), expected);
+    let mut stream = Bundle2Stream::new(reader, logger);
+    match block_on(stream.next()) {
+        Some(Ok(item)) => {
+            assert_eq!(item.stream_header(), expected);
             Ok(stream)
         }
-        Err((e, _)) => Err(e),
+        Some(Err(err)) => Err(err),
+        None => panic!("bundle2 stream ended before the stream header"),
     }
 }
 
@@ -353,30 +346,76 @@ fn make_root_logger() -> Logger {
     Logger::root(slog_term::FullFormat::new(plain).build().fuse(), o!())
 }
 
-fn next_cg2_part<R: AsyncRead>(
-    core: &mut Core,
-    stream: Bundle2Stream<R>,
-) -> (changegroup::Part, Bundle2Stream<R>) {
-    let (res, stream) = core.next_stream(stream);
-    (res.unwrap().inner_part().cg2_part(), stream)
+fn next_cg2_part<R>(stream: &mut Bundle2Stream<R>) -> changegroup::Part
+where
+    R: AsyncRead + Unpin,
+{
+    next_bundle_item(stream).unwrap().inner_part().cg2_part()
 }
 
-trait CoreExt {
-    fn next_stream<S: Stream>(&mut self, stream: S) -> (Option<S::Item>, S)
-    where
-        <S as Stream>::Error: Debug;
-}
-
-impl CoreExt for Core {
-    fn next_stream<S: Stream>(&mut self, stream: S) -> (Option<S::Item>, S)
-    where
-        <S as Stream>::Error: Debug,
-    {
-        match self.run(stream.into_future()) {
-            Ok((res, stream)) => (res, stream),
-            Err((e, _)) => {
-                panic!("stream failed to produce the next value! {:?}", e);
-            }
-        }
+fn next_bundle_item<R>(stream: &mut Bundle2Stream<R>) -> Option<Bundle2Item>
+where
+    R: AsyncRead + Unpin,
+{
+    match block_on(stream.next()) {
+        Some(Ok(item)) => Some(item),
+        Some(Err(err)) => panic!("bundle2 stream error: {}", err),
+        None => None,
     }
+}
+
+#[test]
+fn changegroup_part_emits_cg02_fulltext() {
+    let node = NodeHash::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let delta = Delta::new(vec![Fragment {
+        start: 0,
+        end: 0,
+        content: b"alpha\n".to_vec(),
+    }])
+    .unwrap();
+    let chunks = vec![
+        changegroup::Part::CgChunk(
+            changegroup::Section::Changeset,
+            changegroup::CgDeltaChunk {
+                node,
+                p1: NULL_HASH,
+                p2: NULL_HASH,
+                base: NULL_HASH,
+                linknode: node,
+                delta,
+            },
+        ),
+        changegroup::Part::SectionEnd(changegroup::Section::Changeset),
+        changegroup::Part::End,
+    ];
+
+    let part = changegroup_part(chunks).unwrap();
+    let cursor = Cursor::new(Vec::with_capacity(32 * 1024));
+    let mut builder = Bundle2EncodeBuilder::new(cursor);
+    builder.set_compressor_type(CompressorType::Uncompressed);
+    builder.add_part(part);
+    let mut buf = block_on(builder.build()).unwrap();
+    buf.set_position(0);
+
+    let logger = make_root_logger();
+    let mut stream = Bundle2Stream::new(buf, logger);
+    let _start = next_bundle_item(&mut stream).unwrap();
+    let header = match next_bundle_item(&mut stream).unwrap() {
+        Bundle2Item::Header(header) => header,
+        other => panic!("expected changegroup header, got {:?}", other),
+    };
+    assert_eq!(header.part_type().as_str(), "CHANGEGROUP");
+    assert_eq!(
+        header.mparams().get("version").map(bytes::Bytes::as_ref),
+        Some(&b"02"[..])
+    );
+
+    let part = next_bundle_item(&mut stream)
+        .unwrap()
+        .inner_part()
+        .cg2_part();
+    let chunk = part.chunk();
+    assert_eq!(chunk.node, node);
+    assert_eq!(chunk.base, NULL_HASH);
+    assert_eq!(chunk.delta.fragments()[0].content, b"alpha\n");
 }

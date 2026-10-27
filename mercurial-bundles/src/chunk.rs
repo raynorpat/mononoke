@@ -4,11 +4,12 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use bytes::{BigEndian, BufMut, Bytes, BytesMut};
-use tokio_io::codec::{Decoder, Encoder};
+use bytes::{BufMut, Bytes, BytesMut};
+use tokio_util::codec::{Decoder, Encoder};
 
-use errors::*;
-use utils::BytesExt;
+use crate::bail;
+use crate::errors::*;
+use crate::utils::BytesExt;
 
 /// A bundle2 chunk.
 ///
@@ -39,11 +40,11 @@ enum ChunkInner {
 impl Chunk {
     pub fn new<T: Into<Bytes>>(val: T) -> Result<Self> {
         let bytes: Bytes = val.into();
-        if bytes.len() > i32::max_value() as usize {
+        if bytes.len() > i32::MAX as usize {
             bail!(ErrorKind::Bundle2Chunk(format!(
                 "chunk of length {} exceeds maximum {}",
                 bytes.len(),
-                i32::max_value()
+                i32::MAX
             )));
         }
         Ok(Chunk(ChunkInner::Normal(bytes)))
@@ -94,20 +95,19 @@ impl Chunk {
 #[derive(Debug)]
 pub struct ChunkEncoder;
 
-impl Encoder for ChunkEncoder {
-    type Item = Chunk;
+impl Encoder<Chunk> for ChunkEncoder {
     type Error = Error;
 
     fn encode(&mut self, item: Chunk, dst: &mut BytesMut) -> Result<()> {
         match item.0 {
             ChunkInner::Normal(bytes) => {
                 dst.reserve(4 + bytes.len());
-                dst.put_i32::<BigEndian>(bytes.len() as i32);
+                dst.put_i32(bytes.len() as i32);
                 dst.put_slice(&bytes);
             }
             ChunkInner::Error => {
                 dst.reserve(4);
-                dst.put_i32::<BigEndian>(-1);
+                dst.put_i32(-1);
             }
         }
         Ok(())
@@ -118,6 +118,7 @@ impl Encoder for ChunkEncoder {
 #[allow(dead_code)]
 pub struct ChunkDecoder;
 
+#[allow(dead_code)]
 impl Decoder for ChunkDecoder {
     type Item = Chunk;
     type Error = Error;
@@ -133,9 +134,10 @@ impl Decoder for ChunkDecoder {
             return Ok(Some(Chunk::error()));
         }
         if len < 0 {
-            bail!(ErrorKind::Bundle2Chunk(
-                format!("chunk length must be >= -1, found {}", len)
-            ));
+            bail!(ErrorKind::Bundle2Chunk(format!(
+                "chunk length must be >= -1, found {}",
+                len
+            )));
         }
 
         let len = len as usize;
@@ -153,17 +155,19 @@ impl Decoder for ChunkDecoder {
 mod test {
     use std::io::Cursor;
 
-    use futures::{Sink, Stream, stream};
-    use quickcheck::{TestResult, quickcheck};
-    use tokio_core::reactor::Core;
-    use tokio_io::codec::{FramedRead, FramedWrite};
+    use assert_matches::assert_matches;
+    use bytes::BufMut;
+    use futures::executor::block_on;
+    use futures::{SinkExt, TryStreamExt};
+    use quickcheck::{quickcheck, TestResult};
+    use tokio_util::codec::{FramedRead, FramedWrite};
 
     use super::*;
 
     #[test]
     fn test_empty_chunk() {
         let mut buf = BytesMut::with_capacity(4);
-        buf.put_i32::<BigEndian>(0);
+        buf.put_i32(0);
 
         let mut decoder = ChunkDecoder;
         let chunk = decoder.decode(&mut buf).unwrap().unwrap();
@@ -177,7 +181,7 @@ mod test {
     #[test]
     fn test_error_chunk() {
         let mut buf = BytesMut::with_capacity(4);
-        buf.put_i32::<BigEndian>(-1);
+        buf.put_i32(-1);
 
         let mut decoder = ChunkDecoder;
         let chunk = decoder.decode(&mut buf).unwrap().unwrap();
@@ -191,7 +195,7 @@ mod test {
     #[test]
     fn test_invalid_chunk() {
         let mut buf = BytesMut::with_capacity(4);
-        buf.put_i32::<BigEndian>(-2);
+        buf.put_i32(-2);
 
         let mut decoder = ChunkDecoder;
         let chunk_err = decoder.decode(&mut buf);
@@ -208,42 +212,28 @@ mod test {
     }
 
     fn roundtrip(data: Vec<Option<Vec<u8>>>) -> TestResult {
-        let count = data.len();
         // Treat Some(bytes) as a normal chunk, None as an error chunk.
-        let chunks: Vec<Chunk> = data.into_iter()
+        let chunks: Vec<Chunk> = data
+            .into_iter()
             .map(|x| match x {
                 Some(b) => Chunk::new(b).unwrap(),
                 None => Chunk::error(),
             })
             .collect();
-        // Make a clone so we can use chunks later.
-        let chunks_res: Vec<Result<Chunk>> = chunks.clone().into_iter().map(|x| Ok(x)).collect();
+        let chunks_res: Vec<Result<Chunk>> = chunks.clone().into_iter().map(Ok).collect();
 
         let cursor = Cursor::new(Vec::with_capacity(32 * 1024));
-        let sink = FramedWrite::new(cursor, ChunkEncoder);
-
-        let encode_fut = sink.send_all(stream::iter(chunks_res));
-
-        let mut core = Core::new().unwrap();
-
-        // Perform encoding.
-        let (sink, _) = core.run(encode_fut).unwrap();
+        let mut sink = FramedWrite::new(cursor, ChunkEncoder);
+        let mut input = futures::stream::iter(chunks_res);
+        block_on(sink.send_all(&mut input)).unwrap();
 
         let mut cursor = sink.into_inner();
         cursor.set_position(0);
 
-        // cursor will now have the encoded byte stream. Run it through the decoder.
         let stream = FramedRead::new(cursor, ChunkDecoder);
+        let decoded: Vec<Chunk> = block_on(stream.try_collect()).unwrap();
 
-        let collector: Vec<Chunk> = Vec::with_capacity(count);
-        let decode_fut = collector.send_all(stream.map_err(|err| {
-            panic!("Unexpected error: {}", err);
-        }));
-
-        // Perform decoding.
-        let (collector, _) = core.run(decode_fut).unwrap();
-
-        assert_eq!(collector, chunks);
+        assert_eq!(decoded, chunks);
 
         TestResult::passed()
     }

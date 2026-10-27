@@ -9,23 +9,22 @@
 //! part headers and puts together chunks for inner codecs to parse.
 
 use std::mem;
-use std::str;
 
 use ascii::AsciiString;
 use async_compression::Decompressor;
 use bytes::{Bytes, BytesMut};
 use futures_ext::{AsyncReadExt, FramedStream};
-use slog;
-use tokio_io::AsyncRead;
-use tokio_io::codec::Decoder;
+use slog::{self, o};
+use tokio::io::AsyncRead;
+use tokio_util::codec::Decoder;
 
-use errors::*;
-use part_header::{self, PartHeader};
-use part_inner::validate_header;
-use types::StreamHeader;
-use utils::{BytesExt, get_decompressor_type};
+use crate::errors::*;
+use crate::part_header::{self, PartHeader};
+use crate::part_inner::validate_header;
+use crate::types::StreamHeader;
+use crate::utils::{get_decompressor_type, BytesExt};
 
-pub fn outer_stream<R: AsyncRead>(
+pub fn outer_stream<R: AsyncRead + Unpin>(
     stream_header: &StreamHeader,
     r: R,
     logger: &slog::Logger,
@@ -36,10 +35,8 @@ pub fn outer_stream<R: AsyncRead>(
             .get("compression")
             .map(String::as_ref),
     )?;
-    Ok(
-        Decompressor::new(r, decompressor_type)
-            .framed_stream(OuterDecoder::new(logger.new(o!("stream" => "outer")))),
-    )
+    Ok(Decompressor::new(r, decompressor_type)
+        .framed_stream(OuterDecoder::new(logger.new(o!("stream" => "outer")))))
 }
 
 pub type OuterStream<R> = FramedStream<Decompressor<R>, OuterDecoder>;
@@ -63,17 +60,15 @@ impl OuterState {
 
     pub fn payload_frame(&self, data: BytesMut) -> OuterFrame {
         match self {
-            &OuterState::Payload {
+            OuterState::Payload {
                 ref part_type,
                 ref part_id,
-            } => {
-                OuterFrame::Payload {
-                    part_type: part_type.clone(),
-                    part_id: *part_id,
-                    payload: data.freeze(),
-                }
-            }
-            &OuterState::DiscardPayload => OuterFrame::Discard,
+            } => OuterFrame::Payload {
+                part_type: part_type.clone(),
+                part_id: *part_id,
+                payload: data.freeze(),
+            },
+            OuterState::DiscardPayload => OuterFrame::Discard,
             _ => panic!("payload_frame called for state without payloads"),
         }
     }
@@ -81,10 +76,7 @@ impl OuterState {
     pub fn part_end_frame(self) -> OuterFrame {
         match self {
             OuterState::Payload { part_type, part_id } => {
-                OuterFrame::PartEnd {
-                    part_type: part_type,
-                    part_id: part_id,
-                }
+                OuterFrame::PartEnd { part_type, part_id }
             }
             OuterState::DiscardPayload => OuterFrame::Discard,
             _ => panic!("part_end_frame called for state without payloads"),
@@ -94,6 +86,7 @@ impl OuterState {
 
 #[derive(Debug)]
 pub struct OuterDecoder {
+    #[allow(dead_code)]
     logger: slog::Logger,
     state: OuterState,
 }
@@ -112,7 +105,7 @@ impl Decoder for OuterDecoder {
 impl OuterDecoder {
     pub fn new(logger: slog::Logger) -> Self {
         OuterDecoder {
-            logger: logger,
+            logger,
             state: OuterState::Header,
         }
     }
@@ -154,7 +147,7 @@ impl OuterDecoder {
                     } else {
                         OuterState::Invalid
                     };
-                    return (Err(e.into()), next_state);
+                    return (Err(e), next_state);
                 };
                 let part_header = part_header.unwrap();
                 // If no part header was returned, this part wasn't
@@ -166,31 +159,22 @@ impl OuterDecoder {
                         let part_id = header.part_id();
                         (
                             Ok(Some(OuterFrame::Header(header))),
-                            OuterState::Payload {
-                                part_type: part_type,
-                                part_id: part_id,
-                            },
+                            OuterState::Payload { part_type, part_id },
                         )
                     }
                 }
             }
 
-            cur_state @ OuterState::Payload { .. } |
-            cur_state @ OuterState::DiscardPayload => {
-                let (payload, next_state) = Self::decode_payload(buf, cur_state);
-                (payload.map_err(|e| e.into()), next_state)
+            cur_state @ OuterState::Payload { .. } | cur_state @ OuterState::DiscardPayload => {
+                Self::decode_payload(buf, cur_state)
             }
 
             OuterState::StreamEnd => (Ok(Some(OuterFrame::StreamEnd)), OuterState::StreamEnd),
 
-            OuterState::Invalid => {
-                (
-                    Err(
-                        ErrorKind::Bundle2Decode("byte stream corrupt".into()).into(),
-                    ),
-                    OuterState::Invalid,
-                )
-            }
+            OuterState::Invalid => (
+                Err(ErrorKind::Bundle2Decode("byte stream corrupt".into())),
+                OuterState::Invalid,
+            ),
         }
     }
 
@@ -275,7 +259,7 @@ pub enum OuterFrame {
 impl OuterFrame {
     pub fn is_payload(&self) -> bool {
         match self {
-            &OuterFrame::Payload { .. } => true,
+            OuterFrame::Payload { .. } => true,
             _ => false,
         }
     }

@@ -12,19 +12,20 @@ use std::mem;
 
 use bytes::BytesMut;
 use slog;
-use tokio_io::codec::Decoder;
+use tokio_util::codec::Decoder;
 
-use mercurial_types::{Delta, Path};
 use mercurial_types::delta::Fragment;
-
-use InnerPart;
-use errors::*;
-use utils::BytesExt;
+use mercurial_types::{Delta, Path};
 
 use super::{CgDeltaChunk, Part, Section};
+use crate::bail;
+use crate::errors::*;
+use crate::utils::BytesExt;
+use crate::InnerPart;
 
 #[derive(Debug)]
 pub struct Cg2Unpacker {
+    #[allow(dead_code)]
     logger: slog::Logger,
     state: State,
 }
@@ -37,8 +38,8 @@ impl Part {
     /// When self does not contain a Section.
     pub fn section(&self) -> &Section {
         match self {
-            &Part::CgChunk(ref section, _) => section,
-            &Part::SectionEnd(ref section) => section,
+            Part::CgChunk(section, _) => section,
+            Part::SectionEnd(section) => section,
             _ => panic!("this Part does not contain a Section"),
         }
     }
@@ -50,7 +51,7 @@ impl Part {
     /// When self does not contain a CgDeltaChunk (it is a SectionEnd or End).
     pub fn chunk(&self) -> &CgDeltaChunk {
         match self {
-            &Part::CgChunk(_, ref chunk) => chunk,
+            Part::CgChunk(_, chunk) => chunk,
             _ => panic!("this Part does not contain a CgDeltaChunk"),
         }
     }
@@ -89,9 +90,7 @@ impl Decoder for Cg2Unpacker {
                     let msg = format!(
                         "incomplete changegroup: {} bytes remaining in \
                          buffer. State: {:?}, First 128 bytes: {:?}",
-                        len,
-                        self.state,
-                        bytes,
+                        len, self.state, bytes,
                     );
                     bail!(ErrorKind::Cg2Decode(msg));
                 }
@@ -100,7 +99,7 @@ impl Decoder for Cg2Unpacker {
                         "incomplete changegroup: expected state End, found {:?}",
                         self.state
                     );
-                    bail!(ErrorKind::Cg2Decode(msg))
+                    bail!(ErrorKind::Cg2Decode(msg));
                 }
                 Ok(None)
             }
@@ -112,44 +111,33 @@ impl Decoder for Cg2Unpacker {
 impl Cg2Unpacker {
     pub fn new(logger: slog::Logger) -> Self {
         Cg2Unpacker {
-            logger: logger,
+            logger,
             state: State::Changeset,
         }
     }
 
     fn decode_next(buf: &mut BytesMut, state: State) -> Result<(Option<Part>, State)> {
         match state {
-            State::Changeset => {
-                match Self::decode_chunk(buf)? {
-                    None => Ok((None, State::Changeset)),
-                    Some(CgChunk::Empty) => {
-                        Ok((
-                            Some(Part::SectionEnd(Section::Changeset)),
-                            State::Manifest,
-                        ))
-                    }
-                    Some(CgChunk::Delta(chunk)) => {
-                        Ok((
-                            Some(Part::CgChunk(Section::Changeset, chunk)),
-                            State::Changeset,
-                        ))
-                    }
+            State::Changeset => match Self::decode_chunk(buf)? {
+                None => Ok((None, State::Changeset)),
+                Some(CgChunk::Empty) => {
+                    Ok((Some(Part::SectionEnd(Section::Changeset)), State::Manifest))
                 }
-            }
-            State::Manifest => {
-                match Self::decode_chunk(buf)? {
-                    None => Ok((None, State::Manifest)),
-                    Some(CgChunk::Empty) => {
-                        Ok((Some(Part::SectionEnd(Section::Manifest)), State::Filename))
-                    }
-                    Some(CgChunk::Delta(chunk)) => {
-                        Ok((
-                            Some(Part::CgChunk(Section::Manifest, chunk)),
-                            State::Manifest,
-                        ))
-                    }
+                Some(CgChunk::Delta(chunk)) => Ok((
+                    Some(Part::CgChunk(Section::Changeset, chunk)),
+                    State::Changeset,
+                )),
+            },
+            State::Manifest => match Self::decode_chunk(buf)? {
+                None => Ok((None, State::Manifest)),
+                Some(CgChunk::Empty) => {
+                    Ok((Some(Part::SectionEnd(Section::Manifest)), State::Filename))
                 }
-            }
+                Some(CgChunk::Delta(chunk)) => Ok((
+                    Some(Part::CgChunk(Section::Manifest, chunk)),
+                    State::Manifest,
+                )),
+            },
             State::Filename => {
                 let filename = Self::decode_filename(buf)?;
                 match filename {
@@ -160,7 +148,7 @@ impl Cg2Unpacker {
             }
             State::Filelog(filename) => Self::decode_filelog_chunk(buf, filename),
             State::End => Ok((None, State::End)),
-            State::Invalid => Err(ErrorKind::Cg2Decode("byte stream corrupt".into()).into()),
+            State::Invalid => Err(ErrorKind::Cg2Decode("byte stream corrupt".into())),
         }
     }
 
@@ -168,17 +156,12 @@ impl Cg2Unpacker {
         match Self::decode_chunk(buf)? {
             None => Ok((None, State::Filelog(f))),
             Some(CgChunk::Empty) => {
-                Ok((
-                    Some(Part::SectionEnd(Section::Filelog(f))),
-                    State::Filename,
-                ))
+                Ok((Some(Part::SectionEnd(Section::Filelog(f))), State::Filename))
             }
-            Some(CgChunk::Delta(chunk)) => {
-                Ok((
-                    Some(Part::CgChunk(Section::Filelog(f.clone()), chunk)),
-                    State::Filelog(f),
-                ))
-            }
+            Some(CgChunk::Delta(chunk)) => Ok((
+                Some(Part::CgChunk(Section::Filelog(f.clone()), chunk)),
+                State::Filelog(f),
+            )),
         }
     }
 
@@ -198,8 +181,7 @@ impl Cg2Unpacker {
         if chunk_len < CHUNK_HEADER_LEN {
             let msg = format!(
                 "invalid chunk: length >= {} required, found {}",
-                CHUNK_HEADER_LEN,
-                chunk_len
+                CHUNK_HEADER_LEN, chunk_len
             );
             bail!(ErrorKind::Cg2Decode(msg));
         }
@@ -225,14 +207,14 @@ impl Cg2Unpacker {
         let linknode = buf.drain_node();
 
         let delta = Self::decode_delta(buf, chunk_len - CHUNK_HEADER_LEN)?;
-        return Ok(Some(CgChunk::Delta(CgDeltaChunk {
-            node: node,
-            p1: p1,
-            p2: p2,
-            base: base,
-            linknode: linknode,
-            delta: delta,
-        })));
+        Ok(Some(CgChunk::Delta(CgDeltaChunk {
+            node,
+            p1,
+            p2,
+            base,
+            linknode,
+            delta,
+        })))
     }
 
     fn decode_delta(buf: &mut BytesMut, mut remaining: usize) -> Result<Delta> {
@@ -255,8 +237,7 @@ impl Cg2Unpacker {
             if remaining < delta_len {
                 bail!(ErrorKind::Cg2Decode(format!(
                     "expected {} bytes, {} remaining",
-                    delta_len,
-                    remaining
+                    delta_len, remaining
                 )));
             }
 

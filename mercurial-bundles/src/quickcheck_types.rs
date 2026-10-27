@@ -7,19 +7,17 @@
 //! Quickcheck support for a few types that don't have support upstream,
 //! and for a few other test types.
 
-use std::convert::From;
 use std::iter;
-use std::result;
-use std::vec::IntoIter;
 
 use bytes::Bytes;
 use futures::stream;
-use quickcheck::{Arbitrary, Gen, empty_shrinker};
-
+use futures::Stream;
+use mercurial_types::delta::Fragment;
 use mercurial_types::{Delta, NodeHash, Path};
+use quickcheck::{empty_shrinker, single_shrinker, Arbitrary, Gen};
 
-use changegroup;
-use errors::*;
+use crate::changegroup;
+use crate::errors::*;
 
 #[derive(Clone, Debug)]
 pub struct QCBytes(Bytes);
@@ -31,13 +29,13 @@ impl From<QCBytes> for Bytes {
 }
 
 impl Arbitrary for QCBytes {
-    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+    fn arbitrary(g: &mut Gen) -> Self {
         // Just use the Vec<u8> quickcheck underneath.
         let v: Vec<u8> = Vec::arbitrary(g);
         QCBytes(v.into())
     }
 
-    fn shrink(&self) -> Box<Iterator<Item = Self>> {
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         Box::new(self.0.to_vec().shrink().map(|v| QCBytes(v.into())))
     }
 }
@@ -55,8 +53,7 @@ pub struct Cg2PartSequence {
 
 impl Cg2PartSequence {
     /// Combine all the changesets, manifests and filelogs into a single iterator.
-    pub fn as_iter<'a>(&'a self) -> Box<Iterator<Item = &'a changegroup::Part> + 'a> {
-        // Trying to describe the type here is madness. Just box it.
+    pub fn as_iter(&self) -> Box<dyn Iterator<Item = &changegroup::Part> + '_> {
         Box::new(
             self.changesets
                 .iter()
@@ -66,13 +63,13 @@ impl Cg2PartSequence {
                 .chain(
                     self.filelogs
                         .iter()
-                        .filter(|&&(ref parts, _)| {
+                        .filter(|entry| {
                             // If there are no filelog parts, it isn't valid to return a
                             // SectionEnd since that won't be referring to anything. So
                             // just skip the whole filelog.
-                            !parts.is_empty()
+                            !entry.0.is_empty()
                         })
-                        .flat_map(|&(ref parts, ref end)| parts.iter().chain(iter::once(end))),
+                        .flat_map(|entry| entry.0.iter().chain(iter::once(&entry.1))),
                 )
                 .chain(iter::once(&self.end)),
         )
@@ -82,9 +79,9 @@ impl Cg2PartSequence {
     ///
     /// This returns a clone of everything because streams can't really return
     /// references at the moment.
-    pub fn to_stream(&self) -> stream::Iter<IntoIter<result::Result<changegroup::Part, Error>>> {
-        let part_results: Vec<_> = self.as_iter().cloned().map(|x| Ok(x)).collect();
-        stream::iter(part_results.into_iter())
+    pub fn to_stream(&self) -> impl Stream<Item = Result<changegroup::Part>> + Unpin + use<'_> {
+        let part_results: Vec<_> = self.as_iter().cloned().map(Ok).collect();
+        stream::iter(part_results)
     }
 }
 
@@ -95,7 +92,7 @@ impl PartialEq<[changegroup::Part]> for Cg2PartSequence {
 }
 
 impl Arbitrary for Cg2PartSequence {
-    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+    fn arbitrary(g: &mut Gen) -> Self {
         use changegroup::*;
 
         // Generate a valid part sequence (changegroup, then manifest, then filelogs).
@@ -104,26 +101,26 @@ impl Arbitrary for Cg2PartSequence {
         let changesets = gen_parts(Section::Changeset, g);
         let manifests = gen_parts(Section::Manifest, g);
 
-        let nfilelogs = g.gen_range(0, size);
+        let nfilelogs = gen_range(g, 0, size);
         let mut filelogs = Vec::with_capacity(nfilelogs);
 
         for _ in 0..nfilelogs {
-            let path = Path::arbitrary(g);
+            let path = arbitrary_path(g);
             let section_end = Part::SectionEnd(Section::Filelog(path.clone()));
             filelogs.push((gen_parts(Section::Filelog(path), g), section_end));
         }
 
         Cg2PartSequence {
-            changesets: changesets,
+            changesets,
             changesets_end: Part::SectionEnd(Section::Changeset),
-            manifests: manifests,
+            manifests,
             manifests_end: Part::SectionEnd(Section::Manifest),
-            filelogs: filelogs,
+            filelogs,
             end: Part::End,
         }
     }
 
-    fn shrink(&self) -> Box<Iterator<Item = Self>> {
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         use changegroup::*;
 
         // All the parts can be shrinked independently as long as the section
@@ -134,24 +131,23 @@ impl Arbitrary for Cg2PartSequence {
                 self.changesets.clone(),
                 self.manifests.clone(),
                 self.filelogs.clone(),
-            ).shrink()
-                .map(|(c, m, f)| {
-                    Cg2PartSequence {
-                        changesets: c,
-                        changesets_end: Part::SectionEnd(Section::Changeset),
-                        manifests: m,
-                        manifests_end: Part::SectionEnd(Section::Manifest),
-                        filelogs: f,
-                        end: Part::End,
-                    }
+            )
+                .shrink()
+                .map(|(c, m, f)| Cg2PartSequence {
+                    changesets: c,
+                    changesets_end: Part::SectionEnd(Section::Changeset),
+                    manifests: m,
+                    manifests_end: Part::SectionEnd(Section::Manifest),
+                    filelogs: f,
+                    end: Part::End,
                 }),
         )
     }
 }
 
-fn gen_parts<G: Gen>(section: changegroup::Section, g: &mut G) -> Vec<changegroup::Part> {
+fn gen_parts(section: changegroup::Section, g: &mut Gen) -> Vec<changegroup::Part> {
     let size = g.size();
-    (0..g.gen_range(0, size))
+    (0..gen_range(g, 0, size))
         .map(|_| {
             changegroup::Part::CgChunk(section.clone(), changegroup::CgDeltaChunk::arbitrary(g))
         })
@@ -159,15 +155,15 @@ fn gen_parts<G: Gen>(section: changegroup::Section, g: &mut G) -> Vec<changegrou
 }
 
 impl Arbitrary for changegroup::Part {
-    fn arbitrary<G: Gen>(_g: &mut G) -> Self {
+    fn arbitrary(_g: &mut Gen) -> Self {
         unimplemented!()
     }
 
-    fn shrink(&self) -> Box<Iterator<Item = Self>> {
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         use changegroup::Part::CgChunk;
 
         match self {
-            &CgChunk(ref section, ref delta_chunk) => {
+            CgChunk(section, delta_chunk) => {
                 // Keep the section the same, but shrink the delta chunk.
                 let section = section.clone();
                 Box::new(
@@ -182,30 +178,119 @@ impl Arbitrary for changegroup::Part {
 }
 
 impl Arbitrary for changegroup::CgDeltaChunk {
-    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+    fn arbitrary(g: &mut Gen) -> Self {
         // TODO: should these be more structured? e.g. base = p1 some of the time
         changegroup::CgDeltaChunk {
-            node: NodeHash::arbitrary(g),
-            p1: NodeHash::arbitrary(g),
-            p2: NodeHash::arbitrary(g),
-            base: NodeHash::arbitrary(g),
-            linknode: NodeHash::arbitrary(g),
-            delta: Delta::arbitrary(g),
+            node: arbitrary_node(g),
+            p1: arbitrary_node(g),
+            p2: arbitrary_node(g),
+            base: arbitrary_node(g),
+            linknode: arbitrary_node(g),
+            delta: arbitrary_delta(g),
         }
     }
 
-    fn shrink(&self) -> Box<Iterator<Item = Self>> {
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         // Don't bother trying to shrink node hashes -- the meat is in the delta.
         let clone = self.clone();
-        Box::new(self.delta.shrink().map(move |delta| {
-            changegroup::CgDeltaChunk {
-                node: clone.node.clone(),
-                p1: clone.p1.clone(),
-                p2: clone.p2.clone(),
-                base: clone.base.clone(),
-                linknode: clone.linknode.clone(),
-                delta: delta,
-            }
-        }))
+        Box::new(
+            shrink_delta(&self.delta).map(move |delta| changegroup::CgDeltaChunk {
+                node: clone.node,
+                p1: clone.p1,
+                p2: clone.p2,
+                base: clone.base,
+                linknode: clone.linknode,
+                delta,
+            }),
+        )
+    }
+}
+
+fn gen_range(g: &mut Gen, low: usize, high: usize) -> usize {
+    if low >= high {
+        return low;
+    }
+    low + usize::arbitrary(g) % (high - low)
+}
+
+fn arbitrary_node(g: &mut Gen) -> NodeHash {
+    let mut bytes = [0u8; 20];
+    // The null hash is special, so give it a 5% chance of happening.
+    if usize::arbitrary(g) % 20 != 0 {
+        for byte in &mut bytes {
+            *byte = u8::arbitrary(g);
+        }
+    }
+    NodeHash::from_bytes(&bytes).unwrap()
+}
+
+fn arbitrary_path(g: &mut Gen) -> Path {
+    let size = g.size().max(1);
+    let size_sqrt = ((size as f64).sqrt() as usize).max(2);
+    let chars: Vec<u8> = (1..b'/').chain((b'/' + 1)..255).collect();
+    let mut path = Vec::new();
+    let ncomp = gen_range(g, 1, size_sqrt);
+    for i in 0..ncomp {
+        if i > 0 {
+            path.push(b'/');
+        }
+        let n = gen_range(g, 1, 2 * size_sqrt);
+        for _ in 0..n {
+            path.push(*g.choose(&chars).unwrap());
+        }
+    }
+    Path::new(path).unwrap()
+}
+
+fn lognormal_sample(g: &mut Gen, mean: f64, std_dev: f64) -> f64 {
+    let u1 = ((u64::arbitrary(g) >> 11) | 1) as f64 / ((1u64 << 53) as f64);
+    let u2 = (u64::arbitrary(g) >> 11) as f64 / ((1u64 << 53) as f64);
+    let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+    (mean + std_dev * z).exp()
+}
+
+fn arbitrary_frag_content(g: &mut Gen) -> Vec<u8> {
+    let size = g.size();
+    let sample = lognormal_sample(g, -3.0, 2.0);
+    let raw = (size as f64) * sample;
+    let content_len = if raw.is_finite() && raw > 0.0 {
+        (raw as usize).min(size.max(1))
+    } else {
+        0
+    };
+
+    let mut v = vec![0u8; content_len];
+    for byte in &mut v {
+        *byte = u8::arbitrary(g);
+    }
+    v
+}
+
+fn arbitrary_delta(g: &mut Gen) -> Delta {
+    let size = g.size().max(1);
+    let nfrags = gen_range(g, 0, size);
+    let mut end = 0usize;
+    let mut frags = Vec::with_capacity(nfrags);
+    for _ in 0..nfrags {
+        let start = end + gen_range(g, 0, size);
+        end = start + gen_range(g, 0, size);
+        frags.push(Fragment {
+            start,
+            end,
+            content: arbitrary_frag_content(g),
+        });
+    }
+    Delta::new(frags).unwrap()
+}
+
+fn shrink_delta(delta: &Delta) -> Box<dyn Iterator<Item = Delta>> {
+    let mut frags = delta.fragments().to_vec();
+    if frags.is_empty() {
+        return empty_shrinker();
+    }
+    frags.pop();
+    match Delta::new(frags) {
+        Ok(delta) => single_shrinker(delta),
+        Err(_) => empty_shrinker(),
     }
 }

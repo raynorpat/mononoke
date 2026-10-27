@@ -4,14 +4,15 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use std::convert::From;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use futures::{Async, Poll, Stream};
+use byteorder::{BigEndian, ByteOrder};
+use bytes::BufMut;
+use futures::Stream;
 
-use byteorder::ByteOrder;
-use bytes::{BigEndian, BufMut};
-use chunk::Chunk;
-use errors::*;
+use crate::chunk::Chunk;
+use crate::errors::*;
 
 use super::{CgDeltaChunk, Part, Section};
 
@@ -23,36 +24,38 @@ pub struct Cg2Packer<S> {
 impl<S> Cg2Packer<S> {
     pub fn new(delta_stream: S) -> Self {
         Cg2Packer {
-            delta_stream: delta_stream,
+            delta_stream,
             last_seen: Section::Changeset,
         }
     }
 }
 
-impl<S> Stream for Cg2Packer<S>
+impl<S, E> Stream for Cg2Packer<S>
 where
-    S: Stream<Item = Part>,
-    Error: From<S::Error>,
+    S: Stream<Item = std::result::Result<Part, E>> + Unpin,
+    Error: From<E>,
 {
-    type Item = Chunk;
-    type Error = Error;
+    type Item = Result<Chunk>;
 
-    fn poll(&mut self) -> Poll<Option<Chunk>, Error> {
-        use self::Part::*;
-
-        match try_ready!(self.delta_stream.poll()) {
-            None => Ok(Async::Ready(None)),
-            Some(CgChunk(section, delta_chunk)) => {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.delta_stream).poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err.into()))),
+            Poll::Ready(Some(Ok(Part::CgChunk(section, delta_chunk)))) => {
                 let mut builder = ChunkBuilder::new();
-                if self.last_seen != section {
+                if this.last_seen != section {
                     builder.encode_section(&section);
-                    self.last_seen = section;
+                    this.last_seen = section;
                 }
                 builder.encode_delta_chunk(delta_chunk);
-                Ok(Async::Ready(Some(builder.build()?)))
+                Poll::Ready(Some(builder.build()))
             }
-            Some(SectionEnd(_section)) => Ok(Async::Ready(Some(empty_cg_chunk()))),
-            Some(End) => Ok(Async::Ready(Some(empty_cg_chunk()))),
+            Poll::Ready(Some(Ok(Part::SectionEnd(_section)))) => {
+                Poll::Ready(Some(Ok(empty_cg_chunk())))
+            }
+            Poll::Ready(Some(Ok(Part::End))) => Poll::Ready(Some(Ok(empty_cg_chunk()))),
         }
     }
 }
@@ -90,7 +93,7 @@ impl ChunkBuilder {
         // Changeset and manifest sections are implicitly encoded, so we don't
         // need to do anything there.
         // TODO: will need to encode tree manifests here as well
-        if let &Section::Filelog(ref f) = section {
+        if let Section::Filelog(f) = section {
             // Note that the filename length must include the four bytes for itself.
             BigEndian::write_i32(&mut self.inner[0..], (f.len() + 4) as i32);
             self.inner.put_slice(f.as_slice());
@@ -109,10 +112,9 @@ impl ChunkBuilder {
         self.inner.put_slice(chunk.linknode.as_ref());
 
         for fragment in chunk.delta.fragments() {
-            self.inner.put_i32::<BigEndian>(fragment.start as i32);
-            self.inner.put_i32::<BigEndian>(fragment.end as i32);
-            self.inner
-                .put_i32::<BigEndian>(fragment.content.len() as i32);
+            self.inner.put_i32(fragment.start as i32);
+            self.inner.put_i32(fragment.end as i32);
+            self.inner.put_i32(fragment.content.len() as i32);
             self.inner.put_slice(&fragment.content[..]);
         }
 

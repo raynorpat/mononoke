@@ -26,7 +26,7 @@ pub enum Part {
 impl Part {
     pub fn is_section_end(&self) -> bool {
         match self {
-            &Part::SectionEnd(_) => true,
+            Part::SectionEnd(_) => true,
             _ => false,
         }
     }
@@ -46,36 +46,32 @@ pub struct CgDeltaChunk {
 mod test {
     use std::io::{self, Cursor};
 
-    use futures::Stream;
-    use quickcheck::{QuickCheck, StdGen, TestResult};
-    use rand;
-    use slog::{Drain, Logger};
-    use slog_term;
-    use tokio_core::reactor::Core;
-    use tokio_io::codec::{FramedRead, FramedWrite};
-
+    use futures::executor::block_on;
+    use futures::{SinkExt, StreamExt, TryStreamExt};
     use futures_ext::StreamLayeredExt;
-    use partial_io::{GenWouldBlock, PartialAsyncRead, PartialAsyncWrite, PartialWithErrors};
-
-    use chunk::{ChunkDecoder, ChunkEncoder};
-    use quickcheck_types::Cg2PartSequence;
+    use partial_io::quickcheck_types::{GenWouldBlock, PartialWithErrors};
+    use partial_io::{PartialAsyncRead, PartialAsyncWrite};
+    use quickcheck::{Gen, QuickCheck, TestResult};
+    use slog::{o, Drain, Logger};
+    use slog_term;
+    use tokio_util::codec::{FramedRead, FramedWrite};
 
     use super::*;
+    use crate::chunk::{ChunkDecoder, ChunkEncoder};
+    use crate::quickcheck_types::Cg2PartSequence;
 
     #[test]
     fn test_roundtrip() {
         // Each test case gets pretty big (O(size**2) parts (because of
         // filelogs), each part with O(size) deltas), so reduce the size a bit
         // and generate a smaller number of test cases.
-        let rng = StdGen::new(rand::thread_rng(), 50);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(50);
-        // Use NoErrors here because:
-        // - AsyncWrite impls aren't supposed to return Interrupted errors.
-        // - WouldBlock would require parking and unparking the task, which
-        //   isn't yet supported in partial-io.
+        //
+        // WouldBlock is turned into Poll::Pending and the waker is woken, so
+        // block_on can drive partial writes and reads.
+        let mut quickcheck = QuickCheck::new().rng(Gen::new(50)).tests(50);
         quickcheck.quickcheck(
-            roundtrip as
-                fn(
+            roundtrip
+                as fn(
                     Cg2PartSequence,
                     PartialWithErrors<GenWouldBlock>,
                     PartialWithErrors<GenWouldBlock>,
@@ -86,11 +82,10 @@ mod test {
     #[test]
     fn test_roundtrip_giant() {
         // Test a smaller number of cases with much larger inputs.
-        let rng = StdGen::new(rand::thread_rng(), 200);
-        let mut quickcheck = QuickCheck::new().gen(rng).tests(1);
+        let mut quickcheck = QuickCheck::new().rng(Gen::new(200)).tests(1);
         quickcheck.quickcheck(
-            roundtrip as
-                fn(
+            roundtrip
+                as fn(
                     Cg2PartSequence,
                     PartialWithErrors<GenWouldBlock>,
                     PartialWithErrors<GenWouldBlock>,
@@ -103,35 +98,25 @@ mod test {
         write_ops: PartialWithErrors<GenWouldBlock>,
         read_ops: PartialWithErrors<GenWouldBlock>,
     ) -> TestResult {
-        // Encode this sequence.
         let cursor = Cursor::new(Vec::with_capacity(32 * 1024));
         let partial_write = PartialAsyncWrite::new(cursor, write_ops);
-        let packer = packer::Cg2Packer::new(seq.to_stream());
-        let sink = FramedWrite::new(partial_write, ChunkEncoder);
-        let encode_fut = packer.forward(sink);
-
-        let mut core = Core::new().unwrap();
-        let (_, sink) = core.run(encode_fut).unwrap();
+        let mut packer = packer::Cg2Packer::new(seq.to_stream());
+        let mut sink = FramedWrite::new(partial_write, ChunkEncoder);
+        block_on(sink.send_all(&mut packer)).unwrap();
         let mut cursor = sink.into_inner().into_inner();
 
-        // Decode it.
         cursor.set_position(0);
 
         let partial_read = PartialAsyncRead::new(cursor, read_ops);
         let chunks = FramedRead::new(partial_read, ChunkDecoder)
-            .map(|chunk| chunk.into_bytes().expect("expected normal chunk"));
+            .map(|chunk| chunk.and_then(|chunk| chunk.into_bytes().map_err(|err| err)));
 
         let logger = make_root_logger();
         let unpacker = unpacker::Cg2Unpacker::new(logger);
         let part_stream = chunks.decode(unpacker);
 
-        let parts = Vec::new();
-        let decode_fut = part_stream
-            .map_err(|e| -> () { panic!("unexpected error: {}", e) })
-            .map(|x| x.cg2_part())
-            .forward(parts);
-
-        let (_, parts) = core.run(decode_fut).unwrap();
+        let parts: Vec<Part> = block_on(part_stream.map_ok(|part| part.cg2_part()).try_collect())
+            .unwrap_or_else(|err| panic!("unexpected error: {}", err));
 
         if seq != parts[..] {
             return TestResult::failed();

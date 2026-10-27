@@ -6,15 +6,15 @@
 
 //! Construct and serialize headers for bundle2 parts.
 
-use std::ascii::AsciiExt;
 use std::collections::HashMap;
 
 use ascii::{AsciiStr, AsciiString, IntoAsciiString};
-use bytes::{BigEndian, BufMut, Bytes};
+use bytes::{BufMut, Bytes};
 
-use chunk::Chunk;
-use errors::*;
-use utils::BytesExt;
+use crate::bail;
+use crate::chunk::Chunk;
+use crate::errors::*;
+use crate::utils::BytesExt;
 
 /// A bundle2 part header.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,7 +67,7 @@ impl PartHeader {
         out_buf.put_slice(self.part_type.as_bytes());
 
         // part id
-        out_buf.put_u32::<BigEndian>(self.part_id);
+        out_buf.put_u32(self.part_id);
 
         // mandatory/advisory params
         let num_mparams = self.mparams.len() as u8;
@@ -95,11 +95,11 @@ impl PartHeader {
         // the actual params themselves
         for &(ref key, ref val) in &mparams {
             out_buf.put_slice(key.as_bytes());
-            out_buf.put_slice(&val);
+            out_buf.put_slice(val);
         }
         for &(ref key, ref val) in &aparams {
             out_buf.put_slice(key.as_bytes());
-            out_buf.put_slice(&val);
+            out_buf.put_slice(val);
         }
 
         // This can only fail because the chunk is too big, but the restrictions
@@ -145,16 +145,15 @@ pub fn decode(mut header_bytes: Bytes) -> Result<PartHeader> {
 
     for cur in 0..nmparams {
         let (ksize, vsize) = param_sizes[cur];
-        let (key, val) = decode_header_param(&mut header_bytes, ksize, vsize)
-            .chain_err(|| {
-                let err_msg = format!(
-                    "part '{}' (id {}): invalid param {}",
-                    header.part_type(),
-                    part_id,
-                    cur
-                );
-                ErrorKind::Bundle2Decode(err_msg)
-            })?;
+        let (key, val) = decode_header_param(&mut header_bytes, ksize, vsize).chain_err(|| {
+            let err_msg = format!(
+                "part '{}' (id {}): invalid param {}",
+                header.part_type(),
+                part_id,
+                cur
+            );
+            ErrorKind::Bundle2Decode(err_msg)
+        })?;
         header
             .add_mparam(key, val)
             .chain_err(|| ErrorKind::Bundle2Decode("invalid part header".into()))?;
@@ -162,16 +161,15 @@ pub fn decode(mut header_bytes: Bytes) -> Result<PartHeader> {
 
     for cur in nmparams..(nmparams + naparams) {
         let (ksize, vsize) = param_sizes[cur];
-        let (key, val) = decode_header_param(&mut header_bytes, ksize, vsize)
-            .chain_err(|| {
-                let err_msg = format!(
-                    "part '{}' (id {}): invalid param {}",
-                    header.part_type(),
-                    part_id,
-                    cur
-                );
-                ErrorKind::Bundle2Decode(err_msg)
-            })?;
+        let (key, val) = decode_header_param(&mut header_bytes, ksize, vsize).chain_err(|| {
+            let err_msg = format!(
+                "part '{}' (id {}): invalid param {}",
+                header.part_type(),
+                part_id,
+                cur
+            );
+            ErrorKind::Bundle2Decode(err_msg)
+        })?;
         header
             .add_aparam(key, val)
             .chain_err(|| ErrorKind::Bundle2Decode("invalid part header".into()))?;
@@ -183,7 +181,7 @@ pub fn decode(mut header_bytes: Bytes) -> Result<PartHeader> {
 fn decode_header_param(buf: &mut Bytes, ksize: usize, vsize: usize) -> Result<(String, Bytes)> {
     let key = buf.drain_str(ksize).chain_err(|| "invalid key")?;
     let val = buf.split_to(vsize);
-    return Ok((key, val));
+    Ok((key, val))
 }
 
 /// Builder for a bundle2 part header.
@@ -212,10 +210,10 @@ impl PartHeaderBuilder {
     {
         let part_type = part_type
             .into_ascii_string()
-            .chain_err(|| "invalid part type")?;
+            .map_err(|err| Error::with_chain(err.to_string(), "invalid part type"))?;
         Self::check_part_type(&part_type)?;
         Ok(PartHeaderBuilder {
-            part_type: part_type,
+            part_type,
             mparams: HashMap::with_capacity(mparam_capacity),
             aparams: HashMap::with_capacity(aparam_capacity),
         })
@@ -229,11 +227,8 @@ impl PartHeaderBuilder {
         let key = key.into();
         let val = val.into();
         self.check_param(&key, &val)?;
-        if self.mparams.len() >= u8::max_value() as usize {
-            bail!(
-                "number of mandatory params exceeds maximum {}",
-                u8::max_value()
-            );
+        if self.mparams.len() >= u8::MAX as usize {
+            bail!("number of mandatory params exceeds maximum {}", u8::MAX);
         }
         self.mparams.insert(key, val);
         Ok(self)
@@ -247,11 +242,8 @@ impl PartHeaderBuilder {
         let key = key.into();
         let val = val.into();
         self.check_param(&key, &val)?;
-        if self.aparams.len() >= u8::max_value() as usize {
-            bail!(
-                "number of advisory params exceeds maximum {}",
-                u8::max_value()
-            );
+        if self.aparams.len() >= u8::MAX as usize {
+            bail!("number of advisory params exceeds maximum {}", u8::MAX);
         }
         self.aparams.insert(key, val);
         Ok(self)
@@ -269,8 +261,8 @@ impl PartHeaderBuilder {
         let part_type_lower = self.part_type.to_ascii_lowercase();
         PartHeader {
             part_type: self.part_type,
-            part_type_lower: part_type_lower,
-            part_id: part_id,
+            part_type_lower,
+            part_id,
             mparams: self.mparams,
             aparams: self.aparams,
         }
@@ -280,12 +272,8 @@ impl PartHeaderBuilder {
         if part_type.is_empty() {
             bail!("part type empty");
         }
-        if part_type.len() > u8::max_value() as usize {
-            bail!(
-                "part type '{}' exceeds max length {}",
-                part_type,
-                u8::max_value()
-            );
+        if part_type.len() > u8::MAX as usize {
+            bail!("part type '{}' exceeds max length {}", part_type, u8::MAX);
         }
         Ok(())
     }
@@ -301,12 +289,12 @@ impl PartHeaderBuilder {
         if key.is_empty() {
             bail!("part '{}': empty key", self.part_type);
         }
-        if key.len() > u8::max_value() as usize {
+        if key.len() > u8::MAX as usize {
             bail!(
                 "part '{}': key '{}' exceeds max length {}",
                 self.part_type,
                 key,
-                u8::max_value()
+                u8::MAX
             );
         }
         if val.is_empty() {
@@ -316,12 +304,12 @@ impl PartHeaderBuilder {
                 key
             );
         }
-        if val.len() > u8::max_value() as usize {
+        if val.len() > u8::MAX as usize {
             bail!(
                 "part '{}': value for key '{}' exceeds max length {}",
                 self.part_type,
                 key,
-                u8::max_value()
+                u8::MAX
             );
         }
         Ok(())
@@ -330,12 +318,16 @@ impl PartHeaderBuilder {
 
 #[cfg(test)]
 mod test {
-    use quickcheck::{TestResult, quickcheck};
+    use std::collections::HashMap;
 
-    use quickcheck_types::QCBytes;
+    use ascii::AsciiString;
+    use bytes::Bytes;
+    use quickcheck::{quickcheck, TestResult};
+
     use super::*;
+    use crate::quickcheck_types::QCBytes;
 
-    const MAX_LEN: usize = ::std::u8::MAX as usize;
+    const MAX_LEN: usize = u8::MAX as usize;
 
     #[test]
     fn test_check_part_type() {
@@ -364,18 +356,28 @@ mod test {
     #[test]
     fn test_roundtrip() {
         quickcheck(
-            roundtrip as
-                fn(AsciiString, u32, HashMap<String, QCBytes>, HashMap<String, QCBytes>)
-                    -> TestResult,
+            roundtrip
+                as fn(
+                    Vec<u8>,
+                    u32,
+                    HashMap<String, QCBytes>,
+                    HashMap<String, QCBytes>,
+                ) -> TestResult,
         );
     }
 
     fn roundtrip(
-        part_type: AsciiString,
+        part_type: Vec<u8>,
         part_id: u32,
         mparams: HashMap<String, QCBytes>,
         aparams: HashMap<String, QCBytes>,
     ) -> TestResult {
+        // AsciiString has no Arbitrary impl. Mask to ASCII so the property still
+        // exercises encode/decode instead of discarding almost every string.
+        let part_type: Vec<u8> = part_type.into_iter().map(|b| b & 0x7f).collect();
+        let Ok(part_type) = AsciiString::from_ascii(part_type) else {
+            return TestResult::discard();
+        };
         match roundtrip_inner(part_type, part_id, mparams, aparams) {
             Ok(test_result) => test_result,
             Err(_err) => TestResult::discard(),

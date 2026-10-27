@@ -8,16 +8,20 @@
 
 use std::fmt::{self, Debug, Formatter};
 use std::mem;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures::{Async, Future, Poll, Stream};
+use futures::future::FutureExt;
+use futures::stream::StreamExt;
+use futures::{Future, Stream};
 
-use chunk::Chunk;
-use errors::*;
-use part_header::{PartHeader, PartHeaderBuilder};
+use crate::chunk::Chunk;
+use crate::errors::*;
+use crate::part_header::{PartHeader, PartHeaderBuilder};
 
 /// Represents a stream of chunks produced by the individual part handler.
-pub struct ChunkStream(Box<Stream<Item = Chunk, Error = Error> + Send>);
+pub struct ChunkStream(Pin<Box<dyn Stream<Item = Result<Chunk>> + Send>>);
 
 impl Debug for ChunkStream {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -105,41 +109,48 @@ impl PartEncodeBuilder {
         Ok(self)
     }
 
-    pub fn set_data_future<T>(&mut self, future: T) -> &mut Self
+    pub fn set_data_future<F, B>(&mut self, future: F) -> &mut Self
     where
-        T: Future<Error = Error> + Send + 'static,
-        T::Item: Into<Bytes>,
+        F: Future<Output = Result<B>> + Send + 'static,
+        B: Into<Bytes> + 'static,
     {
-        let stream = future.and_then(Chunk::new).into_stream();
+        let stream = future
+            .into_stream()
+            .map(|result| result.and_then(|bytes| Chunk::new(bytes.into())));
         self.set_data_generated(stream)
     }
 
     pub fn set_data_generated<S>(&mut self, stream: S) -> &mut Self
     where
-        S: 'static + Stream<Item = Chunk, Error = Error> + Send,
+        S: Stream<Item = Result<Chunk>> + Send + 'static,
     {
-        self.data = PartEncodeData::Generated(ChunkStream(Box::new(stream)));
+        self.data = PartEncodeData::Generated(ChunkStream(Box::pin(stream)));
         self
     }
 
     pub fn build(self, part_id: u32) -> PartEncode {
-        PartEncode { state: GenerationState::NotStarted(self.headerb.build(part_id), self.data) }
+        PartEncode {
+            state: GenerationState::NotStarted(self.headerb.build(part_id), self.data),
+        }
     }
 }
 
 impl Stream for PartEncode {
-    type Item = Chunk;
-    type Error = Error;
+    type Item = Result<Chunk>;
 
-    fn poll(&mut self) -> Poll<Option<Chunk>, Error> {
-        let (ret, next_state) = Self::poll_next(self.state.take());
-        self.state = next_state;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let (ret, next_state) = Self::poll_state(this.state.take(), cx);
+        this.state = next_state;
         ret
     }
 }
 
 impl PartEncode {
-    fn poll_next(state: GenerationState) -> (Poll<Option<Chunk>, Error>, GenerationState) {
+    fn poll_state(
+        state: GenerationState,
+        cx: &mut Context<'_>,
+    ) -> (Poll<Option<Result<Chunk>>>, GenerationState) {
         // An individual part has three sections:
         // (1) a header (1 chunk)
         // (2) the payload (0-many chunks)
@@ -160,27 +171,22 @@ impl PartEncode {
                 let next_state = match data {
                     PartEncodeData::Fixed(b) => Fixed(b),
                     PartEncodeData::None => EmptyChunk,
-                    PartEncodeData::Generated(ChunkStream(stream)) => {
-                        Generating(ChunkStream(stream))
-                    }
+                    PartEncodeData::Generated(stream) => Generating(stream),
                 };
-                (Ok(Async::Ready(Some(header_chunk))), next_state)
+                (Poll::Ready(Some(Ok(header_chunk))), next_state)
             }
-            Generating(ChunkStream(mut stream)) => {
-                match stream.poll() {
-                    Ok(Async::Ready(Some(v))) => {
-                        // TODO: don't send too large or too small chunks to clients
-                        (Ok(Async::Ready(Some(v))), Generating(ChunkStream(stream)))
-                    }
-                    Ok(Async::Ready(None)) => (Ok(Async::Ready(Some(Chunk::empty()))), Done),
-                    Ok(Async::NotReady) => (Ok(Async::NotReady), Generating(ChunkStream(stream))),
-                    // TODO: produce an error part for (some kinds of?) errors
-                    Err(e) => (Err(e), Generating(ChunkStream(stream))),
+            Generating(mut stream) => match stream.0.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(v))) => {
+                    // TODO: don't send too large or too small chunks to clients
+                    (Poll::Ready(Some(Ok(v))), Generating(stream))
                 }
-            }
-            Fixed(chunk) => (Ok(Async::Ready(Some(chunk))), EmptyChunk),
-            EmptyChunk => (Ok(Async::Ready(Some(Chunk::empty()))), Done),
-            Done => (Ok(Async::Ready(None)), Done),
+                Poll::Ready(Some(Err(e))) => (Poll::Ready(Some(Err(e))), Generating(stream)),
+                Poll::Ready(None) => (Poll::Ready(Some(Ok(Chunk::empty()))), Done),
+                Poll::Pending => (Poll::Pending, Generating(stream)),
+            },
+            Fixed(chunk) => (Poll::Ready(Some(Ok(chunk))), EmptyChunk),
+            EmptyChunk => (Poll::Ready(Some(Ok(Chunk::empty()))), Done),
+            Done => (Poll::Ready(None), Done),
             Invalid => panic!("invalid state"),
         }
     }

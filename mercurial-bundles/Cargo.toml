@@ -1,0 +1,25 @@
+[package]
+name = "mercurial-bundles"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ascii = "1"
+async-compression = { path = "../async-compression" }
+byteorder = "1"
+bytes = "1"
+futures = "0.3"
+futures-ext = { path = "../futures-ext" }
+mercurial-types = { path = "../mercurial-types" }
+percent-encoding = "2"
+slog = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+assert_matches = "1.5"
+partial-io = { version = "0.5", features = ["tokio1", "quickcheck1"] }
+quickcheck = "1"
+slog-term = "2"
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }
