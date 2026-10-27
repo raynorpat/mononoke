@@ -391,3 +391,80 @@ fn append_snapshot_rejects_unknown_parent() {
     let kept = revlog.get_rev(RevIdx::from(0u32)).expect("unchanged");
     assert_eq!(kept.as_blob().as_slice(), Some(&b"alpha\n"[..]));
 }
+
+/// Entry 0 carries the feature word and version 1 in its first four bytes.
+/// Parents and linkrev stay `u32::MAX` from `ng_entry`.
+fn stamp_separate_header(entry: &mut [u8; 64], features: u16, node_byte: u8) {
+    entry[0..2].copy_from_slice(&features.to_be_bytes());
+    entry[2..4].copy_from_slice(&1u16.to_be_bytes());
+    entry[51] = node_byte;
+}
+
+fn zlib_frame(text: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(text).expect("zlib");
+    let frame = enc.finish().expect("zlib");
+    assert_eq!(frame[0], b'x');
+    frame
+}
+
+#[test]
+fn changelog_self_base_zstd_reads_full_text() {
+    let chunk = zstd::encode_all(&b"hello changelog"[..], 0).expect("zstd");
+    let mut entry = ng_entry(0, chunk.len() as u32, 0);
+    stamp_separate_header(&mut entry, 0x0000, 1);
+    let revlog = Revlog::new(entry.to_vec(), Some(chunk)).expect("revlog");
+    let node = revlog.get_rev(RevIdx::from(0u32)).expect("rev");
+    assert_eq!(node.as_blob().as_slice(), Some(&b"hello changelog"[..]));
+}
+
+#[test]
+fn non_generaldelta_self_base_zlib_and_raw_are_literals() {
+    let mut raw = vec![b'u'];
+    raw.extend_from_slice(b"raw-text");
+    let zlib = zlib_frame(b"zlib-text");
+
+    for (chunk, text) in [(raw, &b"raw-text"[..]), (zlib, &b"zlib-text"[..])] {
+        let mut entry = ng_entry(0, chunk.len() as u32, 0);
+        stamp_separate_header(&mut entry, 0x0000, 1);
+        let revlog = Revlog::new(entry.to_vec(), Some(chunk)).expect("revlog");
+        let node = revlog.get_rev(RevIdx::from(0u32)).expect("rev");
+        assert_eq!(node.as_blob().as_slice(), Some(text));
+    }
+}
+
+#[test]
+fn sparse_chain_skips_unrelated_revision() {
+    let mut rev0 = vec![b'u'];
+    rev0.extend_from_slice(b"aaaa");
+    let mut rev1 = vec![b'u'];
+    rev1.extend_from_slice(b"zzzz");
+    let mut rev2 = vec![b'u'];
+    // One fragment: start=0, end=1, len=1, content=b.
+    rev2.extend_from_slice(&0u32.to_be_bytes());
+    rev2.extend_from_slice(&1u32.to_be_bytes());
+    rev2.extend_from_slice(&1u32.to_be_bytes());
+    rev2.push(b'b');
+
+    let mut entry0 = ng_entry(0, rev0.len() as u32, 0);
+    stamp_separate_header(&mut entry0, 0x0002, 1);
+    let mut entry1 = ng_entry(rev0.len() as u64, rev1.len() as u32, 1);
+    entry1[51] = 2;
+    let mut entry2 = ng_entry((rev0.len() + rev1.len()) as u64, rev2.len() as u32, 0);
+    entry2[51] = 3;
+
+    let mut idx = Vec::with_capacity(192);
+    idx.extend_from_slice(&entry0);
+    idx.extend_from_slice(&entry1);
+    idx.extend_from_slice(&entry2);
+    let mut data = Vec::new();
+    data.extend_from_slice(&rev0);
+    data.extend_from_slice(&rev1);
+    data.extend_from_slice(&rev2);
+
+    let revlog = Revlog::new(idx, Some(data)).expect("revlog");
+    let node = revlog.get_rev(RevIdx::from(2u32)).expect("rev");
+    assert_eq!(node.as_blob().as_slice(), Some(&b"baaa"[..]));
+}
