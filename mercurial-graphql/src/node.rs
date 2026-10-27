@@ -6,12 +6,29 @@
 
 use std::ops::Deref;
 
-use juniper::Value;
+use juniper::GraphQLScalar;
 
 use mercurial_types::NodeHash;
 
-#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, GraphQLScalar)]
+#[graphql(
+    name = "NodeId",
+    description = "Unique ID of a particular version of a file.",
+    to_output_with = Self::to_output,
+    from_input_with = Self::from_input,
+    parse_token(String)
+)]
 pub struct GQLNodeId(NodeHash);
+
+impl GQLNodeId {
+    fn to_output(&self) -> String {
+        self.0.to_string()
+    }
+
+    fn from_input(input: &str) -> Result<Self, String> {
+        input.parse().map(GQLNodeId).map_err(|err| err.to_string())
+    }
+}
 
 impl From<NodeHash> for GQLNodeId {
     fn from(nodehash: NodeHash) -> Self {
@@ -32,15 +49,3 @@ impl Deref for GQLNodeId {
         &self.0
     }
 }
-
-graphql_scalar!(GQLNodeId as "NodeId" {
-    description: "Unique ID of a particular version of a file."
-
-    resolve(&self) -> Value {
-        Value::string(format!("{}", &self.0))
-    }
-
-    from_input_value(v: &InputValue) -> Option<GQLNodeId> {
-        v.as_string_value().and_then(|s| s.parse().ok()).map(GQLNodeId)
-    }
-});

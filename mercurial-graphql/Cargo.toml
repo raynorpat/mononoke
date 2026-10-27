@@ -1,0 +1,10 @@
+[package]
+name = "mercurial-graphql"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures = "0.3"
+juniper = "0.17"
+mercurial = { path = "../mercurial" }
+mercurial-types = { path = "../mercurial-types" }

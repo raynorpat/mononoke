@@ -4,87 +4,63 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-// declare dependencies on other crates
-extern crate clap; // 3rd party command line parser
-extern crate mercurial; // mercurial stuff
-#[macro_use]
-extern crate error_chain;
+use std::str::FromStr;
 
-// Import symbols from std:: (standard library)
-use std::str::{self, FromStr};
+use clap::{Arg, Command};
 
-// Just need `App` from clap
-use clap::App;
-
-// Get `Revlog` and `RevIdx` from revlog module.
 use mercurial::revlog::{RevIdx, Revlog};
-
-mod errors {
-    use mercurial;
-
-    error_chain! {
-        links {
-            Mercurial(mercurial::Error, mercurial::ErrorKind);
-        }
-    }
-}
-
-use errors::*;
+use mercurial::Result;
 
 fn run() -> Result<()> {
-    // Define command line args and parse command line
-    let matches = App::new("idxdump")
+    let matches = Command::new("idxdump")
         .version("0.0.0")
         .about("dump index entries")
-        .args_from_usage(concat!(
-            "<IDXFILE>               'index file'\n",
-            "[<REV>]                 'revision index'"
-        ))
+        .arg(
+            Arg::new("IDXFILE")
+                .help("index file")
+                .required(true)
+                .index(1),
+        )
+        .arg(Arg::new("REV").help("revision index").index(2))
         .get_matches();
 
-    // get path to index file
-    let idxpath = matches.value_of("IDXFILE").unwrap();
-
-    // Get optional index of entry within index file to start dumping from
-    let revidx: Option<RevIdx> = match matches.value_of("REV").map(FromStr::from_str) {
-        Some(Ok(v)) => Some(v),
-        Some(Err(err)) => bail!("idx malformed: {:?}", err),
+    let idxpath = matches.get_one::<String>("IDXFILE").unwrap();
+    let revidx: Option<RevIdx> = match matches
+        .get_one::<String>("REV")
+        .map(|rev| FromStr::from_str(rev))
+    {
+        Some(Ok(idx)) => Some(idx),
+        Some(Err(err)) => return Err(format!("idx malformed: {:?}", err).into()),
         None => None,
     };
 
-    // Construct a `Revlog` from the index file
     let revlog = match Revlog::from_idx(idxpath) {
         Ok(revlog) => revlog,
-        Err(err) => bail!("failed to load idx {}: {:?}", idxpath, err),
+        Err(err) => return Err(format!("failed to load idx {}: {:?}", idxpath, err).into()),
     };
 
-    // Print the header, using its `Debug` implementation
     println!("Header: {:?}", revlog.get_header());
 
-    // Construct an iterator over the revlog index
-    let iter = &mut revlog.into_iter();
-
-    // If we're not starting at the first version, seek to the starting point
+    let mut iter = revlog.into_iter();
     if let Some(revidx) = revidx {
-        iter.seek(revidx)
+        iter.seek(revidx);
     }
 
-    // for each entry, get a parsed index entry, and the sequence number in the iteration
-    // (`enumerate()` takes an iterator returning T and turns it into an iterator returning
-    // `(usize, T)` tuples)
-    for (idx, entry) in iter.enumerate() {
-        println!("{:?}: {:?}", revidx.unwrap_or(RevIdx::zero()) + idx, entry)
+    for (idx, entry) in iter {
+        println!("{:?}: {:?}", idx, entry)
     }
 
     Ok(())
 }
 
 fn main() {
-    if let Err(ref e) = run() {
-        println!("Failed: {}", e);
+    if let Err(ref err) = run() {
+        println!("Failed: {}", err);
 
-        for e in e.iter().skip(1) {
-            println!("caused by: {}", e);
+        let mut cause = std::error::Error::source(err);
+        while let Some(next) = cause {
+            println!("caused by: {}", next);
+            cause = std::error::Error::source(next);
         }
 
         std::process::exit(1);

@@ -6,13 +6,14 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use futures::{Future, Stream};
-use juniper::{Context, FieldResult};
+use futures::TryStreamExt;
+use juniper::graphql_object;
 
 use mercurial::RevlogRepo;
 
-use changeset::GQLChangeset;
-use node::GQLNodeId;
+use crate::changeset::GQLChangeset;
+use crate::node::GQLNodeId;
+use crate::ready;
 
 #[derive(Debug)]
 pub struct GQLRepo;
@@ -30,51 +31,53 @@ pub struct RepoCtx {
 
 impl RepoCtx {
     pub fn new(repo: RevlogRepo) -> Self {
-        RepoCtx { repo: Arc::new(Mutex::new(repo)) }
+        RepoCtx {
+            repo: Arc::new(Mutex::new(repo)),
+        }
     }
 
-    pub fn repo<'a>(&'a self) -> MutexGuard<'a, RevlogRepo> {
+    pub fn repo(&self) -> MutexGuard<'_, RevlogRepo> {
         self.repo.lock().expect("lock failed")
     }
 }
 
-impl Context for RepoCtx {}
+impl juniper::Context for RepoCtx {}
 
-graphql_object!(GQLRepo: RepoCtx as "Repo" |&self| {
-    description: "A source control repository"
-
-    field required(&executor) -> Vec<String> {
-        let repo = executor.context().repo();
-        repo.get_requirements().iter().map(|r| format!("{}", r)).collect()
-    }
-
-    // XXX replace with more general revset operator
-    field heads(&executor) -> FieldResult<Vec<GQLChangeset>>
-            as "Set of head revisions in the repo" {
-        let mut repo = executor.context().repo();
-        repo.get_heads()
+/// A source control repository
+#[graphql_object(name = "Repo", context = RepoCtx)]
+impl GQLRepo {
+    fn required(ctx: &RepoCtx) -> Vec<String> {
+        let repo = ctx.repo();
+        repo.get_requirements()
+            .iter()
+            .map(|req| format!("{}", req))
             .collect()
-            .wait() // TODO(jsgf) make async
-            .map(|set| set.into_iter().map(GQLChangeset::from).collect())
-            .map_err(From::from)
     }
 
-    field changeset(&executor, id: GQLNodeId) -> FieldResult<GQLChangeset>
-            as "Fetch a specific changeset" {
-        let mut repo = executor.context().repo();
+    /// Set of head revisions in the repo
+    fn heads(ctx: &RepoCtx) -> Result<Vec<GQLChangeset>, String> {
+        let repo = ctx.repo();
+        let set = ready(repo.get_heads().try_collect::<Vec<_>>()).map_err(|err| err.to_string())?;
+        Ok(set.into_iter().map(GQLChangeset::from).collect())
+    }
+
+    /// Fetch a specific changeset
+    fn changeset(ctx: &RepoCtx, id: GQLNodeId) -> Result<GQLChangeset, String> {
+        let repo = ctx.repo();
         // Check the id exists, but we don't need the result now
-        if let Err(err) = repo.changeset_exists(&id).wait() /* TODO(jsgf) make async */ {
-            return Err(String::from(err));
+        match ready(repo.changeset_exists(&id)).map_err(|err| err.to_string())? {
+            true => Ok(GQLChangeset::from(id)),
+            false => Err(format!("changeset {} does not exist", *id)),
         }
-        Ok(From::from(id))
     }
 
-    field changesets(&executor) -> Vec<GQLChangeset>
-            as "Fetch all changesets" {
-        let mut repo = executor.context().repo();
-        repo.changesets()
-            .collect().wait().unwrap().into_iter() // TODO(jsgf) make async
+    /// Fetch all changesets
+    fn changesets(ctx: &RepoCtx) -> Vec<GQLChangeset> {
+        let repo = ctx.repo();
+        ready(repo.changesets().try_collect::<Vec<_>>())
+            .unwrap()
+            .into_iter()
             .map(GQLChangeset::from)
             .collect()
     }
-});
+}

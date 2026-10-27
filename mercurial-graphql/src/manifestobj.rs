@@ -4,16 +4,22 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
+use juniper::graphql_interface;
+
 use mercurial::manifest::Details;
 
-use repo::RepoCtx;
-use file::GQLFile;
-use symlink::GQLSymlink;
-use manifest::GQLPath;
-use node::GQLNodeId;
+use crate::file::GQLFile;
+use crate::manifest::GQLPath;
+use crate::node::GQLNodeId;
+use crate::repo::RepoCtx;
+use crate::symlink::GQLSymlink;
 
+/// An object in the manifest
+#[graphql_interface(for = [GQLFile, GQLSymlink], context = RepoCtx, name = "ManifestObj")]
 pub trait ManifestObj {
     fn path(&self) -> &GQLPath;
+
+    #[graphql(name = "id")]
     fn nodeid(&self) -> &GQLNodeId;
 }
 
@@ -33,6 +39,13 @@ impl GQLManifestObj {
             unimplemented!()
         }
     }
+
+    pub fn into_value(self) -> ManifestObjValue {
+        match self {
+            GQLManifestObj::File(file) => file.into(),
+            GQLManifestObj::Symlink(symlink) => symlink.into(),
+        }
+    }
 }
 
 impl From<GQLFile> for GQLManifestObj {
@@ -50,42 +63,15 @@ impl From<GQLSymlink> for GQLManifestObj {
 impl ManifestObj for GQLManifestObj {
     fn path(&self) -> &GQLPath {
         match self {
-            &GQLManifestObj::File(ref file) => file.path(),
-            &GQLManifestObj::Symlink(ref symlink) => symlink.path(),
+            GQLManifestObj::File(file) => file.path(),
+            GQLManifestObj::Symlink(symlink) => symlink.path(),
         }
     }
 
     fn nodeid(&self) -> &GQLNodeId {
         match self {
-            &GQLManifestObj::File(ref file) => file.nodeid(),
-            &GQLManifestObj::Symlink(ref symlink) => symlink.nodeid(),
+            GQLManifestObj::File(file) => file.nodeid(),
+            GQLManifestObj::Symlink(symlink) => symlink.nodeid(),
         }
     }
 }
-
-graphql_interface!(GQLManifestObj: RepoCtx as "ManifestObj" |&self| {
-    description: "An object in the manifest"
-
-    field path() -> &GQLPath {
-        self.path()
-    }
-
-    field id() -> &GQLNodeId {
-        self.nodeid()
-    }
-
-    instance_resolvers: |&_| {
-        &GQLFile => {
-            match self {
-                &GQLManifestObj::File(ref file) => Some(file),
-                _ => None,
-            }
-        },
-        &GQLSymlink => {
-            match self {
-                &GQLManifestObj::Symlink(ref symlink) => Some(symlink),
-                _ => None,
-            }
-        },
-    }
-});

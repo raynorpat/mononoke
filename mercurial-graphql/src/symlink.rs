@@ -4,17 +4,16 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use std::str;
-
-use juniper::FieldResult;
+use juniper::graphql_object;
 
 use mercurial::symlink::Symlink;
 use mercurial_types::{NodeHash, Path};
 
-use repo::RepoCtx;
-use node::GQLNodeId;
-use manifest::GQLPath;
-use manifestobj::{GQLManifestObj, ManifestObj};
+use crate::graphql_int;
+use crate::manifest::GQLPath;
+use crate::manifestobj::{ManifestObj, ManifestObjValue};
+use crate::node::GQLNodeId;
+use crate::repo::RepoCtx;
 
 pub struct GQLSymlink(GQLPath, GQLNodeId);
 
@@ -34,49 +33,66 @@ impl ManifestObj for GQLSymlink {
     }
 }
 
-graphql_object!(GQLSymlink: RepoCtx as "Symlink" |&self| {
-    description: "A file in the repo"
-    interfaces: [ &GQLManifestObj ]
-
-    field path() -> &GQLPath {
+/// A file in the repo
+#[graphql_object(
+    name = "Symlink",
+    context = RepoCtx,
+    impl = ManifestObjValue
+)]
+impl GQLSymlink {
+    fn path(&self) -> &GQLPath {
         &self.0
     }
 
-    field id() -> &GQLNodeId {
+    fn id(&self) -> &GQLNodeId {
         &self.1
     }
 
-    field target(&executor) -> FieldResult<GQLPath> {
-        let mut repo = executor.context().repo();
-        let mut filelog = repo.get_file_revlog(self.path())
-            .map_err(|err| format!("open {:?}: {:?}", self.path(), err))?;
-        let node = filelog.get_rev_by_nodeid(self.nodeid())?;
+    fn target(&self, ctx: &RepoCtx) -> Result<GQLPath, String> {
+        let repo = ctx.repo();
+        let filelog = repo
+            .get_file_revlog(&self.0)
+            .map_err(|err| format!("open {:?}: {:?}", self.0, err))?;
+        let node = filelog
+            .get_rev_by_nodeid(&self.1)
+            .map_err(|err| err.to_string())?;
         let symlink = Symlink::new(node);
 
-        symlink.path()?
-            .ok_or("no path content".into())
+        symlink
+            .path()
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "no path content".to_string())
             .map(GQLPath::new)
     }
 
-    field size(&executor) -> FieldResult<i64> {
-        let mut repo = executor.context().repo();
-        let mut entry = repo.get_file_revlog(self.path())
-            .map_err(|err| format!("open {:?}: {:?}", self.path(), err))
-            .and_then(|revlog| revlog.get_entry_by_nodeid(self.nodeid()).map_err(From::from))?;
+    fn size(&self, ctx: &RepoCtx) -> Result<i32, String> {
+        let repo = ctx.repo();
+        let entry = repo
+            .get_file_revlog(&self.0)
+            .map_err(|err| format!("open {:?}: {:?}", self.0, err))?
+            .get_entry_by_nodeid(&self.1)
+            .map_err(|err| err.to_string())?;
 
-        entry.len.map(|sz| sz as i64).ok_or("File has no size".into())
+        match entry.len {
+            Some(sz) => graphql_int(sz),
+            None => Err("File has no size".into()),
+        }
     }
 
-    field parents(&executor) -> FieldResult<Vec<GQLSymlink>>
-            as "get changeset's parents" {
-        let mut repo = executor.context().repo();
-        let mut filelog = repo.get_file_revlog(self.path())
-            .map_err(|err| format!("open {:?}: {:?}", self.path(), err))?;
+    /// get changeset's parents
+    fn parents(&self, ctx: &RepoCtx) -> Result<Vec<GQLSymlink>, String> {
+        let repo = ctx.repo();
+        let filelog = repo
+            .get_file_revlog(&self.0)
+            .map_err(|err| format!("open {:?}: {:?}", self.0, err))?;
+        let node = filelog
+            .get_rev_by_nodeid(&self.1)
+            .map_err(|err| err.to_string())?;
 
-        filelog.get_rev_by_nodeid(self.nodeid())
-            .map(|node| node.parents().into_iter()
-                .map(|p| GQLSymlink::new(self.path(), &p))
-                .collect())
-            .map_err(From::from)
+        Ok(node
+            .parents()
+            .into_iter()
+            .map(|parent| GQLSymlink::new(&self.0, &parent))
+            .collect())
     }
-});
+}

@@ -4,64 +4,56 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-// declare dependencies on other crates
-extern crate clap; // 3rd party command line parser
-extern crate mercurial; // mercurial stuff
-#[macro_use]
-extern crate error_chain;
-
-// Import symbols from std:: (standard library)
-use std::io::Write;
-use std::str;
-use std::str::FromStr;
 use std::fs::File;
+use std::io::Write;
+use std::str::FromStr;
 
-// Just need `App` from clap
-use clap::App;
+use clap::{Arg, Command};
 
-// Get `Revlog` from the mercurial revlog module
 use mercurial::revlog::Revlog;
-
-mod errors {
-    use mercurial;
-
-    error_chain! {
-        links {
-            Mercurial(mercurial::Error, mercurial::ErrorKind);
-        }
-    }
-}
-
-use errors::*;
+use mercurial::{ChainErr, Error, Result};
 
 fn run() -> Result<()> {
-    // Define command line args and parse command line
-    let matches = App::new("dumprev")
+    let matches = Command::new("dumprev")
         .version("0.0.0")
         .about("extract a revision from a revlog")
-        .args_from_usage(concat!(
-            "-d, --data=[DATAFILE]  'Data file if not inline'\n",
-            "-w, --write=[DUMPFILE]  'Write data to file'\n",
-            "<IDXFILE>               'index file'\n",
-            "<REV>                   'revision index'"
-        ))
+        .arg(
+            Arg::new("data")
+                .short('d')
+                .long("data")
+                .value_name("DATAFILE")
+                .help("Data file if not inline"),
+        )
+        .arg(
+            Arg::new("write")
+                .short('w')
+                .long("write")
+                .value_name("DUMPFILE")
+                .help("Write data to file"),
+        )
+        .arg(
+            Arg::new("IDXFILE")
+                .help("index file")
+                .required(true)
+                .index(1),
+        )
+        .arg(
+            Arg::new("REV")
+                .help("revision index")
+                .required(true)
+                .index(2),
+        )
         .get_matches();
-    // Get path of index file; `unwrap()` is safe because parameter is non-optional
-    let idxpath = matches.value_of("IDXFILE").unwrap();
 
-    // Get optional datapath
-    let datapath = matches.value_of("DATAFILE");
-
-    // Also optional dumpfile
-    let dumpfile = matches.value_of("write");
-
-    // Get non-optional revision
-    let revidx = FromStr::from_str(matches.value_of("REV").unwrap())
+    let idxpath = matches.get_one::<String>("IDXFILE").unwrap();
+    let datapath = matches.get_one::<String>("data");
+    let dumpfile = matches.get_one::<String>("write");
+    let revidx = FromStr::from_str(matches.get_one::<String>("REV").unwrap())
+        .map_err(Error::from)
         .chain_err(|| "idx malformed")?;
 
-    // Construct a `Revlog`
-    let revlog = Revlog::from_idx_data(idxpath, datapath)
-        .chain_err(|| "failed to load idx and data")?;
+    let revlog =
+        Revlog::from_idx_data(idxpath, datapath).chain_err(|| "failed to load idx and data")?;
     println!("made revlog {:?}", revlog.get_header());
 
     let entry = revlog
@@ -82,7 +74,11 @@ fn run() -> Result<()> {
                 if let Some(dumpfile) = dumpfile {
                     let mut file = match File::create(dumpfile) {
                         Ok(file) => file,
-                        Err(err) => bail!("Failed to create file {}: {:?}", dumpfile, err),
+                        Err(err) => {
+                            return Err(
+                                format!("Failed to create file {}: {:?}", dumpfile, err).into()
+                            )
+                        }
                     };
                     println!(
                         "Writing rev {:?} to {}",
@@ -90,7 +86,7 @@ fn run() -> Result<()> {
                         dumpfile
                     );
                     if let Err(err) = file.write_all(revdata) {
-                        bail!("Failed to write {}: {:?}", dumpfile, err);
+                        return Err(format!("Failed to write {}: {:?}", dumpfile, err).into());
                     }
                 } else {
                     println!(
@@ -104,24 +100,27 @@ fn run() -> Result<()> {
             }
         }
         Ok(rev) => {
-            bail!(
+            return Err(format!(
                 "Nodeid missing: got {:?} expected {:?}",
                 rev.nodeid(),
                 entry.nodeid()
             )
+            .into())
         }
-        Err(err) => bail!("failed to get chunk {:?}: {}", revidx, err),
+        Err(err) => return Err(format!("failed to get chunk {:?}: {}", revidx, err).into()),
     };
 
     Ok(())
 }
 
 fn main() {
-    if let Err(ref e) = run() {
-        println!("Failed: {}", e);
+    if let Err(ref err) = run() {
+        println!("Failed: {}", err);
 
-        for e in e.iter().skip(1) {
-            println!("caused by: {}", e);
+        let mut cause = std::error::Error::source(err);
+        while let Some(next) = cause {
+            println!("caused by: {}", next);
+            cause = std::error::Error::source(next);
         }
 
         std::process::exit(1);

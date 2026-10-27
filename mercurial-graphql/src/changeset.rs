@@ -4,15 +4,15 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use futures::Future;
+use juniper::graphql_object;
 
-use juniper::FieldResult;
+use mercurial_types::{Changeset, NodeHash, Time};
 
-use mercurial_types::{Changeset, NodeHash, changeset};
-
-use repo::RepoCtx;
-use manifest::{GQLManifest, GQLPath};
-use node::GQLNodeId;
+use crate::graphql_int;
+use crate::manifest::{GQLManifest, GQLPath};
+use crate::node::GQLNodeId;
+use crate::ready;
+use crate::repo::RepoCtx;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct GQLChangeset(GQLNodeId);
@@ -29,79 +29,75 @@ impl From<NodeHash> for GQLChangeset {
     }
 }
 
-pub struct GQLTime(changeset::Time);
+pub struct GQLTime(Time);
 
-graphql_object!(GQLTime: RepoCtx as "Time" |&self| {
-    description: "Time a commit was made"
-
-    field time() -> i64 as "UTC time in seconds since Unix Epoch" {
-        self.0.time as i64
+/// Time a commit was made
+#[graphql_object(name = "Time", context = RepoCtx)]
+impl GQLTime {
+    /// UTC time in seconds since Unix Epoch
+    fn time(&self) -> Result<i32, String> {
+        graphql_int(self.0.time)
     }
 
-    field tz() -> i64 as "Timezone offset in seconds from UTC" {
-        self.0.tz as i64
+    /// Timezone offset in seconds from UTC
+    fn tz(&self) -> i32 {
+        self.0.tz
     }
-});
+}
 
-graphql_object!(GQLChangeset: RepoCtx as "Changeset" |&self| {
-    description: "A single atomic change"
-
-    field id() -> &GQLNodeId as "changeset identifier" {
+/// A single atomic change
+#[graphql_object(name = "Changeset", context = RepoCtx)]
+impl GQLChangeset {
+    /// changeset identifier
+    fn id(&self) -> &GQLNodeId {
         &self.0
     }
 
-    field manifest(&executor) -> FieldResult<GQLManifest>
-            as "manifest identifier" {
-        executor.context().repo().get_changeset_by_nodeid(&self.0)
-                        .wait() // TODO(jsgf) make async
-                        .map(|cs| From::from(*cs.manifestid()))
-                        .map_err(From::from)
+    /// manifest identifier
+    fn manifest(&self, ctx: &RepoCtx) -> Result<GQLManifest, String> {
+        let repo = ctx.repo();
+        ready(repo.get_changeset_by_nodeid(&self.0))
+            .map(|cs| GQLManifest::from(*cs.manifestid()))
+            .map_err(|err| err.to_string())
     }
 
-    field user(&executor) -> FieldResult<String>
-            as "user" {
-        executor.context().repo().get_changeset_by_nodeid(&self.0)
-                        .wait() // TODO(jsgf) make async
-                        .map(|cs| String::from_utf8_lossy(cs.user()).into_owned())
-                        .map_err(From::from)
+    /// user
+    fn user(&self, ctx: &RepoCtx) -> Result<String, String> {
+        let repo = ctx.repo();
+        ready(repo.get_changeset_by_nodeid(&self.0))
+            .map(|cs| String::from_utf8_lossy(cs.user()).into_owned())
+            .map_err(|err| err.to_string())
     }
 
-    field comments(&executor) -> FieldResult<String>
-            as "commit comments" {
-        executor.context().repo().get_changeset_by_nodeid(&self.0)
-                        .wait() // TODO(jsgf) make async
-                        .map(|cs| String::from_utf8_lossy(cs.comments()).into_owned())
-                        .map_err(From::from)
+    /// commit comments
+    fn comments(&self, ctx: &RepoCtx) -> Result<String, String> {
+        let repo = ctx.repo();
+        ready(repo.get_changeset_by_nodeid(&self.0))
+            .map(|cs| String::from_utf8_lossy(cs.comments()).into_owned())
+            .map_err(|err| err.to_string())
     }
 
-    field time(&executor) -> FieldResult<GQLTime>
-            as "commit time" {
-        executor.context().repo().get_changeset_by_nodeid(&self.0)
-                        .wait() // TODO(jsgf) make async
-                        .map(|cs| *cs.time())
-                        .map(GQLTime)
-                        .map_err(From::from)
+    /// commit time
+    fn time(&self, ctx: &RepoCtx) -> Result<GQLTime, String> {
+        let repo = ctx.repo();
+        ready(repo.get_changeset_by_nodeid(&self.0))
+            .map(|cs| GQLTime(*cs.time()))
+            .map_err(|err| err.to_string())
     }
 
-    field paths(&executor) -> FieldResult<Vec<GQLPath>>
-            as "paths affected by commit" {
-        executor.context().repo().get_changeset_by_nodeid(&self.0)
-                        .wait() // TODO(jsgf) make async
-                        .map(|cs| cs.files().into_iter().map(GQLPath::from).collect())
-                        .map_err(From::from)
+    /// paths affected by commit
+    fn paths(&self, ctx: &RepoCtx) -> Result<Vec<GQLPath>, String> {
+        let repo = ctx.repo();
+        ready(repo.get_changeset_by_nodeid(&self.0))
+            .map(|cs| cs.files().iter().map(GQLPath::from).collect())
+            .map_err(|err| err.to_string())
     }
 
-    field parents(&executor) -> FieldResult<Vec<GQLChangeset>>
-            as "get changeset's parents" {
-        executor.context().repo().get_changeset_by_nodeid(&self.0)
-                        .wait() // TODO(jsgf) make async
-                        .map(|cs| cs.parents().into_iter()
-                                        .map(GQLChangeset::from)
-                                        .collect())
-                        .map_err(From::from)
+    /// get changeset's parents
+    fn parents(&self, ctx: &RepoCtx) -> Result<Vec<GQLChangeset>, String> {
+        let repo = ctx.repo();
+        ready(repo.get_changeset_by_nodeid(&self.0))
+            .map(|cs| cs.parents().into_iter().map(GQLChangeset::from).collect())
+            .map_err(|err| err.to_string())
     }
-
-    //field extra() -> &BTreeMap<String, String> as "extra metadata" {
-    //    self.extra()
-    //}
-});
+}

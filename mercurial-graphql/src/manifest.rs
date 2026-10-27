@@ -6,22 +6,38 @@
 
 use std::ops::Deref;
 
-use futures::Future;
-
-use juniper::{FieldResult, Value};
+use juniper::{graphql_object, GraphQLScalar};
 
 use mercurial_types::{NodeHash, Path};
 
-use repo::RepoCtx;
-use node::GQLNodeId;
-use manifestobj::GQLManifestObj;
+use crate::manifestobj::{GQLManifestObj, ManifestObjValue};
+use crate::node::GQLNodeId;
+use crate::ready;
+use crate::repo::RepoCtx;
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, GraphQLScalar)]
+#[graphql(
+    name = "GQLPath",
+    description = "A path in the manifest",
+    to_output_with = Self::to_output,
+    from_input_with = Self::from_input,
+    parse_token(String)
+)]
 pub struct GQLPath(Path);
 
 impl GQLPath {
     pub fn new(path: Path) -> GQLPath {
         GQLPath(path)
+    }
+
+    fn to_output(&self) -> String {
+        String::from_utf8_lossy(self.0.as_slice()).into_owned()
+    }
+
+    fn from_input(input: &str) -> Result<Self, String> {
+        Path::new(input.as_bytes())
+            .map(GQLPath::new)
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -33,27 +49,11 @@ impl<'a> From<&'a Path> for GQLPath {
 
 impl Deref for GQLPath {
     type Target = Path;
+
     fn deref(&self) -> &Path {
         &self.0
     }
 }
-
-graphql_scalar!(GQLPath {
-    description: "A path in the manifest"
-
-    resolve(&self) -> Value {
-        let path = &self.0;
-        Value::string(String::from_utf8_lossy(path.as_slice()).into_owned())
-    }
-
-    from_input_value(v: &InputValue) -> Option<GQLPath> {
-        v.as_string_value()
-            .map(|s| Path::new(s.as_bytes()))
-            .and_then(Result::ok)
-            .map(GQLPath::new)
-    }
-});
-
 
 pub struct GQLManifest(GQLNodeId);
 
@@ -63,42 +63,52 @@ impl From<NodeHash> for GQLManifest {
     }
 }
 
-graphql_object!(GQLManifest: RepoCtx as "Manifest" |&self| {
-    description: "The manifest for a specific changeset"
-
-    field id() -> &GQLNodeId as "Get manifest id" {
+/// The manifest for a specific changeset
+#[graphql_object(name = "Manifest", context = RepoCtx)]
+impl GQLManifest {
+    /// Get manifest id
+    fn id(&self) -> &GQLNodeId {
         &self.0
     }
 
-    // Return just a list of paths
-    field paths(&executor) -> FieldResult<Vec<GQLPath>> as "Get paths" {
-        let mut repo = executor.context().repo();
-        repo.get_manifest_by_nodeid(&self.0)
-            .wait() // TODO(jsgf) make async
-            .map(|m| m.manifest().into_iter()
-                .map(|(path, _)| GQLPath::from(path))
-                .collect())
-            .map_err(From::from)
+    /// Get paths
+    fn paths(&self, ctx: &RepoCtx) -> Result<Vec<GQLPath>, String> {
+        let repo = ctx.repo();
+        ready(repo.get_manifest_by_nodeid(&self.0))
+            .map(|manifest| {
+                manifest
+                    .manifest()
+                    .into_iter()
+                    .map(|(path, _)| GQLPath::from(path))
+                    .collect()
+            })
+            .map_err(|err| err.to_string())
     }
 
-    // Return a list of manifest objects
-    field entries(&executor) -> FieldResult<Vec<GQLManifestObj>> as "Get entries" {
-        let mut repo = executor.context().repo();
-        repo.get_manifest_by_nodeid(&self.0)
-            .wait() // TODO(jsgf) make async
-            .map(|m| m.manifest().into_iter()
-                .map(|(path, details)| GQLManifestObj::new(&From::from(path), details))
-                .collect())
-            .map_err(From::from)
+    /// Get entries
+    fn entries(&self, ctx: &RepoCtx) -> Result<Vec<ManifestObjValue>, String> {
+        let repo = ctx.repo();
+        ready(repo.get_manifest_by_nodeid(&self.0))
+            .map(|manifest| {
+                manifest
+                    .manifest()
+                    .into_iter()
+                    .map(|(path, details)| {
+                        GQLManifestObj::new(&GQLPath::from(path), details).into_value()
+                    })
+                    .collect()
+            })
+            .map_err(|err| err.to_string())
     }
 
-    // Look up a specific path (XXX fileset)
-    field lookup(&executor, path: GQLPath) -> FieldResult<GQLManifestObj> as "Lookup entry" {
-        let mut repo = executor.context().repo();
-        let manifest = repo.get_manifest_by_nodeid(&self.0)
-            .wait()?; // TODO(jsgf) make async
-        let details = manifest.lookup(&path)
-                .ok_or(format!("\"{}\" not present", *path))?;
-        Ok(GQLManifestObj::new(&path, details))
+    /// Lookup entry
+    fn lookup(&self, ctx: &RepoCtx, path: GQLPath) -> Result<ManifestObjValue, String> {
+        let repo = ctx.repo();
+        let manifest =
+            ready(repo.get_manifest_by_nodeid(&self.0)).map_err(|err| err.to_string())?;
+        let details = manifest
+            .lookup(&path)
+            .ok_or_else(|| format!("\"{}\" not present", &*path))?;
+        Ok(GQLManifestObj::new(&path, details).into_value())
     }
-});
+}
