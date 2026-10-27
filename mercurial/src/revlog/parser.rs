@@ -221,15 +221,29 @@ pub fn delta(input: &[u8]) -> ParseResult<'_, Delta> {
     ))
 }
 
-/// Parse zero or more deltas. A short tail is left unparsed, matching `many0`.
-fn deltas(input: &[u8]) -> (&[u8], Vec<Delta>) {
+/// Parse zero or more deltas.
+///
+/// `many0` stops on a hard mismatch and fails when a fragment is `Incomplete`.
+/// A short tail is not a successful end.
+fn deltas(input: &[u8]) -> Result<(&[u8], Vec<Delta>), ParseError> {
     let mut rest = input;
     let mut out = Vec::new();
-    while let Ok((next, one)) = delta(rest) {
-        out.push(one);
-        rest = next;
+    loop {
+        if rest.is_empty() {
+            return Ok((rest, out));
+        }
+        match delta(rest) {
+            Ok((next, one)) => {
+                if next.len() == rest.len() {
+                    return Err(ParseError::Incomplete);
+                }
+                out.push(one);
+                rest = next;
+            }
+            Err(ParseError::Incomplete) => return Err(ParseError::Incomplete),
+            Err(err) => return Err(err),
+        }
     }
-    (rest, out)
 }
 
 fn zlib_decompress(input: &[u8]) -> Result<(Vec<u8>, usize), ParseError> {
@@ -246,23 +260,27 @@ fn zlib_decompress(input: &[u8]) -> Result<(Vec<u8>, usize), ParseError> {
 fn delta_frame(input: &[u8]) -> Result<Option<(&[u8], Vec<Delta>)>, ParseError> {
     match input[0] {
         b'u' => {
-            let (rest, parsed) = deltas(&input[1..]);
+            let (rest, parsed) = deltas(&input[1..])?;
             Ok(Some((rest, parsed)))
         }
         0 => {
-            let (rest, parsed) = deltas(input);
+            let (rest, parsed) = deltas(input)?;
             Ok(Some((rest, parsed)))
         }
         b'x' => {
             let (data, used) = zlib_decompress(input)?;
-            // Bytes left inside the decompressed buffer are not part of the
-            // compressed-stream remainder. The caller checks that remainder.
-            let parsed = deltas(&data).1;
+            let (rest, parsed) = deltas(&data)?;
+            if !rest.is_empty() {
+                return Err(ParseError::Incomplete);
+            }
             Ok(Some((&input[used..], parsed)))
         }
         b'4' => {
             let data = lz4::decompress(&input[1..]).map_err(ParseError::BadLz4)?;
-            let parsed = deltas(&data).1;
+            let (rest, parsed) = deltas(&data)?;
+            if !rest.is_empty() {
+                return Err(ParseError::Incomplete);
+            }
             Ok(Some((&[], parsed)))
         }
         _ => Ok(None),
@@ -308,7 +326,39 @@ pub fn literal(input: &[u8]) -> ParseResult<'_, Vec<u8>> {
 
 #[cfg(test)]
 mod test {
-    use super::{Features, GENERAL_DELTA, Header, INLINE, Version, header};
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+
+    use super::{Features, GENERAL_DELTA, Header, INLINE, Version, deltachunk, header};
+
+    /// One complete empty fragment, then four bytes that start another fragment.
+    fn truncated_delta_payload() -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        payload
+    }
+
+    #[test]
+    fn truncated_zlib_delta_is_error() {
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&truncated_delta_payload()).unwrap();
+        let frame = enc.finish().unwrap();
+        assert_eq!(frame[0], b'x');
+        assert!(deltachunk(&frame).is_err());
+    }
+
+    #[test]
+    fn truncated_lz4_delta_is_error() {
+        let compressed = lz4_flex::block::compress_prepend_size(&truncated_delta_payload());
+        let mut frame = vec![b'4'];
+        frame.extend_from_slice(&compressed);
+        assert!(deltachunk(&frame).is_err());
+    }
 
     #[test]
     fn test_header_0() {

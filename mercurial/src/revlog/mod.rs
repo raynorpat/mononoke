@@ -429,7 +429,7 @@ impl RevlogInner {
                         ErrorKind::Revlog(format!(
                             "Failed to unpack details: {} remains, {:?}",
                             rest.len(),
-                            &rest[..16]
+                            &rest[..rest.len().min(16)]
                         )).into(),
                     );
                 }
@@ -450,7 +450,7 @@ impl RevlogInner {
                         ErrorKind::Revlog(format!(
                             "Failed to unpack literal: {} remains, {:?}",
                             rest.len(),
-                            &rest[..16]
+                            &rest[..rest.len().min(16)]
                         )).into(),
                     );
                 }
