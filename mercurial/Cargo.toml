@@ -1,0 +1,20 @@
+[package]
+name = "mercurial"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flate2 = "1"
+lz4_flex = "0.11"
+memmap2 = "0.9"
+bitflags = "2"
+thiserror = "2"
+futures = "0.3"
+time = "0.3"
+itertools = "0.13"
+mercurial-types = { path = "../mercurial-types" }
+stockbookmarks = { path = "../bookmarks/stockbookmarks" }
+asyncmemo = { path = "../asyncmemo" }
+
+[dev-dependencies]
+quickcheck = "1"

@@ -7,17 +7,17 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::str;
-use std::vec;
 
-use futures::{Async, Poll};
-use futures::future::{BoxFuture, Future, IntoFuture};
-use futures::stream::{BoxStream, Stream};
+use futures::future::{self, BoxFuture, FutureExt};
+use futures::stream::{self, BoxStream, StreamExt};
 
-use mercurial_types::{BlobNode, NodeHash, Parents, Path};
 use mercurial_types::manifest::{Content, Entry, Manifest, Type};
-use errors::*;
+use mercurial_types::{BlobNode, NodeHash, Parents, Path};
 
-use RevlogRepo;
+use std::result::Result as StdResult;
+
+use crate::errors::{ChainErr, Error, Result};
+use crate::RevlogRepo;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Details {
@@ -48,13 +48,13 @@ pub fn parse(data: &[u8]) -> Result<BTreeMap<Path, Details>> {
         }
 
         let (name, rest) = match find(line, &0) {
-            None => bail!("Malformed entry: no \\0"),
+            None => return Err("Malformed entry: no \\0".into()),
             Some(nil) => {
                 let (name, rest) = line.split_at(nil);
                 if let Some((_, hash)) = rest.split_first() {
                     (name, hash)
                 } else {
-                    bail!("Malformed entry: no hash");
+                    return Err("Malformed entry: no hash".into());
                 }
             }
         };
@@ -80,7 +80,7 @@ impl RevlogManifest {
     pub fn new(repo: RevlogRepo, node: BlobNode) -> Result<RevlogManifest> {
         node.as_blob()
             .as_slice()
-            .ok_or("node missing data".into())
+            .ok_or_else(|| "node missing data".into())
             .and_then(|blob| Self::parse(Some(repo), blob))
     }
 
@@ -89,11 +89,11 @@ impl RevlogManifest {
     }
 
     pub fn generate<W: Write>(&self, out: &mut W) -> io::Result<()> {
-        for (ref k, ref v) in &self.files {
+        for (k, v) in &self.files {
             k.generate(out)?;
-            out.write(&b"\0"[..])?;
+            out.write_all(b"\0")?;
             v.generate(out)?;
-            out.write(&b"\n"[..])?;
+            out.write_all(b"\n")?;
         }
         Ok(())
     }
@@ -110,18 +110,18 @@ impl RevlogManifest {
 impl Details {
     fn parse(data: &[u8]) -> Result<Details> {
         if data.len() < 40 {
-            bail!("hash too small");
+            return Err("hash too small".into());
         }
 
         let (hash, flags) = data.split_at(40);
         let hash = match str::from_utf8(hash) {
-            Err(_) => bail!("malformed hash"),
+            Err(_) => return Err("malformed hash".into()),
             Ok(hs) => hs,
         };
         let nodeid = hash.parse().chain_err(|| "malformed hash")?;
 
         if flags.len() > 1 {
-            bail!("More than 1 flag");
+            return Err("More than 1 flag".into());
         }
 
         let flag = if flags.len() == 0 {
@@ -131,7 +131,7 @@ impl Details {
                 b'l' => Type::Symlink,
                 b'x' => Type::Executable,
                 b't' => Type::Tree,
-                unk => bail!("Unknown flag {}", unk),
+                unk => return Err(format!("Unknown flag {}", unk).into()),
             }
         };
 
@@ -183,53 +183,45 @@ pub struct RevlogEntry {
     details: Details,
 }
 
-pub struct RevlogListStream(vec::IntoIter<(Path, Details)>, RevlogRepo);
-
-impl Stream for RevlogListStream {
-    type Item = RevlogEntry;
-    type Error = Error;
-
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let v = self.0.next().map(|(path, details)| {
-            RevlogEntry {
-                repo: self.1.clone(),
-                path,
-                details,
-            }
-        });
-        Ok(Async::Ready(v))
-    }
-}
-
 impl Manifest for RevlogManifest {
     type Error = Error;
 
     fn lookup(
         &self,
         path: &Path,
-    ) -> BoxFuture<Option<Box<Entry<Error = Self::Error>>>, Self::Error> {
+    ) -> BoxFuture<'static, StdResult<Option<Box<dyn Entry<Error = Self::Error>>>, Self::Error>>
+    {
         let repo = self.repo.as_ref().expect("missing repo").clone();
-        let res = RevlogManifest::lookup(self, path).map(|details| {
+        let found = self.files.get(path).map(|details| {
             RevlogEntry {
-                repo: repo,
+                repo,
                 path: path.clone(),
                 details: *details,
             }
+            .boxed()
         });
 
-        Ok(res.map(|e| e.boxed())).into_future().boxed()
+        future::ready(Ok(found)).boxed()
     }
 
-    fn list(&self) -> BoxStream<Box<Entry<Error = Self::Error>>, Self::Error> {
-        let v: Vec<_> = self.manifest()
+    fn list(
+        &self,
+    ) -> BoxStream<'static, StdResult<Box<dyn Entry<Error = Self::Error>>, Self::Error>> {
+        let repo = self.repo.as_ref().expect("missing repo").clone();
+        let entries: Vec<_> = self
+            .manifest()
             .into_iter()
-            .map(|(p, d)| (p.clone(), *d))
+            .map(|(path, details)| (path.clone(), *details))
             .collect();
-        RevlogListStream(
-            v.into_iter(),
-            self.repo.as_ref().expect("missing repo").clone(),
-        ).map(|e| e.boxed())
-            .boxed()
+        stream::iter(entries.into_iter().map(move |(path, details)| {
+            let entry = RevlogEntry {
+                repo: repo.clone(),
+                path,
+                details,
+            };
+            Ok(entry.boxed())
+        }))
+        .boxed()
     }
 }
 
@@ -240,41 +232,46 @@ impl Entry for RevlogEntry {
         self.details.flag()
     }
 
-    fn get_parents(&self) -> BoxFuture<Parents, Self::Error> {
-        self.repo
-            .get_file_revlog(self.get_path())
-            .and_then(|revlog| revlog.get_rev_by_nodeid(self.get_hash()))
-            .map(|node| *node.parents())
-            .into_future()
-            .boxed()
+    fn get_parents(&self) -> BoxFuture<'static, StdResult<Parents, Self::Error>> {
+        let path = self.path.clone();
+        let hash = *self.details.nodeid();
+        let result = self
+            .repo
+            .get_file_revlog(&path)
+            .and_then(|revlog| revlog.get_rev_by_nodeid(&hash))
+            .map(|node| *node.parents());
+        future::ready(result).boxed()
     }
 
-    fn get_content(&self) -> BoxFuture<Content<Self::Error>, Self::Error> {
-        self.repo
-            .get_file_revlog(self.get_path())
-            .and_then(|revlog| revlog.get_rev_by_nodeid(self.get_hash()))
-            .map(|node| node.as_blob().clone())
-            .and_then(|data| match self.get_type() {
+    fn get_content(&self) -> BoxFuture<'static, StdResult<Content<Self::Error>, Self::Error>> {
+        let path = self.path.clone();
+        let hash = *self.details.nodeid();
+        let kind = self.get_type();
+        let result = (|| -> Result<Content<Error>> {
+            let data = self
+                .repo
+                .get_file_revlog(&path)
+                .and_then(|revlog| revlog.get_rev_by_nodeid(&hash))
+                .map(|node| node.as_blob().clone())?;
+            match kind {
                 Type::File => Ok(Content::File(data)),
                 Type::Executable => Ok(Content::Executable(data)),
                 Type::Symlink => {
-                    let data = data.as_slice().ok_or("missing blob data")?;
-                    Ok(Content::Symlink(Path::new(data)?))
+                    let bytes = data
+                        .as_slice()
+                        .ok_or_else(|| Error::from("missing blob data"))?;
+                    Ok(Content::Symlink(Path::new(bytes)?))
                 }
                 Type::Tree => unimplemented!(),
-            })
-            .map_err(|err| {
-                Error::with_chain(
-                    err,
-                    format!(
-                        "Can't get content for {} node {}",
-                        self.get_path(),
-                        self.get_hash()
-                    ),
-                )
-            })
-            .into_future()
-            .boxed()
+            }
+        })()
+        .map_err(|err| {
+            Error::with_chain(
+                err,
+                format!("Can't get content for {} node {}", path, hash),
+            )
+        });
+        future::ready(result).boxed()
     }
 
     fn get_hash(&self) -> &NodeHash {
@@ -288,6 +285,12 @@ impl Entry for RevlogEntry {
 
 #[cfg(test)]
 mod test {
+    use std::collections::BTreeMap;
+    use std::str;
+
+    use mercurial_types::manifest::Type;
+    use mercurial_types::Path;
+
     use super::*;
 
     #[test]

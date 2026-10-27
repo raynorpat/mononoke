@@ -5,13 +5,12 @@
 // GNU General Public License version 2 or any later version.
 
 use std::collections::BTreeMap;
-use std::str;
 
-use quickcheck::{QuickCheck, TestResult};
+use quickcheck::{QuickCheck, TestResult, quickcheck};
 
 use mercurial_types::{Blob, BlobNode, NodeHash, Path};
 
-use changeset::{Extra, RevlogChangeset, Time, escape, unescape};
+use super::{Extra, RevlogChangeset, Time, escape, unescape};
 
 const CHANGESET: &[u8] = include_bytes!("cset.bin");
 const CHANGESETBLOB: Blob<&[u8]> = Blob::Dirty(CHANGESET);

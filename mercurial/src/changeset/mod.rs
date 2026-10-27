@@ -10,9 +10,10 @@ use std::collections::BTreeMap;
 use std::result;
 use std::error;
 
-use mercurial_types::{BlobNode, NULL_HASH, NodeHash, Parents, Path};
 use mercurial_types::changeset::{Changeset, Time};
-use errors::*;
+use mercurial_types::{BlobNode, NULL_HASH, NodeHash, Parents, Path};
+
+use crate::errors::{ChainErr, Error, Result};
 
 #[cfg(test)]
 mod test;
@@ -43,11 +44,10 @@ where
 {
     match lines.next() {
         Some(s) => parse(s).map_err(Into::into),
-        None => bail!("premature end"),
+        None => return Err("premature end".into()),
     }
 }
 
-#[allow(dead_code)] // XXX TODO
 fn escape<'a, S: IntoIterator<Item = &'a u8>>(s: S) -> Vec<u8> {
     let mut ret = Vec::new();
 
@@ -130,7 +130,7 @@ impl Extra {
                 escape(&vec)
             })
             .collect();
-        out.write_all(kv.join(&b'\0').as_slice())
+        out.write_all(kv.join(b"\0".as_ref()).as_slice())
     }
 }
 
@@ -154,7 +154,7 @@ fn parsetimeextra<S: AsRef<[u8]>>(s: S) -> Result<(Time, Extra)> {
     let parts: Vec<_> = s.splitn(3, |c| *c == b' ').collect();
 
     if parts.len() < 2 {
-        bail!("not enough parts");
+        return Err("not enough parts".into());
     }
     let time: u64 = str::from_utf8(parts[0])?
         .parse()
@@ -240,7 +240,7 @@ impl RevlogChangeset {
             }
 
             ret.files = files;
-            ret.comments = comments.join(&b'\n');
+            ret.comments = comments.join(b"\n".as_ref());
         }
 
         Ok(ret)

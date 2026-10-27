@@ -4,54 +4,57 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-// Nom parser for Mercurial revlogs
+// Parsers for Mercurial revlog index entries and chunk payloads.
 use std::io::Read;
-use std::fmt::Debug;
 
+use bitflags::bitflags;
 use flate2::read::ZlibDecoder;
-use nom::{ErrorKind, IResult, Needed, be_u16, be_u32};
 
 use mercurial_types::bdiff::Delta;
 use mercurial_types::NodeHash;
 
-use revlog::revidx::RevIdx;
-
 use super::lz4;
-
-// #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-// pub enum Badness {
-// IO,
-// Version,
-// Features,
-// BadZlib,
-// }
-//
-
-pub type Error = u32;
+use super::revidx::RevIdx;
 
 // hack until I work out how to propagate proper E type
 #[allow(non_upper_case_globals, non_snake_case, dead_code)]
 pub mod Badness {
-    use super::Error;
-    pub const IO: Error = 0;
-    pub const Version: Error = 1;
-    pub const Features: Error = 2;
-    pub const BadZlib: Error = 3;
-    pub const BadLZ4: Error = 4;
+    pub const IO: u32 = 0;
+    pub const Version: u32 = 1;
+    pub const Features: u32 = 2;
+    pub const BadZlib: u32 = 3;
+    pub const BadLZ4: u32 = 4;
 }
 
-/// `Revlog` features
+/// Failure while reading a revlog index entry or chunk.
+#[derive(Debug)]
+#[allow(dead_code)] // payload is only formatted with Debug
+pub enum ParseError {
+    Incomplete,
+    NoMatch,
+    BadZlib(String),
+    BadLz4(String),
+}
+
+pub type ParseResult<'a, T> = Result<(&'a [u8], T), ParseError>;
+
 bitflags! {
+    /// `Revlog` features
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub struct Features: u16 {
         const INLINE        = 1 << 0;
         const GENERAL_DELTA = 1 << 1;
     }
 }
 
-/// Per-revision flags
+pub const INLINE: Features = Features::INLINE;
+pub const GENERAL_DELTA: Features = Features::GENERAL_DELTA;
+
 bitflags! {
+    /// Per-revision flags
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub struct IdxFlags: u16 {
-        const CENSORED      = 1 << 15;
+        const CENSORED = 1 << 15;
     }
 }
 
@@ -89,246 +92,296 @@ impl Entry {
     }
 }
 
-/// Parse the revlog header
-named!(pub header<Header>,
-    do_parse!(
-        features: return_error!(ErrorKind::Custom(Badness::IO), be_u16) >>
-        version: return_error!(ErrorKind::Custom(Badness::IO), be_u16) >>
-        ({
-            let vers = match version {
-                0 => Version::Revlog0,
-                1 => Version::RevlogNG,
-                _ => panic!("bad version"),
-            };
+fn read_u16(input: &[u8]) -> u16 {
+    u16::from_be_bytes([input[0], input[1]])
+}
 
-            let features = match Features::from_bits(features) {
-                Some(f) => f,
-                None => panic!("bad features"),
-            };
+fn read_u32(input: &[u8]) -> u32 {
+    u32::from_be_bytes([input[0], input[1], input[2], input[3]])
+}
 
-            Header {
-                version: vers,
-                features: features,
-            }
-        }))
-);
+fn read_u48(input: &[u8]) -> u64 {
+    ((input[0] as u64) << 40)
+        + ((input[1] as u64) << 32)
+        + ((input[2] as u64) << 24)
+        + ((input[3] as u64) << 16)
+        + ((input[4] as u64) << 8)
+        + ((input[5] as u64) << 0)
+}
+
+fn optional_idx(v: u32) -> Option<RevIdx> {
+    if v == u32::MAX {
+        None
+    } else {
+        Some(v.into())
+    }
+}
+
+/// Parse the revlog header.
+///
+/// Layout is a 2-byte big-endian feature word, then a 2-byte big-endian
+/// version (`0` revlog0, `1` revlog NG).
+pub fn header(input: &[u8]) -> ParseResult<'_, Header> {
+    if input.len() < 4 {
+        return Err(ParseError::Incomplete);
+    }
+    let features = read_u16(&input[0..2]);
+    let version = read_u16(&input[2..4]);
+    let vers = match version {
+        0 => Version::Revlog0,
+        1 => Version::RevlogNG,
+        _ => panic!("bad version"),
+    };
+    let features = match Features::from_bits(features) {
+        Some(features) => features,
+        None => panic!("bad features"),
+    };
+    Ok((
+        &input[4..],
+        Header {
+            version: vers,
+            features,
+        },
+    ))
+}
 
 pub fn indexng_size() -> usize {
     6 + 2 + 4 + 4 + 4 + 4 + 4 + 4 + 32
 }
 
-/// Parse an "NG" revlog entry
-named!(pub indexng<Entry>,
-    do_parse!(
-        offset: return_error!(ErrorKind::Custom(Badness::IO), be_u48) >>    // XXX if first, then only 2 bytes, implied 0 in top 4
-        flags: return_error!(ErrorKind::Custom(Badness::IO), be_u16) >>     // ?
-        compressed_length: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        uncompressed_length: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        baserev: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        linkrev: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        p1: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        p2: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        hash: take!(32) >>
-        ({
-            Entry {
-                offset: offset,
-                flags: IdxFlags::from_bits(flags).expect("bad rev idx flags"),
-                compressed_len: compressed_length,
-                len: Some(uncompressed_length),
-                baserev: if baserev == !0 { None } else { Some(baserev.into()) },
-                linkrev: if linkrev == !0 { None } else { Some(linkrev.into()) },
-                p1: if p1 == !0 { None } else { Some(p1.into()) },
-                p2: if p2 == !0 { None } else { Some(p2.into()) },
-                nodeid: NodeHash::from_bytes(&hash[..20]).expect("bad bytes for sha"),
-            }
-        })
-    )
-);
+/// Parse an "NG" revlog entry.
+///
+/// 64 bytes: 6-byte offset, 2-byte flags, four `u32`s (compressed length,
+/// uncompressed length, base, link), two parent `u32`s, then a 32-byte node
+/// slot of which the first 20 bytes are the node id. `u32::MAX` is `None`.
+pub fn indexng(input: &[u8]) -> ParseResult<'_, Entry> {
+    let size = indexng_size();
+    if input.len() < size {
+        return Err(ParseError::Incomplete);
+    }
+    let hash = &input[32..64];
+    let entry = Entry {
+        offset: read_u48(&input[0..6]),
+        flags: IdxFlags::from_bits(read_u16(&input[6..8])).expect("bad rev idx flags"),
+        compressed_len: read_u32(&input[8..12]),
+        len: Some(read_u32(&input[12..16])),
+        baserev: optional_idx(read_u32(&input[16..20])),
+        linkrev: optional_idx(read_u32(&input[20..24])),
+        p1: optional_idx(read_u32(&input[24..28])),
+        p2: optional_idx(read_u32(&input[28..32])),
+        nodeid: NodeHash::from_bytes(&hash[..20]).expect("bad bytes for sha"),
+    };
+    Ok((&input[size..], entry))
+}
 
 pub fn index0_size() -> usize {
     4 + 4 + 4 + 4 + 4 + 4 + 4 + 20
 }
 
-/// Parse an original revlog entry
-named!(pub index0<Entry>,
-    do_parse!(
-        _header: header >>
-        offset: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        compressed_length: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        baserev: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        linkrev: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        p1: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        p2: return_error!(ErrorKind::Custom(Badness::IO), be_u32) >>
-        hash: take!(20) >>
-        ({
-            Entry {
-                offset: offset as u64,
-                flags: IdxFlags::empty(),
-                compressed_len: compressed_length,
-                len: None,
-                baserev: if baserev == !0 { None } else { Some(baserev.into()) },
-                linkrev: if linkrev == !0 { None } else { Some(linkrev.into()) },
-                p1: if p1 == !0 { None } else { Some(p1.into()) },
-                p2: if p2 == !0 { None } else { Some(p2.into()) },
-                nodeid: NodeHash::from_bytes(&hash[..20]).expect("bad bytes for sha"),
-            }
-        })
-    )
-);
-
-/// Parse a single Delta
-named!(pub delta<Delta>,
-    do_parse!(
-        start: be_u32 >>
-        end: be_u32 >>
-        content: length_bytes!(be_u32) >>
-        ({
-            Delta {
-                start: start as usize,
-                end: end as usize,
-                content: content.into(),
-            }
-        })
-    )
-);
-
-/// Parse 0 or more deltas
-named!(deltas<Vec<Delta> >, many0!(delta));
-
-// A chunk of data data that contains some Deltas; the caller defines the framing bytes
-// bounding the input.
-named!(pub deltachunk<Vec<Delta> >,
-    map!(
-        many0!(
-            alt!(
-                do_parse!(tag!(b"u") >> d: deltas >> (d)) |                                  // uncompressed with explicit 'u' header
-                do_parse!(peek!(tag!(b"\0")) >> d: deltas >> (d)) |                          // uncompressed with included initial 0x00
-                do_parse!(peek!(tag!(b"x")) >> d: apply!(zlib_decompress, deltas) >> (d)) |  // compressed; 'x' part of the zlib stream
-                do_parse!(tag!(b"4") >> d: apply!(lz4::lz4_decompress, deltas) >> (d))       // compressed w/ lz4
-            )
-        ),
-        |dv: Vec<_>| dv.into_iter().flat_map(|x| x).collect())
-);
-
-fn remains(i: &[u8]) -> IResult<&[u8], &[u8]> {
-    IResult::Done(&i[..0], i)
+/// Parse an original revlog entry.
+pub fn index0(input: &[u8]) -> ParseResult<'_, Entry> {
+    let size = index0_size();
+    if input.len() < size {
+        return Err(ParseError::Incomplete);
+    }
+    // The v0 entry starts with a header; the fields used below follow it.
+    let _ = header(input)?;
+    let hash = &input[28..48];
+    let entry = Entry {
+        offset: read_u32(&input[4..8]) as u64,
+        flags: IdxFlags::empty(),
+        compressed_len: read_u32(&input[8..12]),
+        len: None,
+        baserev: optional_idx(read_u32(&input[12..16])),
+        linkrev: optional_idx(read_u32(&input[16..20])),
+        p1: optional_idx(read_u32(&input[20..24])),
+        p2: optional_idx(read_u32(&input[24..28])),
+        nodeid: NodeHash::from_bytes(&hash[..20]).expect("bad bytes for sha"),
+    };
+    Ok((&input[size..], entry))
 }
 
-named!(remains_owned<Vec<u8> >,
-    map!(remains, |x: &[u8]| x.into()));
+/// Parse a single delta fragment: start, end, and a length-prefixed payload.
+pub fn delta(input: &[u8]) -> ParseResult<'_, Delta> {
+    if input.len() < 12 {
+        return Err(ParseError::Incomplete);
+    }
+    let len = read_u32(&input[8..12]) as usize;
+    if input.len() < 12 + len {
+        return Err(ParseError::Incomplete);
+    }
+    let content = input[12..12 + len].to_vec();
+    Ok((
+        &input[12 + len..],
+        Delta {
+            start: read_u32(&input[0..4]) as usize,
+            end: read_u32(&input[4..8]) as usize,
+            content,
+        },
+    ))
+}
 
-/// Parse some literal data, possibly compressed
-named!(pub literal<Vec<u8> >,
-    alt!(
-        do_parse!(peek!(tag!(b"\0")) >> d: remains >> (d.into())) |
-        do_parse!(peek!(tag!(b"x")) >> d: apply!(zlib_decompress, remains_owned) >> (d)) |
-        do_parse!(tag!(b"4") >> d: apply!(lz4::lz4_decompress, remains_owned) >> (d)) |
-        do_parse!(tag!(b"u") >> d: remains >> (d.into()))
-    )
-);
+/// Parse zero or more deltas. A short tail is left unparsed, matching `many0`.
+fn deltas(input: &[u8]) -> (&[u8], Vec<Delta>) {
+    let mut rest = input;
+    let mut out = Vec::new();
+    while let Ok((next, one)) = delta(rest) {
+        out.push(one);
+        rest = next;
+    }
+    (rest, out)
+}
 
-// Remap error to remove reference to `data`
-pub fn detach_result<'a, O, E>(
-    res: IResult<&[u8], O, E>,
-    rest: &'a [u8],
-) -> IResult<&'a [u8], O, E> {
-    match res {
-        IResult::Done(_, o) => IResult::Done(rest, o),
-        IResult::Incomplete(n) => IResult::Incomplete(n),
-        IResult::Error(e) => IResult::Error(e),
+fn zlib_decompress(input: &[u8]) -> Result<(Vec<u8>, usize), ParseError> {
+    let mut decoder = ZlibDecoder::new(input);
+    let mut data = Vec::new();
+    match decoder.read_to_end(&mut data) {
+        Ok(_) => Ok((data, decoder.total_in() as usize)),
+        Err(err) => Err(ParseError::BadZlib(err.to_string())),
     }
 }
 
-/// Unpack a chunk of data and apply a parse function to the output.
-fn zlib_decompress<P, R, E: Debug>(i: &[u8], parse: P) -> IResult<&[u8], R, E>
-where
-    for<'a> P: Fn(&'a [u8]) -> IResult<&'a [u8], R, E> + 'a,
-{
-    let mut data = Vec::new();
-
-    let inused = {
-        let mut zdec = ZlibDecoder::new(i);
-
-        match zdec.read_to_end(&mut data) {
-            Ok(_) => zdec.total_in() as usize,
-            Err(err) => panic!("zdec failed {:?}", err),
+// One framed chunk of deltas. `None` means this byte is not a frame marker,
+// so the caller leaves those bytes unconsumed.
+fn delta_frame(input: &[u8]) -> Result<Option<(&[u8], Vec<Delta>)>, ParseError> {
+    match input[0] {
+        b'u' => {
+            let (rest, parsed) = deltas(&input[1..]);
+            Ok(Some((rest, parsed)))
         }
-    };
-
-    let remains = &i[inused..];
-
-    detach_result(parse(&data[..]), remains)
+        0 => {
+            let (rest, parsed) = deltas(input);
+            Ok(Some((rest, parsed)))
+        }
+        b'x' => {
+            let (data, used) = zlib_decompress(input)?;
+            // Bytes left inside the decompressed buffer are not part of the
+            // compressed-stream remainder. The caller checks that remainder.
+            let parsed = deltas(&data).1;
+            Ok(Some((&input[used..], parsed)))
+        }
+        b'4' => {
+            let data = lz4::decompress(&input[1..]).map_err(ParseError::BadLz4)?;
+            let parsed = deltas(&data).1;
+            Ok(Some((&[], parsed)))
+        }
+        _ => Ok(None),
+    }
 }
 
-/// Parse a 6 byte big-endian offset
-#[inline]
-fn be_u48(i: &[u8]) -> IResult<&[u8], u64> {
-    if i.len() < 6 {
-        IResult::Incomplete(Needed::Size(6))
-    } else {
-        let res = ((i[0] as u64) << 40) + ((i[1] as u64) << 32) + ((i[2] as u64) << 24) +
-            ((i[3] as u64) << 16) + ((i[4] as u64) << 8) + ((i[5] as u64) << 0);
-        IResult::Done(&i[6..], res)
+/// Parse a chunk of data that contains some deltas.
+pub fn deltachunk(input: &[u8]) -> ParseResult<'_, Vec<Delta>> {
+    let mut rest = input;
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        let Some((next, parsed)) = delta_frame(rest)? else {
+            break;
+        };
+        if next.len() == rest.len() {
+            break;
+        }
+        out.extend(parsed);
+        rest = next;
+    }
+    Ok((rest, out))
+}
+
+/// Parse some literal data, possibly compressed.
+pub fn literal(input: &[u8]) -> ParseResult<'_, Vec<u8>> {
+    if input.is_empty() {
+        return Err(ParseError::NoMatch);
+    }
+    match input[0] {
+        0 => Ok((&[], input.to_vec())),
+        b'x' => {
+            let (data, used) = zlib_decompress(input)?;
+            Ok((&input[used..], data))
+        }
+        b'4' => {
+            let data = lz4::decompress(&input[1..]).map_err(ParseError::BadLz4)?;
+            Ok((&[], data))
+        }
+        b'u' => Ok((&[], input[1..].to_vec())),
+        _ => Err(ParseError::NoMatch),
     }
 }
 
 #[cfg(test)]
 mod test {
-    use nom::IResult;
     use super::{Features, GENERAL_DELTA, Header, INLINE, Version, header};
 
     #[test]
     fn test_header_0() {
         let d = [0x00, 0x00, 0x00, 0x00];
-        assert_eq!(header(&d[..]),
-            IResult::Done(&b""[..],
-            Header {
-                version: Version::Revlog0,
-                features: Features::empty(),
-        }))
+        assert_eq!(
+            header(&d[..]).unwrap(),
+            (
+                &b""[..],
+                Header {
+                    version: Version::Revlog0,
+                    features: Features::empty(),
+                }
+            )
+        )
     }
 
     #[test]
     fn test_header_1() {
         let d = [0x00, 0x00, 0x00, 0x01];
-        assert_eq!(header(&d[..]),
-            IResult::Done(&b""[..],
-            Header {
-                version: Version::RevlogNG,
-                features: Features::empty(),
-        }))
+        assert_eq!(
+            header(&d[..]).unwrap(),
+            (
+                &b""[..],
+                Header {
+                    version: Version::RevlogNG,
+                    features: Features::empty(),
+                }
+            )
+        )
     }
 
     #[test]
     fn test_header_feat_1() {
         let d = [0x00, 0x01, 0x00, 0x01];
-        assert_eq!(header(&d[..]),
-            IResult::Done(&b""[..],
-            Header {
-                version: Version::RevlogNG,
-                features: INLINE,
-        }))
+        assert_eq!(
+            header(&d[..]).unwrap(),
+            (
+                &b""[..],
+                Header {
+                    version: Version::RevlogNG,
+                    features: INLINE,
+                }
+            )
+        )
     }
 
     #[test]
     fn test_header_feat_2() {
         let d = [0x00, 0x02, 0x00, 0x01];
-        assert_eq!(header(&d[..]),
-            IResult::Done(&b""[..],
-            Header {
-                version: Version::RevlogNG,
-                features: GENERAL_DELTA,
-        }))
+        assert_eq!(
+            header(&d[..]).unwrap(),
+            (
+                &b""[..],
+                Header {
+                    version: Version::RevlogNG,
+                    features: GENERAL_DELTA,
+                }
+            )
+        )
     }
 
     #[test]
     fn test_header_feat_3() {
         let d = [0x00, 0x03, 0x00, 0x01];
-        assert_eq!(header(&d[..]),
-            IResult::Done(&b""[..],
-            Header {
-                version: Version::RevlogNG,
-                features: INLINE | GENERAL_DELTA,
-        }))
+        assert_eq!(
+            header(&d[..]).unwrap(),
+            (
+                &b""[..],
+                Header {
+                    version: Version::RevlogNG,
+                    features: INLINE | GENERAL_DELTA,
+                }
+            )
+        )
     }
 }

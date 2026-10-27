@@ -4,17 +4,17 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
+use std::fmt::Debug;
+use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::result;
 use std::sync::{Arc, Mutex};
-use std::fmt::Debug;
 
-use errors::*;
-use nom::IResult;
-use memmap::{self, Mmap};
+use memmap2::Mmap;
 
+use crate::errors::{ChainErr, Error, ErrorKind, Result};
 use mercurial_types::{Blob, BlobNode, NodeHash};
 pub use mercurial_types::bdiff::{self, Delta};
 pub use mercurial_types::delta;
@@ -38,13 +38,17 @@ enum Datafile {
 
 impl Datafile {
     fn map<P: AsRef<Path>>(path: P) -> io::Result<Datafile> {
-        Mmap::open_path(path, memmap::Protection::Read).map(Datafile::Mmap)
+        let file = File::open(path)?;
+        // Read-only map. Dropping `file` is safe: the mapping owns its handle.
+        // A concurrent truncate can still fault a reader, same as the old mmap.
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Datafile::Mmap(mmap))
     }
 
     fn as_slice(&self) -> &[u8] {
         match self {
-            &Datafile::Loaded(ref data) => data.as_ref(),
-            &Datafile::Mmap(ref mmap) => unsafe { mmap.as_slice() },
+            Datafile::Loaded(data) => data.as_ref(),
+            Datafile::Mmap(mmap) => mmap,
         }
     }
 }
@@ -97,8 +101,8 @@ impl Eq for Revlog {}
 impl Revlog {
     fn init(idx: Datafile, data: Option<Datafile>) -> Result<Self> {
         let hdr = match parser::header(idx.as_slice()) {
-            IResult::Done(_, hdr) => hdr,
-            err => {
+            Ok((_, hdr)) => hdr,
+            Err(err) => {
                 return Err(
                     ErrorKind::Revlog(format!("Header parse failed: {:?}", err)).into(),
                 )
@@ -264,13 +268,13 @@ impl RevlogInner {
         };
 
         match res {
-            IResult::Done(_, mut res) => {
+            Ok((_, mut res)) => {
                 if off == 0 {
                     res.offset &= 0xffff;
                 }
                 Ok(res)
             }
-            err => {
+            Err(err) => {
                 return Err(
                     ErrorKind::Revlog(format!("failed to parse entry offset {}: {:?}", off, err))
                         .into(),
@@ -420,7 +424,7 @@ impl RevlogInner {
         // baserev itself might also be delta, otherwise its all the deltas from baserev..idx.
         if let Some(baserev) = entry.baserev {
             let delta = match parser::deltachunk(chunkdata) {
-                IResult::Done(rest, _) if rest.len() != 0 => {
+                Ok((rest, _)) if rest.len() != 0 => {
                     return Err(
                         ErrorKind::Revlog(format!(
                             "Failed to unpack details: {} remains, {:?}",
@@ -429,8 +433,8 @@ impl RevlogInner {
                         )).into(),
                     );
                 }
-                IResult::Done(_, deltas) => Chunk::Deltas(baserev, deltas),
-                err => {
+                Ok((_, deltas)) => Chunk::Deltas(baserev, deltas),
+                Err(err) => {
                     return Err(
                         ErrorKind::Revlog(format!("Failed to unpack deltas: {:?}", err)).into(),
                     )
@@ -441,7 +445,7 @@ impl RevlogInner {
             Ok(Chunk::Literal(vec![]))
         } else {
             let literal = match parser::literal(chunkdata) {
-                IResult::Done(rest, _) if rest.len() != 0 => {
+                Ok((rest, _)) if rest.len() != 0 => {
                     return Err(
                         ErrorKind::Revlog(format!(
                             "Failed to unpack literal: {} remains, {:?}",
@@ -450,8 +454,8 @@ impl RevlogInner {
                         )).into(),
                     );
                 }
-                IResult::Done(_, literal) => Chunk::Literal(literal),
-                err => {
+                Ok((_, literal)) => Chunk::Literal(literal),
+                Err(err) => {
                     return Err(
                         ErrorKind::Revlog(format!("Failed to unpack literal: {:?}", err)).into(),
                     )

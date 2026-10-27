@@ -4,29 +4,31 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use std::io::{BufRead, BufReader};
-use std::str::FromStr;
-use std::fs;
-use std::fmt::{self, Display};
-use std::path::PathBuf;
 use std::collections::HashSet;
 use std::collections::hash_map::{Entry, HashMap};
+use std::fmt::{self, Display};
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
-use futures::{Async, Future, IntoFuture, Poll, Stream};
-use futures::future::{self, BoxFuture};
-use futures::stream::{self, BoxStream};
+use futures::future::{self, BoxFuture, FutureExt};
+use futures::stream::{self, BoxStream, StreamExt};
+use futures::{Stream, TryFutureExt};
 
 use asyncmemo::Filler;
 use mercurial_types::{BlobNode, Changeset, Manifest, NodeHash, Path, Repo};
 use stockbookmarks::StockBookmarks;
 
-use errors::*;
-use revlog::{Revlog, RevlogIter};
-pub use changeset::RevlogChangeset;
-pub use manifest::RevlogManifest;
+use std::result::Result as StdResult;
 
-type FutureResult<T> = future::FutureResult<T, Error>;
+pub use crate::changeset::RevlogChangeset;
+use crate::errors::{ChainErr, Error, ErrorKind, Result};
+pub use crate::manifest::RevlogManifest;
+use crate::revlog::{Revlog, RevlogIter};
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Required {
@@ -45,20 +47,18 @@ pub enum Required {
 
 impl Display for Required {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        use self::Required::*;
-
         let s = match self {
-            &Store => "store",
-            &Fncache => "fncache",
-            &Dotencode => "dotencode",
-            &Generaldelta => "generaldelta",
-            &Treemanifest => "treemanifest",
-            &Manifestv2 => "manifestv2",
-            &Usefncache => "usefncache",
-            &Revlogv1 => "revlogv1",
-            &Largefiles => "largefiles",
-            &Lz4revlog => "lz4revlog",
-            &SqlDirstate => "sqldirstate",
+            Required::Store => "store",
+            Required::Fncache => "fncache",
+            Required::Dotencode => "dotencode",
+            Required::Generaldelta => "generaldelta",
+            Required::Treemanifest => "treemanifest",
+            Required::Manifestv2 => "manifestv2",
+            Required::Usefncache => "usefncache",
+            Required::Revlogv1 => "revlogv1",
+            Required::Largefiles => "largefiles",
+            Required::Lz4revlog => "lz4revlog",
+            Required::SqlDirstate => "sqldirstate",
         };
         write!(fmt, "{}", s)
     }
@@ -68,20 +68,18 @@ impl FromStr for Required {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Required> {
-        use self::Required::*;
-
         match s {
-            "store" => Ok(Store),
-            "fncache" => Ok(Fncache),
-            "dotencode" => Ok(Dotencode),
-            "generaldelta" => Ok(Generaldelta),
-            "treemanifest" => Ok(Treemanifest),
-            "manifestv2" => Ok(Manifestv2),
-            "usefncache" => Ok(Usefncache),
-            "revlogv1" => Ok(Revlogv1),
-            "largefiles" => Ok(Largefiles),
-            "lz4revlog" => Ok(Lz4revlog),
-            "sqldirstate" => Ok(SqlDirstate),
+            "store" => Ok(Required::Store),
+            "fncache" => Ok(Required::Fncache),
+            "dotencode" => Ok(Required::Dotencode),
+            "generaldelta" => Ok(Required::Generaldelta),
+            "treemanifest" => Ok(Required::Treemanifest),
+            "manifestv2" => Ok(Required::Manifestv2),
+            "usefncache" => Ok(Required::Usefncache),
+            "revlogv1" => Ok(Required::Revlogv1),
+            "largefiles" => Ok(Required::Largefiles),
+            "lz4revlog" => Ok(Required::Lz4revlog),
+            "sqldirstate" => Ok(Required::SqlDirstate),
             unk => Err(ErrorKind::UnknownReq(unk.into()).into()),
         }
     }
@@ -116,8 +114,9 @@ struct RevlogInner {
 
 impl PartialEq<Self> for RevlogRepo {
     fn eq(&self, other: &Self) -> bool {
-        self.basepath == other.basepath && self.requirements == other.requirements &&
-            Arc::ptr_eq(&self.inner, &other.inner)
+        self.basepath == other.basepath
+            && self.requirements == other.requirements
+            && Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
 impl Eq for RevlogRepo {}
@@ -131,14 +130,13 @@ impl RevlogRepo {
         let manifest = Revlog::from_idx_data(store.join("00manifest.i"), None as Option<String>)?;
 
         let mut req = HashSet::new();
-        let file = fs::File::open(base.join("requires"))
-            .chain_err(|| "Can't open `requires`")?;
+        let file = fs::File::open(base.join("requires")).chain_err(|| "Can't open `requires`")?;
         for line in BufReader::new(file).lines() {
             req.insert(line.chain_err(|| "Line read failed")?.parse()?);
         }
 
         Ok(RevlogRepo {
-            basepath: base.into(),
+            basepath: base,
             requirements: req,
             inner: Arc::new(Mutex::new(RevlogInner {
                 changelog: changelog,
@@ -148,53 +146,68 @@ impl RevlogRepo {
         })
     }
 
-    pub fn get_heads(&self) -> BoxStream<NodeHash, Error> {
+    pub fn get_heads(&self) -> BoxStream<'static, StdResult<NodeHash, Error>> {
         let mut inner = self.inner.lock().expect("poisoned lock");
         match inner.changelog.get_heads() {
-            Err(e) => stream::once(Err(e)).boxed(),
-            Ok(set) => stream::iter(set.into_iter().map(|e| Ok(e))).boxed(),
+            Err(err) => stream::once(future::ready(Err(err))).boxed(),
+            Ok(set) => stream::iter(set.into_iter().map(Ok)).boxed(),
         }
     }
 
-    pub fn changeset_exists(&self, nodeid: &NodeHash) -> FutureResult<bool> {
+    pub fn changeset_exists(
+        &self,
+        nodeid: &NodeHash,
+    ) -> BoxFuture<'static, StdResult<bool, Error>> {
         let inner = self.inner.lock().expect("poisoned lock");
-
-        Ok(inner.changelog.get_idx_by_nodeid(nodeid).is_ok()).into_future()
+        let exists = inner.changelog.get_idx_by_nodeid(nodeid).is_ok();
+        future::ready(Ok(exists)).boxed()
     }
 
-    pub fn get_changeset_blob_by_nodeid(&self, nodeid: &NodeHash) -> FutureResult<BlobNode> {
+    fn changeset_blob(&self, nodeid: &NodeHash) -> Result<BlobNode> {
         let inner = self.inner.lock().expect("poisoned lock");
-
-        inner
-            .changelog
-            .get_idx_by_nodeid(nodeid)
-            .and_then(|idx| inner.changelog.get_rev(idx))
-            .into_future()
+        let idx = inner.changelog.get_idx_by_nodeid(nodeid)?;
+        inner.changelog.get_rev(idx)
     }
 
-    pub fn get_changeset_by_nodeid(&self, nodeid: &NodeHash) -> BoxFuture<RevlogChangeset, Error> {
+    pub fn get_changeset_blob_by_nodeid(
+        &self,
+        nodeid: &NodeHash,
+    ) -> BoxFuture<'static, StdResult<BlobNode, Error>> {
+        future::ready(self.changeset_blob(nodeid)).boxed()
+    }
+
+    pub fn get_changeset_by_nodeid(
+        &self,
+        nodeid: &NodeHash,
+    ) -> BoxFuture<'static, StdResult<RevlogChangeset, Error>> {
         // TODO: (jsgf) T17932873 distinguish between not existing vs some other error
-        self.get_changeset_blob_by_nodeid(nodeid)
-            .and_then(|rev| RevlogChangeset::new(rev))
-            .boxed()
+        future::ready(self.changeset_blob(nodeid).and_then(RevlogChangeset::new)).boxed()
     }
 
-    pub fn get_manifest_blob_by_nodeid(&self, nodeid: &NodeHash) -> FutureResult<BlobNode> {
+    fn manifest_blob(&self, nodeid: &NodeHash) -> Result<BlobNode> {
         let inner = self.inner.lock().expect("poisoned lock");
-
-        inner
-            .manifest
-            .get_idx_by_nodeid(nodeid)
-            .and_then(|idx| inner.manifest.get_rev(idx))
-            .into_future()
+        let idx = inner.manifest.get_idx_by_nodeid(nodeid)?;
+        inner.manifest.get_rev(idx)
     }
 
-    pub fn get_manifest_by_nodeid(&self, nodeid: &NodeHash) -> BoxFuture<RevlogManifest, Error> {
+    pub fn get_manifest_blob_by_nodeid(
+        &self,
+        nodeid: &NodeHash,
+    ) -> BoxFuture<'static, StdResult<BlobNode, Error>> {
+        future::ready(self.manifest_blob(nodeid)).boxed()
+    }
+
+    pub fn get_manifest_by_nodeid(
+        &self,
+        nodeid: &NodeHash,
+    ) -> BoxFuture<'static, StdResult<RevlogManifest, Error>> {
         // TODO: (jsgf) T17932873 distinguish between not existing vs some other error
         let repo = self.clone();
-        self.get_manifest_blob_by_nodeid(nodeid)
-            .and_then(|rev| RevlogManifest::new(repo, rev))
-            .boxed()
+        future::ready(
+            self.manifest_blob(nodeid)
+                .and_then(|rev| RevlogManifest::new(repo, rev)),
+        )
+        .boxed()
     }
 
     pub fn get_requirements(&self) -> &HashSet<Required> {
@@ -209,13 +222,12 @@ impl RevlogRepo {
 
             Entry::Vacant(missing) => {
                 let dotencode = self.requirements.contains(&Required::Dotencode);
-                let mut path = self.basepath
+                let mut path = self
+                    .basepath
                     .join("store")
                     .join("data")
                     .join(path.fsencode(dotencode));
-                if let Some(ext) = path.extension()
-                    .map(|ext| ext.to_string_lossy().into_owned())
-                {
+                if let Some(ext) = path.extension().map(|ext| ext.to_string_lossy().into_owned()) {
                     path.set_extension(format!("{}.i", ext));
                 } else {
                     path.set_extension("i");
@@ -228,7 +240,7 @@ impl RevlogRepo {
     }
 
     pub fn bookmarks(&self) -> Result<StockBookmarks> {
-        Ok(StockBookmarks::read(self.basepath.clone())?)
+        StockBookmarks::read(self.basepath.clone()).map_err(Into::into)
     }
 
     pub fn changesets(&self) -> ChangesetStream {
@@ -246,13 +258,12 @@ impl ChangesetBlobFiller {
 
 impl Filler for ChangesetBlobFiller {
     type Key = NodeHash;
-    type Value = BoxFuture<Arc<BlobNode>, Error>;
+    type Value = BoxFuture<'static, StdResult<Arc<BlobNode>, Error>>;
 
     fn fill(&self, key: &Self::Key) -> Self::Value {
-        self.0
-            .get_changeset_blob_by_nodeid(&key)
-            .map(Arc::new)
-            .boxed()
+        let key = *key;
+        let repo = self.0.clone();
+        async move { repo.changeset_blob(&key).map(Arc::new) }.boxed()
     }
 }
 
@@ -265,13 +276,12 @@ impl ManifestBlobFiller {
 
 impl Filler for ManifestBlobFiller {
     type Key = NodeHash;
-    type Value = BoxFuture<Arc<BlobNode>, Error>;
+    type Value = BoxFuture<'static, StdResult<Arc<BlobNode>, Error>>;
 
     fn fill(&self, key: &Self::Key) -> Self::Value {
-        self.0
-            .get_manifest_blob_by_nodeid(&key)
-            .map(Arc::new)
-            .boxed()
+        let key = *key;
+        let repo = self.0.clone();
+        async move { repo.manifest_blob(&key).map(Arc::new) }.boxed()
     }
 }
 
@@ -284,44 +294,47 @@ impl ChangesetStream {
 }
 
 impl Stream for ChangesetStream {
-    type Item = NodeHash;
-    type Error = Error;
+    type Item = StdResult<NodeHash, Error>;
 
-    fn poll(&mut self) -> Poll<Option<NodeHash>, Error> {
-        match self.0.next() {
-            Some((_, e)) => Ok(Async::Ready(Some(e.nodeid))),
-            None => Ok(Async::Ready(None)),
-        }
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        Poll::Ready(this.0.next().map(|(_, entry)| Ok(entry.nodeid)))
     }
 }
 
 impl Repo for RevlogRepo {
     type Error = Error;
 
-    fn get_heads(&self) -> BoxStream<NodeHash, Self::Error> {
-        self.get_heads().boxed()
+    fn get_heads(&self) -> BoxStream<'static, StdResult<NodeHash, Self::Error>> {
+        RevlogRepo::get_heads(self)
     }
 
-    fn get_changesets(&self) -> BoxStream<NodeHash, Self::Error> {
+    fn get_changesets(&self) -> BoxStream<'static, StdResult<NodeHash, Self::Error>> {
         self.changesets().boxed()
     }
 
-    fn changeset_exists(&self, nodeid: &NodeHash) -> BoxFuture<bool, Self::Error> {
-        RevlogRepo::changeset_exists(self, nodeid).boxed()
+    fn changeset_exists(
+        &self,
+        nodeid: &NodeHash,
+    ) -> BoxFuture<'static, StdResult<bool, Self::Error>> {
+        RevlogRepo::changeset_exists(self, nodeid)
     }
 
-    fn get_changeset_by_nodeid(&self, nodeid: &NodeHash) -> BoxFuture<Box<Changeset>, Self::Error> {
+    fn get_changeset_by_nodeid(
+        &self,
+        nodeid: &NodeHash,
+    ) -> BoxFuture<'static, StdResult<Box<dyn Changeset>, Self::Error>> {
         RevlogRepo::get_changeset_by_nodeid(self, nodeid)
-            .map(|cs| cs.boxed())
+            .map_ok(|cs| cs.boxed())
             .boxed()
     }
 
     fn get_manifest_by_nodeid(
         &self,
         nodeid: &NodeHash,
-    ) -> BoxFuture<Box<Manifest<Error = Self::Error>>, Self::Error> {
+    ) -> BoxFuture<'static, StdResult<Box<dyn Manifest<Error = Self::Error>>, Self::Error>> {
         RevlogRepo::get_manifest_by_nodeid(self, nodeid)
-            .map(|m| m.boxed())
+            .map_ok(|manifest| manifest.boxed())
             .boxed()
     }
 }

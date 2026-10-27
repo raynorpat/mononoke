@@ -6,39 +6,66 @@
 
 use std::io;
 
-use mercurial_types;
-use stockbookmarks;
+use thiserror::Error;
 
-#[recursion_limit = "1024"]
-error_chain! {
-    errors {
-        Bundle2Decode(msg: String) {
-            description("bundle2 decode error")
-            display("{}", msg)
-        }
-        Revlog(msg: String) {
-            description("revlog error")
-            display("{}", msg)
-        }
-        Repo(msg: String) {
-            description("repo error")
-            display("{}", msg)
-        }
-        UnknownReq(req: String) {
-            description("unknown repo requirement")
-            display("Unknown requirement \"{}\"", req)
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("{0}")]
+    Msg(String),
+    #[error("{0}")]
+    Bundle2Decode(String),
+    #[error("{0}")]
+    Revlog(String),
+    #[error("{0}")]
+    Repo(String),
+    #[error("Unknown requirement \"{0}\"")]
+    UnknownReq(String),
+    #[error("{context}")]
+    WithChain {
+        context: String,
+        #[source]
+        cause: Box<Error>,
+    },
+    #[error(transparent)]
+    MercurialTypes(#[from] mercurial_types::Error),
+    #[error(transparent)]
+    StockBookmarks(#[from] stockbookmarks::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Utf8(#[from] std::str::Utf8Error),
+    #[error(transparent)]
+    Utf8String(#[from] std::string::FromUtf8Error),
+    #[error(transparent)]
+    ParseInt(#[from] std::num::ParseIntError),
+}
+
+pub type ErrorKind = Error;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    pub fn with_chain<E, C>(error: E, context: C) -> Self
+    where
+        E: Into<Error>,
+        C: std::fmt::Display,
+    {
+        Error::WithChain {
+            context: context.to_string(),
+            cause: Box::new(error.into()),
         }
     }
+}
 
-    links {
-        MercurialTypes(mercurial_types::Error, mercurial_types::ErrorKind);
-        StockBookmarks(stockbookmarks::Error, stockbookmarks::ErrorKind);
+impl From<&str> for Error {
+    fn from(msg: &str) -> Self {
+        Error::Msg(msg.to_owned())
     }
+}
 
-    foreign_links {
-        Io(::std::io::Error);
-        Utf8(::std::str::Utf8Error);
-        Utf8String(::std::string::FromUtf8Error);
+impl From<String> for Error {
+    fn from(msg: String) -> Self {
+        Error::Msg(msg)
     }
 }
 
@@ -50,12 +77,29 @@ impl From<Error> for String {
 
 impl From<Error> for io::Error {
     fn from(err: Error) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, format!("{}", err))
+        io::Error::new(io::ErrorKind::Other, err)
     }
 }
 
-impl From<ErrorKind> for io::Error {
-    fn from(err: ErrorKind) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, format!("{}", err))
+pub trait ChainErr<T> {
+    fn chain_err<F, D>(self, op: F) -> Result<T>
+    where
+        F: FnOnce() -> D,
+        D: Into<Error>;
+}
+
+impl<T, E> ChainErr<T> for std::result::Result<T, E>
+where
+    E: Into<Error>,
+{
+    fn chain_err<F, D>(self, op: F) -> Result<T>
+    where
+        F: FnOnce() -> D,
+        D: Into<Error>,
+    {
+        self.map_err(|err| {
+            let context = op().into().to_string();
+            Error::with_chain(err, context)
+        })
     }
 }

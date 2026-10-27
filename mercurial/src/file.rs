@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::str;
 
-use errors::*;
-
 use itertools::Itertools;
+
+use crate::errors::{ChainErr, Result};
 
 use mercurial_types::{BlobNode, NodeHash, Path};
 
@@ -30,7 +30,8 @@ impl File {
         if &file[..META_SZ] != META_MARKER {
             (&[], 0)
         } else {
-            let metasz = &file[META_SZ..]
+            // XXX malformed if None - unterminated metadata
+            let metasz = file[META_SZ..]
                 .iter()
                 .enumerate()
                 .tuple_windows()
@@ -38,9 +39,7 @@ impl File {
                     *a == META_MARKER[0] && *b == META_MARKER[1]
                 })
                 .map(|((idx, _), _)| idx + META_SZ * 2)
-                .unwrap_or(META_SZ); // XXX malformed if None - unterminated metadata
-
-            let metasz = *metasz;
+                .unwrap_or(META_SZ);
             if metasz >= META_SZ * 2 {
                 (&file[META_SZ..metasz - META_SZ], metasz)
             } else {
