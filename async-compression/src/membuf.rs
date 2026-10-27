@@ -4,11 +4,12 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-//! In-memory async buffers that implement `Read`.
+//! In-memory async buffers.
 //!
-//! Sync decoders only see `std::io::Read`. When the buffer is empty they get
-//! `WouldBlock`, and the waker from the current `poll_read` is stored here so
-//! a later `write_buf` can wake the reader.
+//! An empty buffer stores the `poll_read` waker so a later `write_buf` wakes
+//! the reader. A full buffer stores the `poll_write` waker so a later read
+//! wakes the writer. `write_buf` itself has no `Context`; callers that must
+//! be woken use `AsyncWrite`.
 
 use std::cell::RefCell;
 use std::cmp;
@@ -17,7 +18,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 use bytes::BytesMut;
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 thread_local! {
     static POLL_WAKER: RefCell<Option<Waker>> = RefCell::new(None);
@@ -63,7 +64,11 @@ impl MemBuf {
         }
 
         if self.capacity == self.buf.len() {
-            self.write_waker = current_waker();
+            // Only replace a parked writer when this call is inside a poll.
+            // A bare `write_buf` has no waker and must not clear one.
+            if let Some(waker) = current_waker() {
+                self.write_waker = Some(waker);
+            }
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "buffer full"));
         }
 
@@ -143,5 +148,71 @@ impl AsyncRead for MemBuf {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
             Err(e) => Poll::Ready(Err(e)),
         }
+    }
+}
+
+impl AsyncWrite for MemBuf {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match this.write_buf(buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                this.write_waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().mark_eof();
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Wake, Waker};
+
+    use super::*;
+
+    struct Flag(AtomicBool);
+
+    impl Wake for Flag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn full_buffer_wakes_blocked_writer() {
+        let mut buf = MemBuf::new(4);
+        assert_eq!(buf.write_buf(&[1, 2, 3, 4]).unwrap(), 4);
+
+        let flag = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = Waker::from(flag.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut buf).poll_write(&mut cx, &[9]).is_pending());
+        assert!(!flag.0.load(Ordering::SeqCst));
+
+        let mut out = [0u8; 1];
+        assert_eq!(Read::read(&mut buf, &mut out).unwrap(), 1);
+        assert!(flag.0.load(Ordering::SeqCst));
+
+        match Pin::new(&mut buf).poll_write(&mut cx, &[9]) {
+            Poll::Ready(Ok(1)) => {}
+            other => panic!("writer was not resumed: {:?}", other),
+        }
+        assert_eq!(&buf.buf[..], &[2, 3, 4, 9]);
     }
 }

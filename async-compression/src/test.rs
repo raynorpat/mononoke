@@ -4,6 +4,7 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
+use std::cmp;
 use std::io::{self, Cursor, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -11,7 +12,7 @@ use std::task::{Context, Poll};
 use bzip2::Compression;
 use futures::executor::block_on;
 use quickcheck::{quickcheck, TestResult};
-use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 use crate::compressor::{Compressor, CompressorType};
 use crate::decompressor::Decompressor;
@@ -74,6 +75,70 @@ fn roundtrip(ct: CompressorType, input: &[u8]) -> TestResult {
     );
     assert_eq!(input, result.as_slice());
     TestResult::passed()
+}
+
+/// `AsyncRead` that yields a few bytes, then `Pending`, and does not implement
+/// `std::io::Read`. `Decompressor::new` must accept it.
+struct PausingRead {
+    data: Vec<u8>,
+    pos: usize,
+    pause: bool,
+}
+
+impl PausingRead {
+    fn new(data: Vec<u8>) -> Self {
+        PausingRead {
+            data,
+            pos: 0,
+            pause: true,
+        }
+    }
+}
+
+impl AsyncRead for PausingRead {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.pause {
+            this.pause = false;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        this.pause = true;
+        if this.pos >= this.data.len() {
+            return Poll::Ready(Ok(()));
+        }
+        let n = cmp::min(3, cmp::min(buf.remaining(), this.data.len() - this.pos));
+        buf.put_slice(&this.data[this.pos..this.pos + n]);
+        this.pos += n;
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[test]
+fn decompresses_async_read_that_is_not_std_read() {
+    let raw = b"hello from an AsyncRead socket";
+    let kinds = [
+        CompressorType::Uncompressed,
+        CompressorType::Gzip,
+        CompressorType::Bzip2(Compression::default()),
+        CompressorType::Zstd {
+            level: ZSTD_DEFAULT_LEVEL,
+        },
+    ];
+    for ct in kinds {
+        let mut compressor = Compressor::new(Cursor::new(Vec::new()), ct);
+        compressor.write_all(raw).unwrap();
+        let compressed = compressor.try_finish().unwrap().into_inner();
+
+        let mut dec = Decompressor::new(PausingRead::new(compressed), ct.decompressor_type());
+        let mut out = Vec::new();
+        block_on(dec.read_to_end(&mut out)).expect("decompress");
+        assert_eq!(out, raw);
+    }
 }
 
 struct FinishAfterCountTestWriter {
