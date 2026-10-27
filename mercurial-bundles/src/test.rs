@@ -5,13 +5,19 @@
 // GNU General Public License version 2 or any later version.
 
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::io::{self, Cursor};
+use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use assert_matches::assert_matches;
 use async_compression::{CompressorType, ZSTD_DEFAULT_LEVEL};
 use futures::executor::block_on;
-use futures::StreamExt;
+use futures::task::{waker, ArcWake};
+use futures::{Future, StreamExt};
 use mercurial_types::delta::Fragment;
 use mercurial_types::{Delta, NodeHash, Path, NULL_HASH};
 use partial_io::quickcheck_types::{GenWouldBlock, PartialWithErrors};
@@ -19,7 +25,7 @@ use partial_io::PartialAsyncRead;
 use quickcheck::{Gen, QuickCheck};
 use slog::{o, Drain, Logger};
 use slog_term;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::bundle2::Bundle2Stream;
 use crate::bundle2_encode::Bundle2EncodeBuilder;
@@ -418,4 +424,101 @@ fn changegroup_part_emits_cg02_fulltext() {
     assert_eq!(chunk.node, node);
     assert_eq!(chunk.base, NULL_HASH);
     assert_eq!(chunk.delta.fragments()[0].content, b"alpha\n");
+}
+
+struct TaskWakes(AtomicUsize);
+
+impl ArcWake for TaskWakes {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Accepts every write. After the first flush, the next write returns `Pending`
+/// once and wakes `cx`. That write is the compression trailer from `try_finish`.
+struct FinishGate {
+    buf: Vec<u8>,
+    armed: bool,
+    blocked_once: bool,
+}
+
+impl AsyncWrite for FinishGate {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.armed && !this.blocked_once {
+            this.blocked_once = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        this.buf.extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().armed = true;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[test]
+fn finish_pending_wakes_task_and_completes() {
+    let flag = Arc::new(TaskWakes(AtomicUsize::new(0)));
+    let task_waker = waker(Arc::clone(&flag));
+    let mut cx = Context::from_waker(&task_waker);
+
+    let mut builder = Bundle2EncodeBuilder::new(FinishGate {
+        buf: Vec::new(),
+        armed: false,
+        blocked_once: false,
+    });
+    builder.set_compressor_type(CompressorType::Gzip);
+    let mut encode = builder.build();
+
+    match Pin::new(&mut encode).poll(&mut cx) {
+        Poll::Pending => {}
+        Poll::Ready(Ok(_)) => panic!("encode finished without a Pending finish write"),
+        Poll::Ready(Err(err)) => panic!("encode failed: {err}"),
+    }
+    assert!(
+        flag.0.load(Ordering::SeqCst) >= 1,
+        "Pending during finish did not wake the task"
+    );
+
+    let writer = match Pin::new(&mut encode).poll(&mut cx) {
+        Poll::Ready(Ok(writer)) => writer,
+        Poll::Pending => panic!("encode stayed Pending after the writer was woken"),
+        Poll::Ready(Err(err)) => panic!("encode failed: {err}"),
+    };
+    assert!(writer.blocked_once);
+    assert!(writer.buf.starts_with(b"HG20"));
+}
+
+#[test]
+fn chain_err_preserves_bundle2_decode_kind() {
+    let err = Err::<(), Error>(Error::from("root"))
+        .chain_err(|| ErrorKind::Bundle2Decode("bad stream".into()))
+        .unwrap_err();
+    assert_matches!(
+        err.kind(),
+        &ErrorKind::Bundle2Decode(ref msg) if msg == "bad stream"
+    );
+    assert!(!err.is_app_error());
+
+    let header = PartHeaderBuilder::new("UNKNOWN").unwrap().build(0);
+    let err = Err::<(), Error>(Error::from("root"))
+        .chain_err(|| ErrorKind::BundleUnknownPart(header))
+        .unwrap_err();
+    assert!(err.is_app_error());
+    assert_matches!(err.kind(), &ErrorKind::BundleUnknownPart(_));
+
+    let io_err = io::Error::from(err);
+    assert_eq!(StdError::source(&io_err).unwrap().to_string(), "root");
 }

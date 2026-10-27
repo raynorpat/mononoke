@@ -41,7 +41,7 @@ pub enum Error {
     ListkeyGeneration,
     #[error("{context}")]
     WithChain {
-        context: String,
+        context: Box<Error>,
         #[source]
         cause: Box<Error>,
     },
@@ -59,11 +59,14 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
     pub fn kind(&self) -> &Self {
-        self
+        match self {
+            Error::WithChain { context, .. } => context.kind(),
+            _ => self,
+        }
     }
 
     pub fn is_app_error(&self) -> bool {
-        match self {
+        match self.kind() {
             Error::BundleUnknownPart(_) | Error::BundleUnknownPartParams(_, _) => true,
             _ => false,
         }
@@ -72,10 +75,10 @@ impl Error {
     pub fn with_chain<E, C>(error: E, context: C) -> Self
     where
         E: Into<Error>,
-        C: std::fmt::Display,
+        C: Into<Error>,
     {
         Error::WithChain {
-            context: context.to_string(),
+            context: Box::new(context.into()),
             cause: Box::new(error.into()),
         }
     }
@@ -95,7 +98,7 @@ impl From<String> for Error {
 
 impl From<Error> for io::Error {
     fn from(err: Error) -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidData, format!("{}", err))
+        io::Error::new(io::ErrorKind::InvalidData, err)
     }
 }
 
@@ -115,9 +118,6 @@ where
         F: FnOnce() -> D,
         D: Into<Error>,
     {
-        self.map_err(|err| {
-            let context = op().into().to_string();
-            Error::with_chain(err, context)
-        })
+        self.map_err(|err| Error::with_chain(err, op()))
     }
 }
