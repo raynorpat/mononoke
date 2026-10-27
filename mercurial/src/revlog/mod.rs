@@ -6,8 +6,8 @@
 
 use std::fmt::Debug;
 use std::fs::File;
-use std::io;
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::result;
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,8 @@ struct RevlogInner {
     data: Option<Datafile>,
     idxoff: BTreeMap<RevIdx, usize>, // cache of index -> offset
     nodeidx: HashMap<NodeHash, RevIdx>, // cache of nodeid -> index
+    idx_path: Option<PathBuf>,
+    data_path: Option<PathBuf>,
 }
 
 impl PartialEq<Self> for Revlog {
@@ -98,21 +100,54 @@ impl PartialEq<Self> for Revlog {
 }
 impl Eq for Revlog {}
 
+/// Inline index-plus-data larger than this is rewritten as a separate `.d` file.
+pub const INLINE_LIMIT: usize = 131072;
+
+/// Compression for a full-text snapshot chunk. Neither variant adds a prefix byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevlogCompression {
+    Zlib,
+    Zstd,
+}
+
+/// One full-text revision to append. `node` is stored as given.
+#[derive(Clone, Debug)]
+pub struct RevlogAppend {
+    pub node: NodeHash,
+    pub p1: Option<NodeHash>,
+    pub p2: Option<NodeHash>,
+    pub linkrev: Option<u32>,
+    pub text: Vec<u8>,
+}
+
 impl Revlog {
     fn init(idx: Datafile, data: Option<Datafile>) -> Result<Self> {
-        let hdr = match parser::header(idx.as_slice()) {
-            Ok((_, hdr)) => hdr,
-            Err(err) => {
-                return Err(
-                    ErrorKind::Revlog(format!("Header parse failed: {:?}", err)).into(),
-                )
-            }
+        // An empty index has no header yet. The first append writes v1 inline generaldelta.
+        // Any non-empty buffer still has to parse as a header.
+        let (hdr, data) = if idx.as_slice().is_empty() {
+            (
+                Header {
+                    version: Version::RevlogNG,
+                    features: parser::INLINE | parser::GENERAL_DELTA,
+                },
+                None,
+            )
+        } else {
+            let hdr = match parser::header(idx.as_slice()) {
+                Ok((_, hdr)) => hdr,
+                Err(err) => {
+                    return Err(
+                        ErrorKind::Revlog(format!("Header parse failed: {:?}", err)).into(),
+                    )
+                }
+            };
+            let data = if hdr.features.contains(parser::INLINE) {
+                None
+            } else {
+                data
+            };
+            (hdr, data)
         };
-
-        let mut data = data;
-        if hdr.features.contains(parser::INLINE) {
-            data = None
-        }
 
         let mut idxoff = BTreeMap::new();
         idxoff.insert(RevIdx::zero(), 0); // prime cache - idx 0 = offset 0
@@ -123,6 +158,8 @@ impl Revlog {
             data: data,
             idxoff: idxoff,
             nodeidx: HashMap::new(),
+            idx_path: None,
+            data_path: None,
         };
 
         Ok(Revlog { inner: Arc::new(Mutex::new(inner)) })
@@ -140,10 +177,12 @@ impl Revlog {
     where
         IP: AsRef<Path>,
     {
-        let idx = Datafile::map(idxpath)
+        let path = idxpath.as_ref().to_path_buf();
+        let idx = Datafile::map(&path)
             .chain_err(|| format!("Can't map idxpath"))?;
 
         let revlog = Revlog::init(idx, None)?;
+        revlog.inner.lock().expect("lock poisoned").idx_path = Some(path);
 
         Ok(revlog)
     }
@@ -166,18 +205,14 @@ impl Revlog {
             let mut inner = revlog.inner.lock().expect("lock poisoned");
 
             if !inner.have_data() {
-                let datafile = match datapath {
-                    None => {
-                        let path = idxpath.with_extension("d");
-                        Datafile::map(&path)
-                            .chain_err(|| format!("Can't open data file {:?}", path))?
-                    }
-                    Some(path) => {
-                        Datafile::map(&path)
-                            .chain_err(|| format!("Can't open data file {:?}", path))?
-                    }
+                let data_path = match datapath {
+                    None => idxpath.with_extension("d"),
+                    Some(path) => path.to_path_buf(),
                 };
+                let datafile = Datafile::map(&data_path)
+                    .chain_err(|| format!("Can't open data file {:?}", data_path))?;
                 inner.data = Some(datafile);
+                inner.data_path = Some(data_path);
             }
         }
 
@@ -255,6 +290,20 @@ impl Revlog {
         let mut inner = self.inner.lock().expect("lock poisoned");
 
         inner.get_heads()
+    }
+
+    /// Append a generaldelta snapshot. The stored node id is `rev.node`.
+    ///
+    /// The base index is the new revision. `Zstd` is a zstd frame of the full
+    /// text and `Zlib` is a zlib stream, with no extra prefix byte. An inline
+    /// revlog whose written size would exceed `INLINE_LIMIT` is split first.
+    pub fn append_snapshot(
+        &mut self,
+        rev: RevlogAppend,
+        compression: RevlogCompression,
+    ) -> Result<u32> {
+        let mut inner = self.inner.lock().expect("lock poisoned");
+        inner.append_snapshot(rev, compression)
     }
 }
 
@@ -641,6 +690,308 @@ impl RevlogInner {
 
         // Convert to a set of nodeids
         Ok(heads.values().map(|n| n.nodeid).collect())
+    }
+
+    fn append_snapshot(
+        &mut self,
+        rev: RevlogAppend,
+        compression: RevlogCompression,
+    ) -> Result<u32> {
+        if self.header.version != Version::RevlogNG {
+            return Err(ErrorKind::Revlog("append_snapshot requires revlog v1".into()).into());
+        }
+        if rev.text.len() > u32::MAX as usize {
+            return Err(ErrorKind::Revlog("revision text exceeds u32 length".into()).into());
+        }
+        let compressed = compress_snapshot(&rev.text, compression)?;
+        if compressed.len() > u32::MAX as usize {
+            return Err(ErrorKind::Revlog("compressed revision exceeds u32 length".into()).into());
+        }
+
+        let p1 = self.parent_rev(rev.p1)?;
+        let p2 = self.parent_rev(rev.p2)?;
+        let linkrev = rev.linkrev.unwrap_or(u32::MAX);
+        let rev_idx = self.revision_count()?;
+        if self.header.features.contains(parser::INLINE) {
+            let new_size = self.idx.as_slice().len() + self.fixed_entry_size() + compressed.len();
+            if new_size > INLINE_LIMIT {
+                self.split_inline()?;
+            }
+        } else if self.data.is_none() && rev_idx > 0 {
+            return Err("Can't append without data".into());
+        }
+
+        self.write_snapshot(
+            rev_idx,
+            &rev.node,
+            p1,
+            p2,
+            linkrev,
+            rev.text.len() as u32,
+            &compressed,
+        )?;
+        self.persist()?;
+        Ok(rev_idx)
+    }
+
+    /// `None` and an unknown hash are a null parent (`u32::MAX`).
+    fn parent_rev(&mut self, parent: Option<NodeHash>) -> Result<u32> {
+        let Some(node) = parent else {
+            return Ok(u32::MAX);
+        };
+        if let Some(idx) = self.nodeidx.get(&node).copied() {
+            return Ok(idx.as_u32());
+        }
+        let count = self.revision_count()?;
+        for n in 0..count {
+            let entry = self.get_entry(RevIdx::from(n as usize))?;
+            if entry.nodeid == node {
+                return Ok(n);
+            }
+        }
+        Ok(u32::MAX)
+    }
+
+    fn revision_count(&self) -> Result<u32> {
+        let bytes_len = self.idx.as_slice().len();
+        if bytes_len == 0 {
+            return Ok(0);
+        }
+        if self.header.features.contains(parser::INLINE) {
+            let mut off = 0usize;
+            let mut count = 0u32;
+            let fixed = self.fixed_entry_size();
+            while off < bytes_len {
+                let ent = self.parse_entry(off)?;
+                let next = off + fixed + ent.compressed_len as usize;
+                if next > bytes_len {
+                    return Err(ErrorKind::Revlog(format!(
+                        "inline chunk for rev {} exceeds index",
+                        count
+                    ))
+                    .into());
+                }
+                off = next;
+                count += 1;
+            }
+            Ok(count)
+        } else {
+            let size = self.fixed_entry_size();
+            if size == 0 || bytes_len % size != 0 {
+                return Err(ErrorKind::Revlog(format!(
+                    "index length {} is not a multiple of {}",
+                    bytes_len, size
+                ))
+                .into());
+            }
+            Ok((bytes_len / size) as u32)
+        }
+    }
+
+    fn split_inline(&mut self) -> Result<()> {
+        if !self.header.features.contains(parser::INLINE) {
+            return Ok(());
+        }
+        let fixed = self.fixed_entry_size();
+        let bytes = self.idx.as_slice().to_vec();
+        let mut data = Vec::new();
+        let mut index = Vec::new();
+        let mut off = 0usize;
+        let mut rev = 0u32;
+        while off < bytes.len() {
+            let (_, ent) = match parser::indexng(&bytes[off..]) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    return Err(ErrorKind::Revlog(format!(
+                        "failed to parse entry offset {}: {:?}",
+                        off, err
+                    ))
+                    .into())
+                }
+            };
+            let start = off + fixed;
+            let end = start + ent.compressed_len as usize;
+            if end > bytes.len() {
+                return Err(ErrorKind::Revlog(format!(
+                    "inline chunk for rev {} exceeds index",
+                    rev
+                ))
+                .into());
+            }
+            let data_off = data.len() as u64;
+            let packed = pack_indexng(
+                data_off,
+                ent.flags.bits(),
+                ent.compressed_len,
+                ent.len.unwrap_or(0),
+                opt_rev(ent.baserev),
+                opt_rev(ent.linkrev),
+                opt_rev(ent.p1),
+                opt_rev(ent.p2),
+                ent.nodeid.as_ref(),
+            );
+            data.extend_from_slice(&bytes[start..end]);
+            index.extend_from_slice(&packed);
+            off = end;
+            rev += 1;
+        }
+
+        self.header.features.remove(parser::INLINE);
+        if !index.is_empty() {
+            overlay_header(&mut index, self.header.features, self.header.version);
+        }
+        self.idx = Datafile::Loaded(index);
+        self.data = Some(Datafile::Loaded(data));
+        self.idxoff.clear();
+        if rev > 0 {
+            self.idxoff.insert(RevIdx::zero(), 0);
+        }
+        if self.data_path.is_none() {
+            if let Some(path) = self.idx_path.clone() {
+                self.data_path = Some(path.with_extension("d"));
+            }
+        }
+        Ok(())
+    }
+
+    fn write_snapshot(
+        &mut self,
+        rev_idx: u32,
+        node: &NodeHash,
+        p1: u32,
+        p2: u32,
+        linkrev: u32,
+        uncompressed_len: u32,
+        compressed: &[u8],
+    ) -> Result<()> {
+        let inline = self.header.features.contains(parser::INLINE);
+        let fixed = self.fixed_entry_size();
+        let entry_off = if inline {
+            self.idx.as_slice().len()
+        } else {
+            rev_idx as usize * fixed
+        };
+        let data_off = if inline {
+            (entry_off + fixed) as u64
+        } else {
+            self.data.as_ref().map(|d| d.as_slice().len()).unwrap_or(0) as u64
+        };
+        let mut packed = pack_indexng(
+            data_off,
+            0,
+            compressed.len() as u32,
+            uncompressed_len,
+            rev_idx,
+            linkrev,
+            p1,
+            p2,
+            node.as_ref(),
+        );
+        if rev_idx == 0 {
+            overlay_header(&mut packed, self.header.features, self.header.version);
+        }
+
+        self.idx_vec().extend_from_slice(&packed);
+        if inline {
+            self.idx_vec().extend_from_slice(compressed);
+        } else {
+            if self.data.is_none() {
+                self.data = Some(Datafile::Loaded(Vec::new()));
+            }
+            self.data_vec()?.extend_from_slice(compressed);
+        }
+        self.idxoff
+            .insert(RevIdx::from(rev_idx as usize), entry_off);
+        self.nodeidx.insert(*node, RevIdx::from(rev_idx as usize));
+        Ok(())
+    }
+
+    fn idx_vec(&mut self) -> &mut Vec<u8> {
+        if matches!(&self.idx, Datafile::Mmap(_)) {
+            let owned = self.idx.as_slice().to_vec();
+            self.idx = Datafile::Loaded(owned);
+        }
+        match &mut self.idx {
+            Datafile::Loaded(data) => data,
+            Datafile::Mmap(_) => unreachable!("mmap copied to a vec"),
+        }
+    }
+
+    fn data_vec(&mut self) -> Result<&mut Vec<u8>> {
+        if let Some(Datafile::Mmap(_)) = &self.data {
+            let owned = self
+                .data
+                .as_ref()
+                .expect("data mmap")
+                .as_slice()
+                .to_vec();
+            self.data = Some(Datafile::Loaded(owned));
+        }
+        match &mut self.data {
+            Some(Datafile::Loaded(data)) => Ok(data),
+            _ => Err("Can't append without data".into()),
+        }
+    }
+
+    fn persist(&self) -> Result<()> {
+        if let Some(path) = &self.idx_path {
+            std::fs::write(path, self.idx.as_slice())?;
+        }
+        if let (Some(path), Some(data)) = (&self.data_path, &self.data) {
+            std::fs::write(path, data.as_slice())?;
+        }
+        Ok(())
+    }
+}
+
+fn opt_rev(idx: Option<RevIdx>) -> u32 {
+    idx.map(RevIdx::as_u32).unwrap_or(u32::MAX)
+}
+
+fn pack_indexng(
+    offset: u64,
+    flags: u16,
+    compressed_len: u32,
+    uncompressed_len: u32,
+    baserev: u32,
+    linkrev: u32,
+    p1: u32,
+    p2: u32,
+    node: &[u8],
+) -> [u8; 64] {
+    let mut entry = [0u8; 64];
+    entry[0] = ((offset >> 40) & 0xff) as u8;
+    entry[1] = ((offset >> 32) & 0xff) as u8;
+    entry[2] = ((offset >> 24) & 0xff) as u8;
+    entry[3] = ((offset >> 16) & 0xff) as u8;
+    entry[4] = ((offset >> 8) & 0xff) as u8;
+    entry[5] = (offset & 0xff) as u8;
+    entry[6..8].copy_from_slice(&flags.to_be_bytes());
+    entry[8..12].copy_from_slice(&compressed_len.to_be_bytes());
+    entry[12..16].copy_from_slice(&uncompressed_len.to_be_bytes());
+    entry[16..20].copy_from_slice(&baserev.to_be_bytes());
+    entry[20..24].copy_from_slice(&linkrev.to_be_bytes());
+    entry[24..28].copy_from_slice(&p1.to_be_bytes());
+    entry[28..32].copy_from_slice(&p2.to_be_bytes());
+    entry[32..52].copy_from_slice(&node[..20]);
+    entry
+}
+
+/// Rev 0 stores features and version in the high 4 bytes of its offset field.
+fn overlay_header(entry: &mut [u8], features: parser::Features, version: Version) {
+    entry[0..2].copy_from_slice(&features.bits().to_be_bytes());
+    entry[2..4].copy_from_slice(&(version as u16).to_be_bytes());
+}
+
+fn compress_snapshot(text: &[u8], compression: RevlogCompression) -> Result<Vec<u8>> {
+    match compression {
+        RevlogCompression::Zstd => Ok(zstd::encode_all(text, 0)?),
+        RevlogCompression::Zlib => {
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(text)?;
+            Ok(enc.finish()?)
+        }
     }
 }
 
