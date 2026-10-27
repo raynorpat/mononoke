@@ -4,23 +4,21 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-extern crate bytes;
-extern crate netstring;
-extern crate tokio_io;
+//! Multiplex stdin/stdout/stderr over one byte stream.
+//!
+//! Each message is a netstring (`<len>:<payload>,`). The payload's first byte
+//! selects the stream: 0 stdin, 1 stdout, 2 stderr.
 
 use std::io;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio_io::codec::{Decoder, Encoder};
-
-use netstring::{NetstringDecoder, NetstringEncoder};
-
-// Multiplex stdin/out/err over a single stream using netstring as framing
-#[derive(Debug)]
-pub struct SshDecoder(NetstringDecoder);
+use tokio_util::codec::{Decoder, Encoder};
 
 #[derive(Debug)]
-pub struct SshEncoder(NetstringEncoder<Bytes>);
+pub struct SshDecoder;
+
+#[derive(Debug)]
+pub struct SshEncoder;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum SshStream {
@@ -41,12 +39,13 @@ impl SshMsg {
     where
         T: AsRef<[u8]>,
     {
-        Self::new(stream, Bytes::from(t.as_ref()))
+        Self::new(stream, Bytes::copy_from_slice(t.as_ref()))
     }
 
     pub fn stream(&self) -> SshStream {
         self.0
     }
+
     pub fn data(self) -> Bytes {
         self.1
     }
@@ -60,7 +59,13 @@ impl AsRef<[u8]> for SshMsg {
 
 impl SshDecoder {
     pub fn new() -> Self {
-        SshDecoder(NetstringDecoder::new())
+        SshDecoder
+    }
+}
+
+impl Default for SshDecoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -69,69 +74,121 @@ impl Decoder for SshDecoder {
     type Error = io::Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<SshMsg>> {
-        if let Some(mut data) = self.0.decode(buf)? {
-            if data.len() == 0 {
-                return Ok(None);
-            }
-            let stream = match data.split_to(1)[0] {
-                0 => SshStream::Stdin,
-                1 => SshStream::Stdout,
-                2 => SshStream::Stderr,
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "bad ssh stream",
-                    ))
-                }
-            };
-            Ok(Some(SshMsg(stream, data.freeze())))
-        } else {
-            Ok(None)
+        let Some(mut data) = decode_netstring(buf)? else {
+            return Ok(None);
+        };
+        if data.is_empty() {
+            return Ok(None);
         }
+        let stream = match data.split_to(1)[0] {
+            0 => SshStream::Stdin,
+            1 => SshStream::Stdout,
+            2 => SshStream::Stderr,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bad ssh stream",
+                ));
+            }
+        };
+        Ok(Some(SshMsg(stream, data)))
     }
 }
 
 impl SshEncoder {
     pub fn new() -> Self {
-        SshEncoder(NetstringEncoder::new())
+        SshEncoder
     }
 }
 
-impl Encoder for SshEncoder {
-    type Item = SshMsg;
+impl Default for SshEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Encoder<SshMsg> for SshEncoder {
     type Error = io::Error;
 
     fn encode(&mut self, msg: SshMsg, buf: &mut BytesMut) -> io::Result<()> {
-        let mut v = BytesMut::with_capacity(1 + msg.1.len());
-        match msg.0 {
-            SshStream::Stdin => v.put_u8(0),
-            SshStream::Stdout => v.put_u8(1),
-            SshStream::Stderr => v.put_u8(2),
+        let mut payload = BytesMut::with_capacity(1 + msg.1.len());
+        let stream_byte = match msg.0 {
+            SshStream::Stdin => 0,
+            SshStream::Stdout => 1,
+            SshStream::Stderr => 2,
         };
-        v.put_slice(&msg.1);
-        Ok(self.0.encode(v.freeze(), buf)?)
+        payload.put_u8(stream_byte);
+        payload.extend_from_slice(&msg.1);
+        encode_netstring(&payload, buf);
+        Ok(())
     }
+}
+
+fn encode_netstring(payload: &[u8], dst: &mut BytesMut) {
+    let header = format!("{}:", payload.len());
+    dst.reserve(header.len() + payload.len() + 1);
+    dst.extend_from_slice(header.as_bytes());
+    dst.extend_from_slice(payload);
+    dst.extend_from_slice(b",");
+}
+
+fn decode_netstring(buf: &mut BytesMut) -> io::Result<Option<Bytes>> {
+    let colon = match buf.iter().position(|b| *b == b':') {
+        Some(i) => i,
+        None => {
+            if buf.len() > 10 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "netstring length too long",
+                ));
+            }
+            return Ok(None);
+        }
+    };
+    if colon == 0 || !buf[..colon].iter().all(|b| b.is_ascii_digit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid netstring length",
+        ));
+    }
+    let len_str = std::str::from_utf8(&buf[..colon])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let len: usize = len_str
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let header = colon + 1;
+    let total = header
+        .checked_add(len)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "netstring length overflow"))?;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    if buf[header + len] != b',' {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "netstring missing comma",
+        ));
+    }
+    let frame = buf.split_to(total);
+    Ok(Some(frame.freeze().slice(header..header + len)))
 }
 
 #[cfg(test)]
 mod test {
-    use bytes::{BufMut, BytesMut};
-    use tokio_io::codec::{Decoder, Encoder};
+    use bytes::{BufMut, Bytes, BytesMut};
+    use tokio_util::codec::{Decoder, Encoder};
 
-    use super::*;
     use super::SshStream::*;
+    use super::*;
 
     trait ToBytes: AsRef<[u8]> {
         fn bytes(&self) -> Bytes {
-            Bytes::from(self.as_ref())
+            Bytes::copy_from_slice(self.as_ref())
         }
     }
 
-    impl<T> ToBytes for T
-    where
-        T: AsRef<[u8]>,
-    {
-    }
+    impl<T: AsRef<[u8]>> ToBytes for T {}
 
     #[test]
     fn encode_simple() {
@@ -198,7 +255,6 @@ mod test {
             Ok(Some(ref res)) if res == &SshMsg::new(Stdin, b"ls -l".bytes()) => (),
             bad => panic!("decode failed: {:?}", bad.as_ref()),
         }
-
     }
 
     #[test]

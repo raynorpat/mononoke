@@ -4,17 +4,20 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-//! Definition of the FuturesOrdered combinator, executing each future in a sequence serially
-//! and streaming their results.
+//! Serially drive a sequence of futures and stream their outputs in order.
 
 use std::fmt;
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use futures::{Async, Future, IntoFuture, Poll, Stream};
+use futures::Stream;
 
-/// A future which takes a list of futures, executes them serially, and
-/// resolves with a vector of the completed values.
+/// Serially executes futures from an iterator.
 ///
-/// This future is created with the `futures_ordered` method.
+/// Each future is polled to completion before the next one starts. The stream
+/// item is that future's `Output`. When the output is a `Result`, an error does
+/// not drop the rest of the iterator: the next future starts on the following poll.
 #[must_use = "streams do nothing unless polled"]
 pub struct FuturesOrdered<I>
 where
@@ -22,15 +25,14 @@ where
     I::Item: IntoFuture,
 {
     elems: I::IntoIter,
-    current: Option<<I::Item as IntoFuture>::Future>,
+    current: Option<<I::Item as IntoFuture>::IntoFuture>,
 }
 
 impl<I> fmt::Debug for FuturesOrdered<I>
 where
     I: IntoIterator,
     I::Item: IntoFuture,
-    <<I as IntoIterator>::Item as IntoFuture>::Future: fmt::Debug,
-    <<I as IntoIterator>::Item as IntoFuture>::Item: fmt::Debug,
+    <<I as IntoIterator>::Item as IntoFuture>::IntoFuture: fmt::Debug,
 {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.debug_struct("FuturesOrdered")
@@ -39,11 +41,7 @@ where
     }
 }
 
-/// Creates a stream which returns results of the futures given.
-///
-/// The returned stream will serially drive execution for all of its underlying
-/// futures. Errors from a future will be returned immediately, but the stream
-/// will still be valid and
+/// Stream the outputs of `iter`'s futures, running one at a time.
 pub fn futures_ordered<I>(iter: I) -> FuturesOrdered<I>
 where
     I: IntoIterator,
@@ -51,51 +49,37 @@ where
 {
     let mut elems = iter.into_iter();
     let current = next_future(&mut elems);
-    FuturesOrdered {
-        elems: elems,
-        current: current,
-    }
+    FuturesOrdered { elems, current }
 }
 
 impl<I> Stream for FuturesOrdered<I>
 where
     I: IntoIterator,
     I::Item: IntoFuture,
+    I::IntoIter: Unpin,
+    <I::Item as IntoFuture>::IntoFuture: Unpin,
 {
-    type Item = <I::Item as IntoFuture>::Item;
-    type Error = <I::Item as IntoFuture>::Error;
+    type Item = <I::Item as IntoFuture>::Output;
 
-
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        match self.current.take() {
-            Some(mut fut) => {
-                match fut.poll() {
-                    Ok(Async::Ready(v)) => {
-                        self.current = next_future(&mut self.elems);
-                        Ok(Async::Ready(Some(v)))
-                    }
-                    Ok(Async::NotReady) => {
-                        self.current = Some(fut);
-                        Ok(Async::NotReady)
-                    }
-                    Err(e) => {
-                        // Don't dump self.elems at this point because the
-                        // caller might want to keep going on.
-                        self.current = next_future(&mut self.elems);
-                        Err(e)
-                    }
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.current.take() {
+            Some(mut fut) => match Pin::new(&mut fut).poll(cx) {
+                Poll::Ready(v) => {
+                    this.current = next_future(&mut this.elems);
+                    Poll::Ready(Some(v))
                 }
-            }
-            None => {
-                // End of stream.
-                Ok(Async::Ready(None))
-            }
+                Poll::Pending => {
+                    this.current = Some(fut);
+                    Poll::Pending
+                }
+            },
+            None => Poll::Ready(None),
         }
     }
 }
 
-#[inline]
-fn next_future<I>(elems: &mut I) -> Option<<I::Item as IntoFuture>::Future>
+fn next_future<I>(elems: &mut I) -> Option<<I::Item as IntoFuture>::IntoFuture>
 where
     I: Iterator,
     I::Item: IntoFuture,
@@ -103,45 +87,51 @@ where
     elems.next().map(IntoFuture::into_future)
 }
 
-
 #[cfg(test)]
 mod test {
-    use std::result;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
-    use futures::{Future, Sink, Stream};
-    use futures::sync::mpsc;
-    use futures::task;
-    use tokio_core::reactor::Core;
+    use futures::channel::mpsc;
+    use futures::executor::block_on;
+    use futures::future::ready;
+    use futures::{Future, StreamExt, TryStreamExt};
 
     use super::*;
 
     #[test]
     fn test_basic() {
-        let into_futs = vec![ok(1), ok(2)];
-        assert_eq!(futures_ordered(into_futs).collect().wait(), Ok(vec![1, 2]));
+        assert_eq!(
+            block_on(
+                futures_ordered(vec![ready(Ok::<_, i32>(1)), ready(Ok(2))]).try_collect::<Vec<_>>()
+            ),
+            Ok(vec![1, 2])
+        );
 
-        let into_futs = vec![ok(1), err(2), ok(3)];
-        assert_eq!(futures_ordered(into_futs).collect().wait(), Err(2));
+        assert_eq!(
+            block_on(
+                futures_ordered(vec![ready(Ok(1)), ready(Err(2)), ready(Ok(3))])
+                    .try_collect::<Vec<_>>()
+            ),
+            Err(2)
+        );
     }
 
     #[test]
     fn test_serial() {
         let (tx, rx) = mpsc::channel(2);
-        // If both the futures returned in parallel, rx would have [20, 10].
-        // Note we move tx in. Once all tx handles have been dropped, the rx
-        // stream ends.
+        // If both futures ran at once, rx would observe [20, 10].
         let futs = vec![delayed_future(10, tx.clone(), 4), delayed_future(20, tx, 2)];
 
-        let mut core = Core::new().unwrap();
-        core.run(futures_ordered(futs).collect()).unwrap();
-        let results = core.run(rx.collect());
-        assert_eq!(results, Ok(vec![10, 20]));
+        block_on(futures_ordered(futs).collect::<Vec<_>>());
+        let results: Vec<_> = block_on(rx.collect());
+        assert_eq!(results, vec![10, 20]);
     }
 
     fn delayed_future<T>(v: T, tx: mpsc::Sender<T>, count: usize) -> DelayedFuture<T> {
         DelayedFuture {
             send: Some((v, tx)),
-            count: count,
+            count,
         }
     }
 
@@ -150,31 +140,20 @@ mod test {
         count: usize,
     }
 
-    impl<T> Future for DelayedFuture<T> {
-        type Item = ();
-        type Error = (); // this could be ! once that's stabilized
+    impl<T: Unpin> Future for DelayedFuture<T> {
+        type Output = ();
 
-        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-            self.count -= 1;
-            if self.count == 0 {
-                let (v, tx) = self.send.take().unwrap();
-                // In production code tx.send(v) would return a future which we could forward the
-                // poll call to. In test code, this is fine.
-                tx.send(v).wait().unwrap();
-                Ok(Async::Ready(()))
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let this = self.get_mut();
+            this.count -= 1;
+            if this.count == 0 {
+                let (v, mut tx) = this.send.take().unwrap();
+                tx.try_send(v).expect("send");
+                Poll::Ready(())
             } else {
-                // Make sure the computation moves forward.
-                task::current().notify();
-                Ok(Async::NotReady)
+                cx.waker().wake_by_ref();
+                Poll::Pending
             }
         }
-    }
-
-    fn ok(v: i32) -> result::Result<i32, i32> {
-        Ok(v)
-    }
-
-    fn err(v: i32) -> result::Result<i32, i32> {
-        Err(v)
     }
 }

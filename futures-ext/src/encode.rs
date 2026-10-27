@@ -4,85 +4,82 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-//! A layered `Encoder` adapter for `Stream` transformations
+//! A layered `Encoder` adapter for `Stream` transformations.
 //!
-//! This module implements an adapter to allow a `tokio_io::codec::Encoder` implementation
-//! to transform a `Stream` - specifically, encode from some structured type to a `Stream`
-//! of `Bytes`.
-//!
-//! This allows multiple protocols to be layered and composed with operations on `Streams`,
-//! rather than restricting all codec operations to `AsyncRead`/`AsyncWrite` operations on
-//! an underlying transport.
+//! Encodes items from a `Stream<Item = Result<T, E>>` into a stream of
+//! `Result<Bytes, _>` using a tokio-util `Encoder`.
 
-use futures::{Async, Poll, Stream};
-use tokio_io::codec::Encoder;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use bytes::{Bytes, BytesMut};
+use futures::Stream;
+use tokio_util::codec::Encoder;
 
 const INITIAL_CAPACITY: usize = 8192;
 const HEADROOM: usize = 512;
 const HIGHWATER: usize = INITIAL_CAPACITY - HEADROOM;
 
-pub fn encode<In, Enc>(inp: In, enc: Enc) -> LayeredEncoder<In, Enc>
+pub fn encode<In, Enc, T, E>(inp: In, enc: Enc) -> LayeredEncoder<In, Enc>
 where
-    In: Stream,
-    Enc: Encoder<Item = In::Item>,
+    In: Stream<Item = Result<T, E>>,
+    Enc: Encoder<T>,
+    Enc::Error: From<E>,
 {
     LayeredEncoder {
-        inp: inp,
-        enc: enc,
+        inp,
+        enc,
         eof: false,
         buf: BytesMut::with_capacity(INITIAL_CAPACITY),
     }
 }
 
 pub struct LayeredEncoder<In, Enc> {
-    inp: In, // source
-    enc: Enc, // encoder
-    eof: bool, // source finished
-    buf: BytesMut, // accumulated output
+    inp: In,
+    enc: Enc,
+    eof: bool,
+    buf: BytesMut,
 }
 
-// Encode Items into Bytes blobs
-impl<In, Enc> Stream for LayeredEncoder<In, Enc>
+impl<In, Enc, T, E> Stream for LayeredEncoder<In, Enc>
 where
-    In: Stream,
-    Enc: Encoder<Item = In::Item>,
-    Enc::Error: From<In::Error>,
+    In: Stream<Item = Result<T, E>> + Unpin,
+    Enc: Encoder<T> + Unpin,
+    Enc::Error: From<E>,
 {
-    type Item = Bytes;
-    type Error = Enc::Error;
+    type Item = Result<Bytes, Enc::Error>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        // Loop filling the buffer until either the input is done or
-        // the output buffer is large enough.
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         loop {
             let mut push = false;
 
-            if !self.eof {
-                match self.inp.poll()? {
-                    Async::Ready(None) => self.eof = true,
-                    Async::Ready(Some(item)) => self.enc.encode(item, &mut self.buf)?,
-                    Async::NotReady => push = true, // no input -> push output to avoid deadlock
+            if !this.eof {
+                match Pin::new(&mut this.inp).poll_next(cx) {
+                    Poll::Ready(None) => this.eof = true,
+                    Poll::Ready(Some(Ok(item))) => {
+                        if let Err(e) = this.enc.encode(item, &mut this.buf) {
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                    }
+                    Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e.into()))),
+                    Poll::Pending => push = true,
                 }
             }
 
-            let len = self.buf.len();
-            let push = push || len > HIGHWATER || self.eof;
+            let len = this.buf.len();
+            let push = push || len > HIGHWATER || this.eof;
 
             if push {
-                match (len == 0, self.eof) {
-                    // Input finished, no output
-                    (true, true) => return Ok(Async::Ready(None)),
-                    // Input not finished, no output
-                    (true, false) => return Ok(Async::NotReady),
-                    // Something to output
+                match (len == 0, this.eof) {
+                    (true, true) => return Poll::Ready(None),
+                    (true, false) => return Poll::Pending,
                     (false, eof) => {
-                        let ret = self.buf.split_to(len);
-                        // regrow buffer if we're not done
+                        let ret = this.buf.split_to(len);
                         if !eof {
-                            self.buf.reserve(HIGHWATER)
+                            this.buf.reserve(HIGHWATER);
                         }
-                        return Ok(Async::Ready(Some(ret.freeze())));
+                        return Poll::Ready(Some(Ok(ret.freeze())));
                     }
                 }
             }
@@ -92,23 +89,28 @@ where
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use bytes::{BigEndian, BufMut, ByteOrder};
-    use futures::Future;
-    use std::iter::Iterator;
-    use std::vec;
     use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::vec;
+
+    use bytes::{BufMut, BytesMut};
+    use futures::executor::block_on;
+    use futures::task::noop_waker;
+    use futures::Stream;
+    use quickcheck::quickcheck;
+    use tokio_util::codec::Encoder;
+
+    use super::*;
 
     struct EncU16;
 
-    impl Encoder for EncU16 {
-        type Item = u16;
+    impl Encoder<u16> for EncU16 {
         type Error = io::Error;
 
-        fn encode(&mut self, item: Self::Item, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        fn encode(&mut self, item: u16, dst: &mut BytesMut) -> Result<(), Self::Error> {
             dst.reserve(2);
-            dst.put_u16::<BigEndian>(item);
-
+            dst.put_u16(item);
             Ok(())
         }
     }
@@ -119,28 +121,31 @@ mod test {
 
     impl<T> TestStream<T> {
         fn new(v: Vec<Option<T>>) -> Self {
-            TestStream { iter: v.into_iter() }
+            TestStream {
+                iter: v.into_iter(),
+            }
         }
     }
 
-    impl<T> Stream for TestStream<T> {
-        type Item = T;
-        type Error = io::Error;
+    impl<T: Unpin> Stream for TestStream<T> {
+        type Item = Result<T, io::Error>;
 
-        fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-            match self.iter.next() {
-                None => Ok(Async::Ready(None)),
-                Some(None) => Ok(Async::NotReady),
-                Some(Some(v)) => Ok(Async::Ready(Some(v))),
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            match self.get_mut().iter.next() {
+                None => Poll::Ready(None),
+                Some(None) => Poll::Pending,
+                Some(Some(v)) => Poll::Ready(Some(Ok(v))),
             }
         }
     }
 
     #[test]
     fn simple() {
+        use futures::TryStreamExt;
+
         let s = TestStream::new(vec![Some(0u16), Some(4), Some(5), Some(6), Some(256)]);
-        let enc = encode::<_, _>(s, EncU16);
-        let res = enc.collect().wait().expect("collect failed");
+        let enc = encode::<_, _, _, _>(s, EncU16);
+        let res: Vec<_> = block_on(enc.try_collect()).expect("collect failed");
         let res: Vec<u8> = res.into_iter().flat_map(|x| x).collect();
         assert_eq!(res.as_slice(), &[0, 0, 0, 4, 0, 5, 0, 6, 1, 0][..]);
     }
@@ -148,14 +153,17 @@ mod test {
     quickcheck! {
         fn encoding(v: Vec<Option<u16>>) -> bool {
             let s = TestStream::new(v.clone());
-            let mut enc = encode::<_, _>(s, EncU16);
+            let mut enc = encode::<_, _, _, _>(s, EncU16);
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
 
             let mut res = Vec::new();
             loop {
-                match enc.poll().expect("poll failed") {
-                    Async::NotReady => (), // "spin"
-                    Async::Ready(None) => break,
-                    Async::Ready(Some(v)) => res.push(v),
+                match Pin::new(&mut enc).poll_next(&mut cx) {
+                    Poll::Pending => (),
+                    Poll::Ready(None) => break,
+                    Poll::Ready(Some(Ok(v))) => res.push(v),
+                    Poll::Ready(Some(Err(e))) => panic!("encode error: {}", e),
                 }
             }
 
@@ -165,7 +173,8 @@ mod test {
 
             let mut output = Vec::new();
             for i in 0..input.len() {
-                output.push(<BigEndian as ByteOrder>::read_u16(&res[i * 2..i * 2 + 2]))
+                let bytes = [res[i * 2], res[i * 2 + 1]];
+                output.push(u16::from_be_bytes(bytes));
             }
 
             input == output

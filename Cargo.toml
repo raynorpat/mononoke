@@ -5,4 +5,7 @@ members = [
     "bookmarks",
     "bookmarks/stockbookmarks",
     "asyncmemo",
+    "futures-ext",
+    "async-compression",
+    "sshrelay",
 ]

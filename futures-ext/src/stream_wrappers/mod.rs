@@ -6,24 +6,16 @@
 
 pub mod take_while;
 
-use futures::Stream;
-
 pub use self::take_while::TakeWhile;
 
-/// A stream that wraps another stream. into_inner consumes this stream and
+/// A stream that wraps another stream. `into_inner` consumes this stream and
 /// returns the original stream.
-pub trait StreamWrapper<S: Stream> {
-    // TODO: this trait might not be necessary once
-    // https://github.com/alexcrichton/futures-rs/pull/523 lands
+pub trait StreamWrapper<S> {
     fn into_inner(self) -> S;
 }
 
-/// A stream that wraps another stream. into_inner consumes this stream and
-/// returns the original stream.
-///
-/// This is a boxed version of StreamWrapper, meant to be used for trait
-/// objects.
-pub trait BoxStreamWrapper<S: Stream> {
+/// Boxed form of `StreamWrapper`, for trait objects.
+pub trait BoxStreamWrapper<S> {
     fn get_ref(&self) -> &S;
     fn get_mut(&mut self) -> &mut S;
     fn into_inner(self: Box<Self>) -> S;

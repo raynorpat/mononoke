@@ -5,25 +5,28 @@
 // GNU General Public License version 2 or any later version.
 
 use std::io::{self, Cursor, Write};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use bzip2;
-use quickcheck::TestResult;
-use futures::{Async, Poll};
-use tokio_core::reactor::Core;
-use tokio_io::AsyncWrite;
-use tokio_io::io::read_to_end;
+use bzip2::Compression;
+use futures::executor::block_on;
+use quickcheck::{quickcheck, TestResult};
+use tokio::io::{AsyncReadExt, AsyncWrite};
 
-use retry::retry_write;
-
-use membuf::MemBuf;
-use metered::{MeteredRead, MeteredWrite};
-use compressor::{Compressor, CompressorType};
-use decompressor::Decompressor;
-use ZSTD_DEFAULT_LEVEL;
+use crate::compressor::{Compressor, CompressorType};
+use crate::decompressor::Decompressor;
+use crate::membuf::MemBuf;
+use crate::metered::{MeteredRead, MeteredWrite};
+use crate::retry::retry_write;
+use crate::ZSTD_DEFAULT_LEVEL;
 
 quickcheck! {
     fn test_bzip2_roundtrip(input: Vec<u8>) -> TestResult {
-        roundtrip(CompressorType::Bzip2(bzip2::Compression::Default), &input)
+        roundtrip(CompressorType::Bzip2(Compression::default()), &input)
+    }
+
+    fn test_gzip_roundtrip(input: Vec<u8>) -> TestResult {
+        roundtrip(CompressorType::Gzip, &input)
     }
 
     fn test_noop_roundtrip(input: Vec<u8>) -> TestResult {
@@ -36,10 +39,10 @@ quickcheck! {
 }
 
 fn roundtrip(ct: CompressorType, input: &[u8]) -> TestResult {
-    let compressed_buf = MeteredWrite::new(Cursor::new(Vec::with_capacity(32 * 1024)));
+    let compressed_buf = MeteredWrite::new(Cursor::new(Vec::new()));
     let mut compressor = MeteredWrite::new(Compressor::new(compressed_buf, ct));
     let res = compressor.write_all(input);
-    assert_matches!(res, Ok(()));
+    assert!(matches!(res, Ok(())));
     assert_eq!(compressor.total_thru(), input.len() as u64);
 
     let compressed_buf = compressor.into_inner().try_finish().unwrap();
@@ -47,21 +50,23 @@ fn roundtrip(ct: CompressorType, input: &[u8]) -> TestResult {
         compressed_buf.total_thru(),
         compressed_buf.get_ref().position()
     );
-    // Turn the MeteredWrite<Cursor> into a Cursor
     let compressed_buf = compressed_buf.into_inner();
+    let compressed = compressed_buf.get_ref();
 
-    let read_buf = MeteredRead::new(MemBuf::new(32 * 1024));
+    let read_buf = MeteredRead::new(MemBuf::new(compressed.len().max(1)));
     let mut decoder = MeteredRead::new(Decompressor::new(read_buf, ct.decompressor_type()));
 
-    assert_matches!(decoder.get_mut().get_mut().get_mut().write_buf(compressed_buf.get_ref()),
-                    Ok(l) if l as u64 == compressed_buf.position());
+    let written = decoder
+        .get_mut()
+        .get_mut()
+        .get_mut()
+        .write_buf(compressed)
+        .expect("write_buf");
+    assert_eq!(written as u64, compressed_buf.position());
     decoder.get_mut().get_mut().get_mut().mark_eof();
 
-    let result = Vec::with_capacity(32 * 1024);
-    let read_future = read_to_end(decoder, result);
-
-    let mut core = Core::new().unwrap();
-    let (decoder, result) = core.run(read_future).unwrap();
+    let mut result = Vec::new();
+    block_on(decoder.read_to_end(&mut result)).expect("read_to_end");
     assert_eq!(decoder.total_thru(), input.len() as u64);
     assert_eq!(
         decoder.get_ref().get_ref().total_thru(),
@@ -77,13 +82,14 @@ struct FinishAfterCountTestWriter {
 }
 
 impl FinishAfterCountTestWriter {
-    pub fn new_ok() -> FinishAfterCountTestWriter {
+    fn new_ok() -> Self {
         FinishAfterCountTestWriter {
             counter: 0,
             fail_with: None,
         }
     }
-    pub fn new_failed(error_kind: io::ErrorKind) -> FinishAfterCountTestWriter {
+
+    fn new_failed(error_kind: io::ErrorKind) -> Self {
         FinishAfterCountTestWriter {
             counter: 0,
             fail_with: Some(error_kind),
@@ -100,14 +106,27 @@ impl Write for FinishAfterCountTestWriter {
             Err(io::Error::from(io::ErrorKind::Interrupted))
         }
     }
+
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
 }
 
 impl AsyncWrite for FinishAfterCountTestWriter {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        Ok(Async::NotReady)
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Write::write(self.get_mut(), buf))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Pending
     }
 }
 

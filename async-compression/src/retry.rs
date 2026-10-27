@@ -4,15 +4,12 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-//! wraps underlying AsyncWrite providing retry logic
+//! Retry `ErrorKind::Interrupted` around a `Write`.
 
-use std::io;
-use tokio_io::AsyncWrite;
+use std::io::{self, Write};
 
 #[inline]
-pub fn retry_write<T: AsyncWrite>(writer: &mut T, buf: &[u8]) -> io::Result<usize> {
-    // tokio-io doesn't handle EINTR well at the moment, so retry here. See
-    // https://github.com/tokio-rs/tokio-io/issues/37 for some discussion.
+pub fn retry_write<T: Write>(writer: &mut T, buf: &[u8]) -> io::Result<usize> {
     loop {
         match writer.write(buf) {
             Ok(n) => return Ok(n),

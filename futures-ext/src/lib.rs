@@ -5,40 +5,34 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-#[cfg(test)]
-#[macro_use]
-extern crate assert_matches;
-extern crate bytes;
-#[macro_use]
-extern crate futures;
-#[cfg(test)]
-extern crate tokio_core;
-extern crate tokio_io;
-#[cfg(test)]
-#[macro_use]
-extern crate quickcheck;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use futures::{Async, Future, IntoFuture, Poll, Sink, Stream};
 use bytes::Bytes;
-use tokio_io::AsyncRead;
-use tokio_io::codec::{Decoder, Encoder};
+use futures::{Future, Stream};
+use tokio::io::AsyncRead;
+use tokio_util::codec::{Decoder, Encoder};
 
 mod frame;
 mod futures_ordered;
-mod streamfork;
 mod stream_wrappers;
+mod streamfork;
+
+#[cfg(test)]
+mod testutil;
 
 pub mod decode;
 pub mod encode;
 
 pub use frame::{FramedStream, ReadLeadingBuffer};
-pub use futures_ordered::{FuturesOrdered, futures_ordered};
+pub use futures_ordered::{futures_ordered, FuturesOrdered};
 pub use stream_wrappers::{BoxStreamWrapper, StreamWrapper, TakeWhile};
+pub use streamfork::Forker;
 
-/// Map `Item` and `Error` to `()`
+/// Map any completion to `()`.
 ///
-/// Adapt an existing `Future` to return unit `Item` and `Error`, while still
-/// waiting for the underlying `Future` to complete.
+/// Adapt an existing `Future` to return `()`, while still waiting for the
+/// underlying `Future` to complete.
 pub struct Discard<F>(F);
 
 impl<F> Discard<F> {
@@ -47,77 +41,66 @@ impl<F> Discard<F> {
     }
 }
 
-impl<F> Future for Discard<F>
-where
-    F: Future,
-{
-    type Item = ();
-    type Error = ();
+impl<F: Future> Future for Discard<F> {
+    type Output = ();
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.0.poll() {
-            Err(_) => Err(()),
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Ok(Async::Ready(_)) => Ok(Async::Ready(())),
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // `F` is structurally pinned.
+        let inner = unsafe { self.map_unchecked_mut(|d| &mut d.0) };
+        match inner.poll(cx) {
+            Poll::Ready(_) => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 pub trait FutureExt: Future + Sized {
-    /// Map a `Future` to have `Item=()` and `Error=()`. This is
-    /// useful when a future is being used to drive a computation
-    /// but the actual results aren't interesting (such as when used
-    /// with `Handle::spawn()`).
+    /// Map a `Future` to have output `()`. Useful when a future only drives
+    /// a computation and its result will be ignored.
     fn discard(self) -> Discard<Self> {
         Discard(self)
     }
 }
 
-impl<T> FutureExt for T
-where
-    T: Future,
-{
-}
+impl<T: Future> FutureExt for T {}
 
 pub trait StreamExt: Stream {
-    /// Fork elements in a stream out to two sinks, depending on a predicate
+    /// Fork elements to two sinks, depending on a predicate.
     ///
-    /// If the predicate returns false, send the item to `out1`, otherwise to
-    /// `out2`. `streamfork()` acts in a similar manner to `forward()` in that it
-    /// keeps operating until the input stream ends, and then returns everything
-    /// in the resulting Future.
-    ///
-    /// The predicate returns a `Result` so that it can fail (if there's a malformed
-    /// input that can't be assigned to either output).
-    fn streamfork<Out1, Out2, F, E>(
+    /// The input is a `Stream<Item = Result<T, _>>`. `pred` returns `Ok(false)`
+    /// to send the value to `out1` and `Ok(true)` to send it to `out2`. The
+    /// returned future finishes with the input stream and both sinks when the
+    /// input ends.
+    fn streamfork<T, InErr, Out1, Out2, F, E>(
         self,
         out1: Out1,
         out2: Out2,
         pred: F,
-    ) -> streamfork::Forker<Self, Out1, Out2, F>
+    ) -> Forker<Self, Out1, Out2, F, T>
     where
-        Self: Sized,
-        Out1: Sink<SinkItem = Self::Item>,
-        Out2: Sink<SinkItem = Self::Item, SinkError = Out1::SinkError>,
-        F: FnMut(&Self::Item) -> Result<bool, E>,
-        E: From<Self::Error> + From<Out1::SinkError> + From<Out2::SinkError>,
+        Self: Sized + Stream<Item = Result<T, InErr>> + Unpin,
+        Out1: futures::Sink<T> + Unpin,
+        Out2: futures::Sink<T, Error = Out1::Error> + Unpin,
+        F: FnMut(&T) -> Result<bool, E>,
+        E: From<InErr> + From<Out1::Error>,
     {
         streamfork::streamfork(self, out1, out2, pred)
     }
 
-    fn take_while_wrapper<P, R>(self, pred: P) -> TakeWhile<Self, P, R>
+    fn take_while_wrapper<T, E, P, Fut>(self, pred: P) -> TakeWhile<Self, P, Fut, T>
     where
-        P: FnMut(&Self::Item) -> R,
-        R: IntoFuture<Item = bool, Error = Self::Error>,
-        Self: Sized,
+        Self: Sized + Stream<Item = Result<T, E>> + Unpin,
+        P: FnMut(&T) -> Fut,
+        Fut: Future<Output = Result<bool, E>> + Unpin,
     {
         stream_wrappers::take_while::new(self, pred)
     }
 
-    fn encode<Enc>(self, encoder: Enc) -> encode::LayeredEncoder<Self, Enc>
+    fn encode<Enc, T, E>(self, encoder: Enc) -> encode::LayeredEncoder<Self, Enc>
     where
-        Self: Sized,
-        Enc: Encoder<Item = Self::Item>,
+        Self: Sized + Stream<Item = Result<T, E>> + Unpin,
+        Enc: Encoder<T>,
+        Enc::Error: From<E>,
     {
         encode::encode(self, encoder)
     }
@@ -130,11 +113,7 @@ pub trait StreamExt: Stream {
     }
 }
 
-impl<T> StreamExt for T
-where
-    T: Stream,
-{
-}
+impl<T: Stream> StreamExt for T {}
 
 pub trait AsyncReadExt: AsyncRead + Sized {
     fn framed_stream<C>(self, codec: C) -> FramedStream<Self, C>
@@ -145,27 +124,26 @@ pub trait AsyncReadExt: AsyncRead + Sized {
     }
 }
 
-impl<T> AsyncReadExt for T
-where
-    T: AsyncRead,
-{
-}
+impl<T: AsyncRead> AsyncReadExt for T {}
 
-pub trait StreamLayeredExt: Stream<Item = Bytes> {
+/// Decode a stream of byte chunks with a tokio-util `Decoder`.
+pub trait StreamLayeredExt<E>: Stream<Item = Result<Bytes, E>> {
     fn decode<Dec>(self, decoder: Dec) -> decode::LayeredDecode<Self, Dec>
     where
         Self: Sized,
-        Dec: Decoder;
+        Dec: Decoder,
+        Dec::Error: From<E>;
 }
 
-impl<T> StreamLayeredExt for T
+impl<T, E> StreamLayeredExt<E> for T
 where
-    T: Stream<Item = Bytes>,
+    T: Stream<Item = Result<Bytes, E>>,
 {
     fn decode<Dec>(self, decoder: Dec) -> decode::LayeredDecode<Self, Dec>
     where
         Self: Sized,
         Dec: Decoder,
+        Dec::Error: From<E>,
     {
         decode::decode(self, decoder)
     }
@@ -178,92 +156,69 @@ pub struct Enumerate<In> {
 
 impl<In> Enumerate<In> {
     fn new(inner: In) -> Self {
-        Enumerate {
-            inner: inner,
-            count: 0,
-        }
+        Enumerate { inner, count: 0 }
     }
 }
 
-impl<In: Stream> Stream for Enumerate<In> {
+impl<In: Stream + Unpin> Stream for Enumerate<In> {
     type Item = (usize, In::Item);
-    type Error = In::Error;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        match self.inner.poll() {
-            Err(err) => Err(err),
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Ok(Async::Ready(None)) => Ok(Async::Ready(None)),
-            Ok(Async::Ready(Some(v))) => {
-                let c = self.count;
-                self.count += 1;
-                Ok(Async::Ready(Some((c, v))))
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(v)) => {
+                let c = this.count;
+                this.count += 1;
+                Poll::Ready(Some((c, v)))
             }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
-/// A convenience macro for working with `io::Result<T>` from the `Read` and
-/// `Write` traits.
-///
-/// This macro takes `io::Result<T>` as input, and returns `Poll<T, io::Error>`
-/// as the output. If the input type is of the `Err` variant, then
-/// `Poll::NotReady` is returned if it indicates `WouldBlock` or otherwise `Err`
-/// is returned.
+/// Turn `io::Result<T>` into `Poll<io::Result<T>>`, mapping `WouldBlock` to
+/// `Pending`.
 #[macro_export]
 macro_rules! handle_nb {
-    ($e:expr) => (match $e {
-        Ok(t) => Ok(::futures::Async::Ready(t)),
-        Err(ref e) if e.kind() == ::std::io::ErrorKind::WouldBlock => {
-            Ok(::futures::Async::NotReady)
+    ($e:expr) => {
+        match $e {
+            Ok(t) => ::std::task::Poll::Ready(Ok(t)),
+            Err(ref e) if e.kind() == ::std::io::ErrorKind::WouldBlock => {
+                ::std::task::Poll::Pending
+            }
+            Err(e) => ::std::task::Poll::Ready(Err(e)),
         }
-        Err(e) => Err(e),
-    })
+    };
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use futures::Stream;
-    use futures::stream;
-    use futures::sync::mpsc;
-
-    #[derive(Debug)]
-    struct MyErr;
-
-    impl<T> From<mpsc::SendError<T>> for MyErr {
-        fn from(_: mpsc::SendError<T>) -> Self {
-            MyErr
-        }
-    }
-
+    use futures::channel::mpsc;
+    use futures::executor::block_on;
+    use futures::stream::{self, StreamExt as FuturesStreamExt};
 
     #[test]
     fn discard() {
-        use futures::sync::mpsc;
-        use tokio_core::reactor::Core;
-
-        let mut core = Core::new().unwrap();
-        let handle = core.handle();
-
         let (tx, rx) = mpsc::channel(1);
-
-        let xfer = stream::iter::<_, _, MyErr>(vec![Ok(123)]).forward(tx);
-
-        handle.spawn(xfer.discard());
-
-        match core.run(rx.collect()) {
-            Ok(v) => assert_eq!(v, vec![123]),
-            bad => panic!("bad {:?}", bad),
-        }
+        let fwd = stream::iter(vec![Ok::<_, mpsc::SendError>(123)])
+            .forward(tx)
+            .discard();
+        block_on(fwd);
+        let v: Vec<_> = block_on(FuturesStreamExt::collect(rx));
+        assert_eq!(v, vec![123]);
     }
 
     #[test]
     fn enumerate() {
         let s = stream::iter(vec![Ok::<_, ()>("hello"), Ok("there"), Ok("world")]);
         let es = Enumerate::new(s);
-        let v = es.collect().wait();
+        let v: Vec<_> = block_on(FuturesStreamExt::collect(es));
 
-        assert_eq!(v, Ok(vec![(0, "hello"), (1, "there"), (2, "world")]));
+        assert_eq!(
+            v,
+            vec![(0, Ok("hello")), (1, Ok("there")), (2, Ok("world"))]
+        );
     }
 }

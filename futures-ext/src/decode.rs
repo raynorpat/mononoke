@@ -4,31 +4,29 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-//! A layered `Decoder` adapter for `Stream` transformations
+//! A layered `Decoder` adapter for `Stream` transformations.
 //!
-//! This module implements an adapter to allow a `tokio_io::codec::Decoder` implementation
-//! to transform a `Stream` - specifically, decode from a `Stream` of `Bytes` into some
-//! structured type.
-//!
-//! This allows multiple protocols to be layered and composed with operations on `Streams`,
-//! rather than restricting all codec operations to `AsyncRead`/`AsyncWrite` operations on
-//! an underlying transport.
+//! Decodes a `Stream<Item = Result<Bytes, E>>` into structured frames with a
+//! tokio-util `Decoder`.
 
-use bytes::{BufMut, Bytes, BytesMut};
-use futures::{Async, Poll, Stream};
-use tokio_io::codec::Decoder;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
-use {BoxStreamWrapper, StreamWrapper};
+use bytes::{Bytes, BytesMut};
+use futures::Stream;
+use tokio_util::codec::Decoder;
 
-pub fn decode<In, Dec>(input: In, decoder: Dec) -> LayeredDecode<In, Dec>
+use crate::{BoxStreamWrapper, StreamWrapper};
+
+pub fn decode<In, Dec, E>(input: In, decoder: Dec) -> LayeredDecode<In, Dec>
 where
-    In: Stream<Item = Bytes>,
+    In: Stream<Item = Result<Bytes, E>>,
     Dec: Decoder,
+    Dec::Error: From<E>,
 {
     LayeredDecode {
-        input: input,
-        decoder: decoder,
-        // 8KB is a reasonable default
+        input,
+        decoder,
         buf: BytesMut::with_capacity(8 * 1024),
         eof: false,
         is_readable: false,
@@ -44,169 +42,117 @@ pub struct LayeredDecode<In, Dec> {
     is_readable: bool,
 }
 
-impl<In, Dec> Stream for LayeredDecode<In, Dec>
+impl<In, Dec, E> Stream for LayeredDecode<In, Dec>
 where
-    In: Stream<Item = Bytes>,
-    Dec: Decoder,
-    Dec::Error: From<In::Error>,
+    In: Stream<Item = Result<Bytes, E>> + Unpin,
+    Dec: Decoder + Unpin,
+    Dec::Error: From<E>,
 {
-    type Item = Dec::Item;
-    type Error = Dec::Error;
+    type Item = Result<Dec::Item, Dec::Error>;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Dec::Error> {
-        // This is adapted from Framed::poll in tokio. This does its own thing
-        // because converting the Bytes input stream to an Io object and then
-        // running it through Framed is pointless.
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         loop {
-            if self.is_readable {
-                if self.eof {
-                    let ret = if self.buf.len() == 0 {
-                        None
-                    } else {
-                        self.decoder.decode_eof(&mut self.buf)?
+            if this.is_readable {
+                if this.eof {
+                    if this.buf.is_empty() {
+                        return Poll::Ready(None);
+                    }
+                    return match this.decoder.decode_eof(&mut this.buf) {
+                        Ok(frame) => Poll::Ready(frame.map(Ok)),
+                        Err(e) => Poll::Ready(Some(Err(e))),
                     };
-                    return Ok(Async::Ready(ret));
                 }
-                if let Some(frame) = self.decoder.decode(&mut self.buf)? {
-                    return Ok(Async::Ready(Some(frame)));
+                match this.decoder.decode(&mut this.buf) {
+                    Ok(Some(frame)) => return Poll::Ready(Some(Ok(frame))),
+                    Ok(None) => this.is_readable = false,
+                    Err(e) => return Poll::Ready(Some(Err(e))),
                 }
-                self.is_readable = false;
             }
 
-            assert!(!self.eof);
+            debug_assert!(!this.eof);
 
-            match try_ready!(self.input.poll()) {
-                Some(v) => {
-                    self.buf.reserve(v.len());
-                    self.buf.put(v);
-                }
-                None => self.eof = true,
+            match Pin::new(&mut this.input).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(v))) => this.buf.extend_from_slice(&v),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e.into()))),
+                Poll::Ready(None) => this.eof = true,
             }
-
-            self.is_readable = true;
+            this.is_readable = true;
         }
     }
 }
 
-impl<In, Dec> StreamWrapper<In> for LayeredDecode<In, Dec>
-where
-    In: Stream<Item = Bytes>,
-{
+impl<In, Dec> StreamWrapper<In> for LayeredDecode<In, Dec> {
     fn into_inner(self) -> In {
-        // TODO: do we want to check that buf is empty? otherwise we might lose data
         self.input
     }
 }
 
-impl<In, Dec> BoxStreamWrapper<In> for LayeredDecode<In, Dec>
-where
-    In: Stream<Item = Bytes>,
-{
-    #[inline]
+impl<In, Dec> BoxStreamWrapper<In> for LayeredDecode<In, Dec> {
     fn get_ref(&self) -> &In {
         &self.input
     }
 
-    #[inline]
     fn get_mut(&mut self) -> &mut In {
         &mut self.input
     }
 
     fn into_inner(self: Box<Self>) -> In {
-        // TODO: do we want to check that buf is empty? otherwise we might lose data
         self.input
     }
 }
 
 #[cfg(test)]
 mod test {
-    extern crate netstring;
-    use self::netstring::NetstringDecoder;
-
     use std::io;
 
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
+    use futures::executor::block_on;
     use futures::stream;
-    use futures::Stream;
-    use tokio_core::reactor;
+    use futures::TryStreamExt;
+    use tokio_util::codec::Decoder;
 
     use super::*;
 
+    struct NetstringDecoder;
+
+    impl Decoder for NetstringDecoder {
+        type Item = Bytes;
+        type Error = io::Error;
+
+        fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Bytes>> {
+            crate::testutil::decode_netstring(buf)
+        }
+    }
+
+    fn collect(chunks: Vec<Bytes>) -> Vec<u8> {
+        let inp = stream::iter(chunks.into_iter().map(|b| Ok::<_, io::Error>(b)));
+        let dec = decode(inp, NetstringDecoder);
+        let out: Vec<Bytes> = block_on(dec.try_collect()).expect("decode");
+        out.into_iter().flat_map(|b| b.to_vec()).collect()
+    }
+
     #[test]
     fn simple() {
-        let mut core = reactor::Core::new().unwrap();
-
-        let decoder = NetstringDecoder::new();
-
-        let inp = stream::iter(vec![
-            Ok::<_, io::Error>(
-                Bytes::from(&b"13:hello, world!,"[..]),
-            ),
-        ]);
-
-        let dec = decode(inp, decoder);
-        let out = Vec::new();
-
-        let xfer = dec.map_err(|err| -> () {
-            panic!("bad = {}", err);
-        }).forward(out);
-
-        let (_, out) = core.run(xfer).unwrap();
-        let out = out.into_iter()
-            .flat_map(|x| x.as_ref().to_vec())
-            .collect::<Vec<_>>();
+        let out = collect(vec![Bytes::from(&b"13:hello, world!,"[..])]);
         assert_eq!(out, b"hello, world!");
     }
 
     #[test]
     fn large() {
-        let mut core = reactor::Core::new().unwrap();
-
-        let decoder = NetstringDecoder::new();
-
-        let inp = stream::iter(vec![
-            Ok::<_, io::Error>(
-                Bytes::from("13:hello, world!,".repeat(5000).as_bytes()),
-            ),
-        ]);
-
-        let dec = decode(inp, decoder);
-        let out = Vec::new();
-
-        let xfer = dec.map_err(|err| -> () {
-            panic!("bad = {}", err);
-        }).forward(out);
-
-        let (_, out) = core.run(xfer).unwrap();
-        let out = out.into_iter()
-            .flat_map(|x| x.as_ref().to_vec())
-            .collect::<Vec<_>>();
-
+        let out = collect(vec![Bytes::copy_from_slice(
+            "13:hello, world!,".repeat(5000).as_bytes(),
+        )]);
         assert_eq!(out, "hello, world!".repeat(5000).as_bytes());
     }
 
     #[test]
     fn partial() {
-        let mut core = reactor::Core::new().unwrap();
-
-        let decoder = NetstringDecoder::new();
-
-        let inp = stream::iter(vec![
-            Ok::<_, io::Error>(Bytes::from(&b"13:hel"[..])),
-            Ok(Bytes::from(&b"lo, world!,"[..])),
+        let out = collect(vec![
+            Bytes::from(&b"13:hel"[..]),
+            Bytes::from(&b"lo, world!,"[..]),
         ]);
-
-        let dec = decode(inp, decoder);
-        let out = Vec::new();
-
-        let xfer = dec.map_err(|err| -> () {
-            panic!("bad = {}", err);
-        }).forward(out);
-
-        let (_, out) = core.run(xfer).unwrap();
-        let out = out.into_iter()
-            .flat_map(|x| x.as_ref().to_vec())
-            .collect::<Vec<_>>();
         assert_eq!(out, b"hello, world!");
     }
 }

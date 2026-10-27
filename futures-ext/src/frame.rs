@@ -8,11 +8,13 @@
 
 use std::cmp;
 use std::io::{self, Read};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use bytes::BytesMut;
-use futures::{Async, Poll, Stream};
-use tokio_io::AsyncRead;
-use tokio_io::codec::Decoder;
+use futures::Stream;
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio_util::codec::Decoder;
 
 const BUFSIZE: usize = 8 * 1024;
 
@@ -24,21 +26,17 @@ where
 {
     FramedStream {
         inner: read,
-        decoder: decoder,
-        // 8KB is a reasonable default
+        decoder,
         buf: BytesMut::with_capacity(BUFSIZE),
         eof: false,
         is_readable: false,
     }
 }
 
-/// Framed objects that are only streams, not sinks. This is distinct from
-/// SplitStream<Framed<T, C>> because that doesn't provide access to `&T` or
-/// `&mut T`.
+/// A stream of decoded frames over an `AsyncRead`.
 ///
-/// This was forked from Framed to implement the `into_inner_leading`
-/// functionality. https://github.com/alexcrichton/tokio-io/issues/17 tackles
-/// implementing this upstream.
+/// Unlike `FramedRead`, `into_inner_leading` returns bytes that were read
+/// but not consumed by the decoder.
 #[derive(Debug)]
 pub struct FramedStream<T, Dec> {
     inner: T,
@@ -48,27 +46,19 @@ pub struct FramedStream<T, Dec> {
     is_readable: bool,
 }
 
-impl<T, Dec> FramedStream<T, Dec>
-where
-    T: AsyncRead,
-    Dec: Decoder,
-{
-    #[inline]
+impl<T, Dec> FramedStream<T, Dec> {
     pub fn get_ref(&self) -> &T {
         &self.inner
     }
 
-    #[inline]
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.inner
     }
 
-    #[inline]
     pub fn into_inner(self) -> T {
         self.inner
     }
 
-    #[inline]
     pub fn into_inner_leading(self) -> ReadLeadingBuffer<T> {
         ReadLeadingBuffer {
             inner: self.inner,
@@ -79,45 +69,49 @@ where
 
 impl<T, Dec> Stream for FramedStream<T, Dec>
 where
-    T: AsyncRead,
-    Dec: Decoder,
+    T: AsyncRead + Unpin,
+    Dec: Decoder + Unpin,
 {
-    type Item = Dec::Item;
-    type Error = Dec::Error;
+    type Item = Result<Dec::Item, Dec::Error>;
 
-    fn poll(&mut self) -> Poll<Option<Dec::Item>, Dec::Error> {
-        // This is adapted from Framed::poll in tokio.
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
         loop {
-            // If the read buffer has any pending data, then it could be
-            // possible that `decode` will return a new frame. We leave it to
-            // the decoder to optimize detecting that more data is required.
-            if self.is_readable {
-                if self.eof {
-                    let ret = if self.buf.len() == 0 {
-                        None
-                    } else {
-                        self.decoder.decode_eof(&mut self.buf)?
+            if this.is_readable {
+                if this.eof {
+                    if this.buf.is_empty() {
+                        return Poll::Ready(None);
+                    }
+                    return match this.decoder.decode_eof(&mut this.buf) {
+                        Ok(frame) => Poll::Ready(frame.map(Ok)),
+                        Err(e) => Poll::Ready(Some(Err(e))),
                     };
-                    return Ok(Async::Ready(ret));
                 }
-
-                if let Some(frame) = self.decoder.decode(&mut self.buf)? {
-                    return Ok(Async::Ready(Some(frame)));
+                match this.decoder.decode(&mut this.buf) {
+                    Ok(Some(frame)) => return Poll::Ready(Some(Ok(frame))),
+                    Ok(None) => this.is_readable = false,
+                    Err(e) => return Poll::Ready(Some(Err(e))),
                 }
-
-                self.is_readable = false;
             }
 
-            assert!(!self.eof);
+            debug_assert!(!this.eof);
 
-            // Otherwise, try to read more data and try again. Make sure we've
-            // got room to make progress.
-            self.buf.reserve(BUFSIZE);
-            if 0 == try_ready!(self.inner.read_buf(&mut self.buf)) {
-                self.eof = true;
+            this.buf.reserve(BUFSIZE);
+            let mut tmp = [0u8; BUFSIZE];
+            let mut read_buf = ReadBuf::new(&mut tmp);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
+                Poll::Ready(Ok(())) => {
+                    let n = read_buf.filled().len();
+                    if n == 0 {
+                        this.eof = true;
+                    } else {
+                        this.buf.extend_from_slice(read_buf.filled());
+                    }
+                }
             }
-
-            self.is_readable = true;
+            this.is_readable = true;
         }
     }
 }
@@ -128,102 +122,97 @@ pub struct ReadLeadingBuffer<T> {
 }
 
 impl<T> ReadLeadingBuffer<T> {
-    #[inline]
     pub fn get_ref(&self) -> &T {
         &self.inner
     }
 
-    #[inline]
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.inner
     }
 
-    #[inline]
     pub fn into_inner(self) -> T {
         self.inner
     }
 }
 
-impl<T> Read for ReadLeadingBuffer<T>
-where
-    T: Read,
-{
+impl<T: Read> Read for ReadLeadingBuffer<T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.buf.len() == 0 {
+        if self.buf.is_empty() {
             return self.inner.read(buf);
         }
 
-        let len = {
-            let slice = self.buf.as_ref();
-            let len = cmp::min(buf.len(), slice.len());
-            if len == 0 {
-                return Ok(0);
-            }
-            let slice = &slice[..len];
-            let buf = &mut buf[..len];
-            buf.copy_from_slice(slice);
-            len
-        };
-
-        self.buf.split_to(len);
+        let len = cmp::min(buf.len(), self.buf.len());
+        if len == 0 {
+            return Ok(0);
+        }
+        buf[..len].copy_from_slice(&self.buf[..len]);
+        let _ = self.buf.split_to(len);
         Ok(len)
     }
 }
 
-impl<T> AsyncRead for ReadLeadingBuffer<T>
-where
-    T: AsyncRead,
-{
+impl<T: AsyncRead + Unpin> AsyncRead for ReadLeadingBuffer<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if !this.buf.is_empty() {
+            let n = cmp::min(buf.remaining(), this.buf.len());
+            buf.put_slice(&this.buf[..n]);
+            let _ = this.buf.split_to(n);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
 }
 
 #[cfg(test)]
 mod test {
     use std::io::{Cursor, Write};
 
-    extern crate netstring;
-    use self::netstring::NetstringDecoder;
-
-    use tokio_core::reactor;
+    use bytes::{Bytes, BytesMut};
+    use futures::executor::block_on;
+    use futures::StreamExt;
+    use tokio_util::codec::Decoder;
 
     use super::*;
 
+    struct NetstringDecoder;
+
+    impl Decoder for NetstringDecoder {
+        type Item = Bytes;
+        type Error = std::io::Error;
+
+        fn decode(&mut self, buf: &mut BytesMut) -> std::io::Result<Option<Bytes>> {
+            crate::testutil::decode_netstring(buf)
+        }
+    }
+
     #[test]
     fn simple() {
-        let mut core = reactor::Core::new().unwrap();
-
-        let decoder = NetstringDecoder::new();
-
         let inp = Cursor::new(b"13:hello, world!,".to_vec());
-        let stream = framed_stream(inp, decoder);
-        let (res, _) = core.run(stream.into_future()).unwrap();
-
-        assert_eq!(res.unwrap().as_ref(), b"hello, world!");
+        let stream = framed_stream(inp, NetstringDecoder);
+        let (res, _) = block_on(stream.into_future());
+        assert_eq!(res.unwrap().unwrap().as_ref(), b"hello, world!");
     }
 
     #[test]
     fn leading_buffer() {
-        let mut core = reactor::Core::new().unwrap();
-
-        let decoder = NetstringDecoder::new();
-
         let inp = Cursor::new(b"13:hello, world!,foo-bar-".to_vec());
-        let stream = framed_stream(inp, decoder);
-        let (res, mut stream) = core.run(stream.into_future()).unwrap();
+        let stream = framed_stream(inp, NetstringDecoder);
+        let (res, mut stream) = block_on(stream.into_future());
 
-        assert_eq!(res.unwrap().as_ref(), b"hello, world!");
-
-        // Make sure the entire input has been read.
+        assert_eq!(res.unwrap().unwrap().as_ref(), b"hello, world!");
         assert_eq!(stream.get_ref().position(), 25);
 
-        // Add some more data to the end so that we can test that both the
-        // remaining bits in the buffer and the additional data we wrote can be
-        // returned.
-        assert_matches!(stream.get_mut().write_all(b"baz-quux"), Ok(()));
+        stream.get_mut().write_all(b"baz-quux").expect("write");
         stream.get_mut().set_position(25);
 
         let mut read2 = stream.into_inner_leading();
         let mut out = vec![];
-        assert_matches!(read2.read_to_end(&mut out), Ok(16));
+        assert_eq!(read2.read_to_end(&mut out).expect("read"), 16);
         assert_eq!(out, b"foo-bar-baz-quux");
     }
 }

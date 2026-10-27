@@ -4,35 +4,30 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use futures::{Async, Future, IntoFuture, Poll, Stream};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures::{Future, Sink, Stream};
 
 use super::StreamWrapper;
 
-/// A stream combinator which takes elements from a stream while a predicate
-/// holds.
+/// Take elements from a `Stream<Item = Result<T, E>>` while a predicate holds.
 ///
-/// This structure is produced by the `Stream::take_while_wrapper` method.
-///
-/// Adapted from take_while.rs in the futures crate, with an extra StreamWrapper
-/// trait defined.
-#[derive(Debug)]
+/// The predicate sees the success value. `Ok(false)` ends the stream.
+/// A predicate error is forwarded and the stream stops yielding that item.
 #[must_use = "streams do nothing unless polled"]
-pub struct TakeWhile<S, P, R>
-where
-    S: Stream,
-    R: IntoFuture,
-{
+pub struct TakeWhile<S, P, Fut, T> {
     stream: S,
     pred: P,
-    pending: Option<(R::Future, S::Item)>,
+    pending: Option<(Fut, T)>,
     done_taking: bool,
 }
 
-pub fn new<S, P, R>(s: S, p: P) -> TakeWhile<S, P, R>
+pub fn new<S, P, Fut, T, E>(s: S, p: P) -> TakeWhile<S, P, Fut, T>
 where
-    S: Stream,
-    P: FnMut(&S::Item) -> R,
-    R: IntoFuture<Item = bool, Error = S::Error>,
+    S: Stream<Item = Result<T, E>>,
+    P: FnMut(&T) -> Fut,
+    Fut: Future<Output = Result<bool, E>>,
 {
     TakeWhile {
         stream: s,
@@ -42,11 +37,7 @@ where
     }
 }
 
-impl<S, P, R> TakeWhile<S, P, R>
-where
-    S: Stream,
-    R: IntoFuture,
-{
+impl<S, P, Fut, T> TakeWhile<S, P, Fut, T> {
     pub fn get_ref(&self) -> &S {
         &self.stream
     }
@@ -56,70 +47,78 @@ where
     }
 }
 
-// Forwarding impl of Sink from the underlying stream
-impl<S, P, R> ::futures::sink::Sink for TakeWhile<S, P, R>
+impl<S, P, Fut, T, Item> Sink<Item> for TakeWhile<S, P, Fut, T>
 where
-    S: ::futures::sink::Sink + Stream,
-    R: IntoFuture,
+    S: Sink<Item> + Unpin,
+    P: Unpin,
+    Fut: Unpin,
+    T: Unpin,
 {
-    type SinkItem = S::SinkItem;
-    type SinkError = S::SinkError;
-
-    fn start_send(&mut self, item: S::SinkItem) -> ::futures::StartSend<S::SinkItem, S::SinkError> {
-        self.stream.start_send(item)
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), S::SinkError> {
-        self.stream.poll_complete()
-    }
-}
-
-impl<S, P, R> Stream for TakeWhile<S, P, R>
-where
-    S: Stream,
-    P: FnMut(&S::Item) -> R,
-    R: IntoFuture<Item = bool, Error = S::Error>,
-{
-    type Item = S::Item;
     type Error = S::Error;
 
-    fn poll(&mut self) -> Poll<Option<S::Item>, S::Error> {
-        if self.done_taking {
-            return Ok(Async::Ready(None));
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().stream).poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Item) -> Result<(), Self::Error> {
+        Pin::new(&mut self.get_mut().stream).start_send(item)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().stream).poll_close(cx)
+    }
+}
+
+impl<S, P, Fut, T, E> Stream for TakeWhile<S, P, Fut, T>
+where
+    S: Stream<Item = Result<T, E>> + Unpin,
+    P: FnMut(&T) -> Fut + Unpin,
+    Fut: Future<Output = Result<bool, E>> + Unpin,
+    T: Unpin,
+{
+    type Item = Result<T, E>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.done_taking {
+            return Poll::Ready(None);
         }
 
-        if self.pending.is_none() {
-            let item = match try_ready!(self.stream.poll()) {
-                Some(e) => e,
-                None => return Ok(Async::Ready(None)),
+        if this.pending.is_none() {
+            let item = match Pin::new(&mut this.stream).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Ok(item))) => item,
             };
-            self.pending = Some(((self.pred)(&item).into_future(), item));
+            let fut = (this.pred)(&item);
+            this.pending = Some((fut, item));
         }
 
-        assert!(self.pending.is_some());
-        match self.pending.as_mut().unwrap().0.poll() {
-            Ok(Async::Ready(true)) => {
-                let (_, item) = self.pending.take().unwrap();
-                Ok(Async::Ready(Some(item)))
+        let (fut, _) = this.pending.as_mut().expect("pending predicate");
+        match Pin::new(fut).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(true)) => {
+                let (_, item) = this.pending.take().expect("pending item");
+                Poll::Ready(Some(Ok(item)))
             }
-            Ok(Async::Ready(false)) => {
-                self.done_taking = true;
-                Ok(Async::Ready(None))
+            Poll::Ready(Ok(false)) => {
+                this.done_taking = true;
+                Poll::Ready(None)
             }
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(e) => {
-                self.pending = None;
-                Err(e)
+            Poll::Ready(Err(e)) => {
+                this.pending = None;
+                Poll::Ready(Some(Err(e)))
             }
         }
     }
 }
 
-impl<S, P, R> StreamWrapper<S> for TakeWhile<S, P, R>
-where
-    S: Stream,
-    R: IntoFuture,
-{
+impl<S, P, Fut, T> StreamWrapper<S> for TakeWhile<S, P, Fut, T> {
     fn into_inner(self) -> S {
         self.stream
     }
