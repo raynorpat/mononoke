@@ -75,6 +75,8 @@ pub struct UnixStream {
     read_rx: Option<Receiver<io::Result<Bytes>>>,
     read_rest: Bytes,
     write_tx: Option<SyncSender<Cmd>>,
+    /// Write half has been shut down. Later writes fail, reads stay open.
+    write_shut: bool,
     shared: Arc<Shared>,
     io: Option<thread::JoinHandle<()>>,
     wait: Wait,
@@ -109,6 +111,7 @@ impl UnixStream {
             read_rx: Some(read_rx),
             read_rest: Bytes::new(),
             write_tx: Some(write_tx),
+            write_shut: false,
             shared,
             io: Some(io),
             wait: Wait::Idle,
@@ -150,7 +153,9 @@ impl UnixStream {
                 let shutting_down = matches!(self.wait, Wait::Shutdown(_));
                 self.wait = Wait::Idle;
                 if shutting_down {
-                    self.write_tx.take();
+                    // Keep `write_tx`. Dropping it disconnects the IO loop and
+                    // closes the socket, which the read half still needs.
+                    self.write_shut = true;
                 }
                 Poll::Ready(result)
             }
@@ -169,8 +174,9 @@ impl Drop for UnixStream {
     fn drop(&mut self) {
         // `FramedWrite` does not call `poll_shutdown`. Drop the command
         // sender so the IO thread finishes bytes already queued, then
-        // half-closes. Join that thread before this function returns so
-        // nothing shuts the socket down during `write`.
+        // half-closes and exits. That exit is the only time the socket and
+        // the read half go away. Join before returning so `shutdown` cannot
+        // run during `write`.
         drop(self.write_tx.take());
         unpark(&self.shared);
         if let Some(handle) = self.io.take() {
@@ -199,6 +205,7 @@ fn io_loop(
     let mut outgoing: Option<Bytes> = None;
     let mut outgoing_pos = 0;
     let mut failed: Option<io::Error> = None;
+    let mut writes_closed = false;
     let mut read_stash: Option<io::Result<Bytes>> = None;
     let mut saw_eof = false;
     let mut eof_queued = false;
@@ -208,7 +215,7 @@ fn io_loop(
         if outgoing.is_none() {
             match cmds.try_recv() {
                 Ok(Cmd::Write(buf)) => {
-                    if failed.is_none() {
+                    if failed.is_none() && !writes_closed {
                         outgoing = Some(buf);
                         outgoing_pos = 0;
                         progressed = true;
@@ -216,22 +223,38 @@ fn io_loop(
                     wake(&shared.write_waker);
                 }
                 Ok(Cmd::Flush(ack)) => {
-                    let _ = ack.send(status(&failed));
+                    let result = if writes_closed && failed.is_none() {
+                        Ok(())
+                    } else {
+                        status(&failed)
+                    };
+                    let _ = ack.send(result);
                     progressed = true;
                 }
                 Ok(Cmd::Shutdown(ack)) => {
-                    let result = match &failed {
-                        Some(err) => Err(copy_err(err)),
-                        None => socket.shutdown(Shutdown::Write),
+                    let result = if writes_closed && failed.is_none() {
+                        Ok(())
+                    } else if let Some(err) = &failed {
+                        Err(copy_err(err))
+                    } else {
+                        socket.shutdown(Shutdown::Write)
                     };
+                    if result.is_ok() {
+                        writes_closed = true;
+                    }
                     let _ = ack.send(result);
-                    failed = Some(write_closed());
                     wake(&shared.write_waker);
                     progressed = true;
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    let _ = socket.shutdown(Shutdown::Write);
+                    // `Drop` dropped the sender. Half-close if needed, then
+                    // leave the loop so this thread can drop the socket.
+                    // `Cmd::Shutdown` must not take this path: the read half
+                    // is still polling.
+                    if !writes_closed {
+                        let _ = socket.shutdown(Shutdown::Write);
+                    }
                     wake(&shared.read_waker);
                     wake(&shared.write_waker);
                     break;
@@ -406,7 +429,7 @@ impl AsyncWrite for UnixStream {
         if let Some(err) = take_error(&this.shared) {
             return Poll::Ready(Err(err));
         }
-        if matches!(this.wait, Wait::Shutdown(_)) || this.write_tx.is_none() {
+        if this.write_shut || matches!(this.wait, Wait::Shutdown(_)) || this.write_tx.is_none() {
             return Poll::Ready(Err(write_closed()));
         }
         if buf.is_empty() {
@@ -424,7 +447,7 @@ impl AsyncWrite for UnixStream {
         if matches!(this.wait, Wait::Flush(_) | Wait::Shutdown(_)) {
             return this.poll_barrier(cx);
         }
-        if this.write_tx.is_none() {
+        if this.write_shut || this.write_tx.is_none() {
             return Poll::Ready(Ok(()));
         }
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -450,7 +473,7 @@ impl AsyncWrite for UnixStream {
         if matches!(this.wait, Wait::Shutdown(_)) {
             return this.poll_barrier(cx);
         }
-        if this.write_tx.is_none() {
+        if this.write_shut || this.write_tx.is_none() {
             return Poll::Ready(Ok(()));
         }
         let (ack_tx, ack_rx) = oneshot::channel();

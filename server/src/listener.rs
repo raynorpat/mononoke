@@ -193,6 +193,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_survives_write_shutdown() {
+        let dir = sock_dir("hs");
+        let path = dir.join("mononoke.sock");
+        let bound = listener(&path).await.expect("bind");
+
+        #[cfg(unix)]
+        let mut client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        #[cfg(windows)]
+        let mut client = crate::uds::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+
+        let (server, _) = bound.accept().await.unwrap();
+        let (mut server_read, mut server_write) = tokio::io::split(server);
+        server_write.shutdown().await.expect("shutdown write");
+
+        let mut probe = [0u8; 1];
+        let early =
+            tokio::time::timeout(Duration::from_millis(50), server_read.read(&mut probe)).await;
+        assert!(
+            early.is_err(),
+            "write shutdown looked like EOF on the read half: {early:?}"
+        );
+
+        let payload = b"after-half";
+        client.write_all(payload).await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut got = [0u8; 10];
+        let read =
+            tokio::time::timeout(Duration::from_secs(2), server_read.read_exact(&mut got)).await;
+        read.expect("read after write shutdown timed out")
+            .expect("read after write shutdown");
+        assert_eq!(&got, payload);
+
+        drop(server_read);
+        drop(server_write);
+        drop(client);
+        drop(bound);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
     async fn stale_socket_file_is_replaced() {
         let dir = sock_dir("st");
         let path = dir.join("mononoke.sock");
