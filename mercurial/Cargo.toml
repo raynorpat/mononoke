@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 flate2 = "1"
 lz4_flex = "0.11"
+zstd = "0.13"
 memmap2 = "0.9"
 bitflags = "2"
 thiserror = "2"

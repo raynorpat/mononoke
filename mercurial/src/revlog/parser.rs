@@ -5,10 +5,11 @@
 // GNU General Public License version 2 or any later version.
 
 // Parsers for Mercurial revlog index entries and chunk payloads.
-use std::io::Read;
+use std::io::{Cursor, Read};
 
 use bitflags::bitflags;
 use flate2::read::ZlibDecoder;
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 use mercurial_types::bdiff::Delta;
 use mercurial_types::NodeHash;
@@ -34,6 +35,7 @@ pub enum ParseError {
     NoMatch,
     BadZlib(String),
     BadLz4(String),
+    BadZstd(String),
 }
 
 pub type ParseResult<'a, T> = Result<(&'a [u8], T), ParseError>;
@@ -255,9 +257,38 @@ fn zlib_decompress(input: &[u8]) -> Result<(Vec<u8>, usize), ParseError> {
     }
 }
 
+/// Zstd frame magic (`28 b5 2f fd`). The payload is raw literal or delta bytes.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+fn is_zstd(input: &[u8]) -> bool {
+    input.starts_with(&ZSTD_MAGIC)
+}
+
+/// Decompress one zstd frame. `used` is the number of input bytes consumed.
+fn zstd_decompress(input: &[u8]) -> Result<(Vec<u8>, usize), ParseError> {
+    let mut cursor = Cursor::new(input);
+    let mut data = Vec::new();
+    let mut decoder = ZstdDecoder::with_buffer(cursor.by_ref())
+        .map_err(|err| ParseError::BadZstd(err.to_string()))?
+        .single_frame();
+    decoder
+        .read_to_end(&mut data)
+        .map_err(|err| ParseError::BadZstd(err.to_string()))?;
+    drop(decoder);
+    Ok((data, cursor.position() as usize))
+}
+
 // One framed chunk of deltas. `None` means this byte is not a frame marker,
 // so the caller leaves those bytes unconsumed.
 fn delta_frame(input: &[u8]) -> Result<Option<(&[u8], Vec<Delta>)>, ParseError> {
+    if is_zstd(input) {
+        let (data, used) = zstd_decompress(input)?;
+        let (rest, parsed) = deltas(&data)?;
+        if !rest.is_empty() {
+            return Err(ParseError::Incomplete);
+        }
+        return Ok(Some((&input[used..], parsed)));
+    }
     match input[0] {
         b'u' => {
             let (rest, parsed) = deltas(&input[1..])?;
@@ -308,6 +339,11 @@ pub fn deltachunk(input: &[u8]) -> ParseResult<'_, Vec<Delta>> {
 pub fn literal(input: &[u8]) -> ParseResult<'_, Vec<u8>> {
     if input.is_empty() {
         return Err(ParseError::NoMatch);
+    }
+    // The frame payload is the literal text. It is not wrapped in `u`/`x`.
+    if is_zstd(input) {
+        let (data, used) = zstd_decompress(input)?;
+        return Ok((&input[used..], data));
     }
     match input[0] {
         0 => Ok((&[], input.to_vec())),

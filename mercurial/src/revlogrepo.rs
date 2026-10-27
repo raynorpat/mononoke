@@ -43,6 +43,7 @@ pub enum Required {
     Largefiles,
     Lz4revlog,
     SqlDirstate,
+    RevlogCompressionZstd,
 }
 
 impl Display for Required {
@@ -59,6 +60,7 @@ impl Display for Required {
             Required::Largefiles => "largefiles",
             Required::Lz4revlog => "lz4revlog",
             Required::SqlDirstate => "sqldirstate",
+            Required::RevlogCompressionZstd => "revlog-compression-zstd",
         };
         write!(fmt, "{}", s)
     }
@@ -80,6 +82,7 @@ impl FromStr for Required {
             "largefiles" => Ok(Required::Largefiles),
             "lz4revlog" => Ok(Required::Lz4revlog),
             "sqldirstate" => Ok(Required::SqlDirstate),
+            "revlog-compression-zstd" => Ok(Required::RevlogCompressionZstd),
             unk => Err(ErrorKind::UnknownReq(unk.into()).into()),
         }
     }
@@ -133,6 +136,9 @@ impl RevlogRepo {
         let file = fs::File::open(base.join("requires")).chain_err(|| "Can't open `requires`")?;
         for line in BufReader::new(file).lines() {
             req.insert(line.chain_err(|| "Line read failed")?.parse()?);
+        }
+        if req.contains(&Required::Treemanifest) {
+            return Err("treemanifest is not served".into());
         }
 
         Ok(RevlogRepo {
@@ -299,6 +305,69 @@ impl Stream for ChangesetStream {
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         Poll::Ready(this.0.next().map(|(_, entry)| Ok(entry.nodeid)))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::fs;
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::RevlogRepo;
+
+    fn open_requires(label: &str, lines: &[&str]) -> crate::errors::Result<RevlogRepo> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mononoke-requires-{}-{}-{}",
+            label,
+            process::id(),
+            nanos
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("store")).expect("store");
+        fs::write(dir.join("requires"), format!("{}\n", lines.join("\n"))).expect("requires");
+        let empty = include_bytes!("revlog/empty.i.bin");
+        fs::write(dir.join("store").join("00changelog.i"), empty).expect("changelog");
+        fs::write(dir.join("store").join("00manifest.i"), empty).expect("manifest");
+        let opened = RevlogRepo::open(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        opened
+    }
+
+    #[test]
+    fn unknown_requirement_names_the_line() {
+        let err = open_requires("unknown", &["store", "revlogv1", "share-safe"])
+            .expect_err("unknown requirement");
+        let msg = err.to_string();
+        assert!(msg.contains("share-safe"), "{}", msg);
+    }
+
+    #[test]
+    fn treemanifest_is_not_served() {
+        let err = open_requires("tree", &["store", "revlogv1", "treemanifest"])
+            .expect_err("treemanifest");
+        let msg = err.to_string();
+        assert!(msg.contains("treemanifest is not served"), "{}", msg);
+    }
+
+    #[test]
+    fn zstd_requirement_is_accepted() {
+        open_requires(
+            "zstd",
+            &[
+                "store",
+                "fncache",
+                "dotencode",
+                "generaldelta",
+                "revlogv1",
+                "revlog-compression-zstd",
+            ],
+        )
+        .expect("open");
     }
 }
 

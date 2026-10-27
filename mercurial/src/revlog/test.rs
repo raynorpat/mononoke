@@ -48,6 +48,35 @@ fn short_delta_remainder_is_error() {
     assert!(msg.contains("3 remains"), "{}", msg);
 }
 
+fn one_rev_generaldelta(chunk: &[u8], baserev: u32) -> Revlog {
+    let mut entry = ng_entry(0, chunk.len() as u32, baserev);
+    // Features GENERAL_DELTA, version revlog NG. The header occupies the
+    // first four bytes of entry 0; the data offset stays 0.
+    entry[0] = 0x00;
+    entry[1] = 0x02;
+    entry[2] = 0x00;
+    entry[3] = 0x01;
+    Revlog::new(entry.to_vec(), Some(chunk.to_vec())).expect("revlog")
+}
+
+#[test]
+fn zstd_magic_chunk_decompresses() {
+    let frame = zstd::encode_all(&b"hello revlog"[..], 0).expect("zstd");
+    assert_eq!(&frame[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+    let revlog = one_rev_generaldelta(&frame, 0);
+    let node = revlog.get_rev(RevIdx::from(0u32)).expect("rev");
+    assert_eq!(node.as_blob().as_slice(), Some(&b"hello revlog"[..]));
+}
+
+#[test]
+fn revlog_snapshot_base_equals_own_index_returns_full_text() {
+    let mut chunk = vec![b'u'];
+    chunk.extend_from_slice(b"snapshot-text");
+    let revlog = one_rev_generaldelta(&chunk, 0);
+    let node = revlog.get_rev(RevIdx::from(0u32)).expect("rev");
+    assert_eq!(node.as_blob().as_slice(), Some(&b"snapshot-text"[..]));
+}
+
 #[test]
 fn emptyrev() {
     let revlog = Revlog::new(EMPTY.to_vec(), None).expect("construction failed");

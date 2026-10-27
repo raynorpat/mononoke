@@ -340,8 +340,9 @@ impl RevlogInner {
             self.parse_entry(self.offset_for_idx(idx).expect("missing from cache?"))?
         };
 
-        // Some index entries refer to themselves as their base when they're literal data
-        if entry.baserev.map(Into::into) == Some(idx) {
+        // Non-generaldelta literals are stored with baserev == self.
+        // Generaldelta keeps that index: it is a snapshot, not a delta.
+        if !self.is_general_delta() && entry.baserev == Some(idx) {
             entry.baserev = None;
         }
 
@@ -422,26 +423,31 @@ impl RevlogInner {
         // If the entry has no baserev then the chunk is literal data, Otherwise
         // its 0 or more deltas against the baserev. If its general delta, then the
         // baserev itself might also be delta, otherwise its all the deltas from baserev..idx.
+        // A generaldelta snapshot uses baserev == idx and stores full text.
+        let snapshot = self.is_general_delta() && entry.baserev == Some(idx);
         if let Some(baserev) = entry.baserev {
-            let delta = match parser::deltachunk(chunkdata) {
-                Ok((rest, _)) if rest.len() != 0 => {
-                    return Err(
-                        ErrorKind::Revlog(format!(
-                            "Failed to unpack details: {} remains, {:?}",
-                            rest.len(),
-                            &rest[..rest.len().min(16)]
-                        )).into(),
-                    );
-                }
-                Ok((_, deltas)) => Chunk::Deltas(baserev, deltas),
-                Err(err) => {
-                    return Err(
-                        ErrorKind::Revlog(format!("Failed to unpack deltas: {:?}", err)).into(),
-                    )
-                }
-            };
-            Ok(delta)
-        } else if chunkdata.len() == 0 {
+            if !snapshot {
+                let delta = match parser::deltachunk(chunkdata) {
+                    Ok((rest, _)) if rest.len() != 0 => {
+                        return Err(
+                            ErrorKind::Revlog(format!(
+                                "Failed to unpack details: {} remains, {:?}",
+                                rest.len(),
+                                &rest[..rest.len().min(16)]
+                            )).into(),
+                        );
+                    }
+                    Ok((_, deltas)) => Chunk::Deltas(baserev, deltas),
+                    Err(err) => {
+                        return Err(
+                            ErrorKind::Revlog(format!("Failed to unpack deltas: {:?}", err)).into(),
+                        )
+                    }
+                };
+                return Ok(delta);
+            }
+        }
+        if chunkdata.len() == 0 {
             Ok(Chunk::Literal(vec![]))
         } else {
             let literal = match parser::literal(chunkdata) {
@@ -517,10 +523,24 @@ impl RevlogInner {
 
             let entry = self.get_entry(idx)?;
             if let Some(baserev) = entry.baserev.map(Into::into) {
-                if baserev >= idx {
-                    Err(ErrorKind::Revlog(
-                        format!("baserev {:?} >= idx {:?}", baserev, idx),
-                    ))?;
+                if baserev > idx {
+                    return Err(ErrorKind::Revlog(format!(
+                        "baserev {:?} > idx {:?}",
+                        baserev, idx
+                    ))
+                    .into());
+                }
+                if baserev == idx {
+                    // Snapshot: this chunk is the full text, not a delta.
+                    let idx = chunks.pop().unwrap();
+                    let chunk = self.get_chunk(idx).chain_err::<_, Error>(|| {
+                        format!("construct_general tgtidx {:?} idx {:?}", tgtidx, idx).into()
+                    })?;
+                    match chunk {
+                        Chunk::Literal(v) => data = v,
+                        _ => panic!("snapshot chunk is not literal"),
+                    }
+                    break;
                 }
                 idx = baserev;
             } else {
