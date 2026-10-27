@@ -113,7 +113,7 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::task::Poll;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -153,6 +153,39 @@ mod tests {
         assert_eq!(&buf, b"ping");
 
         drop(server);
+        drop(client);
+        drop(bound);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn flushed_write_survives_drop() {
+        let dir = sock_dir("fd");
+        let path = dir.join("mononoke.sock");
+        let bound = listener(&path).await.expect("bind");
+
+        #[cfg(unix)]
+        let mut client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        #[cfg(windows)]
+        let mut client = crate::uds::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+
+        let (mut server, _) = bound.accept().await.unwrap();
+        let payload = b"pong-flush";
+        server.write_all(payload).await.unwrap();
+        server.flush().await.unwrap();
+        drop(server);
+
+        let mut got = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut got)).await;
+        let n = read.expect("peer read timed out").expect("peer read");
+        assert_eq!(n, payload.len());
+        assert_eq!(got, payload);
+
         drop(client);
         drop(bound);
         let _ = fs::remove_file(&path);

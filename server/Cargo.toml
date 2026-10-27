@@ -18,7 +18,7 @@ slog = "2"
 slog-term = "2"
 sshrelay = { path = "../sshrelay" }
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
 [target.'cfg(windows)'.dependencies]
