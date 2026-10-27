@@ -23,6 +23,15 @@ fn free_port() -> u16 {
     listener.local_addr().expect("ephemeral addr").port()
 }
 
+fn free_port_except(taken: u16) -> u16 {
+    loop {
+        let port = free_port();
+        if port != taken {
+            return port;
+        }
+    }
+}
+
 fn sibling_bin(name: &str) -> PathBuf {
     let mononoke = PathBuf::from(env!("CARGO_BIN_EXE_mononoke"));
     let mut path = mononoke
@@ -131,6 +140,24 @@ fn init_zstd_repo(root: &Path) -> PathBuf {
     repo
 }
 
+/// Self-signed PEM pair for `https://127.0.0.1/`.
+/// The IP is a subject alternative name. Mercurial ignores IP SANs and
+/// matches the common name, so the CN is the same address.
+fn write_test_cert(dir: &Path) -> (PathBuf, PathBuf) {
+    let mut params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
+        .expect("cert params for 127.0.0.1");
+    let mut name = rcgen::DistinguishedName::new();
+    name.push(rcgen::DnType::CommonName, "127.0.0.1");
+    params.distinguished_name = name;
+    let key_pair = rcgen::KeyPair::generate().expect("key pair");
+    let cert = params.self_signed(&key_pair).expect("self-signed cert");
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    fs::write(&cert_path, cert.pem()).expect("write cert");
+    fs::write(&key_path, key_pair.serialize_pem()).expect("write key");
+    (cert_path, key_path)
+}
+
 fn write_ssh_shim(dir: &Path, hgcli: &Path, repo: &Path) -> PathBuf {
     if cfg!(windows) {
         let path = dir.join("ssh.cmd");
@@ -193,10 +220,25 @@ impl Running {
     fn start(repo: &Path, log: &Path) -> Self {
         let _guard = lock_ports();
         let port = free_port();
-        Self::spawn(repo, log, port)
+        Self::spawn(repo, log, port, &[])
     }
 
-    fn spawn(repo: &Path, log: &Path, port: u16) -> Self {
+    fn start_https(repo: &Path, log: &Path, cert: &Path, key: &Path) -> (Self, u16) {
+        let _guard = lock_ports();
+        let http_port = free_port();
+        let https_port = free_port_except(http_port);
+        let extra = [
+            "--https-port".to_string(),
+            https_port.to_string(),
+            "--tls-cert".to_string(),
+            cert.display().to_string(),
+            "--tls-key".to_string(),
+            key.display().to_string(),
+        ];
+        (Self::spawn(repo, log, http_port, &extra), https_port)
+    }
+
+    fn spawn(repo: &Path, log: &Path, port: u16, extra: &[String]) -> Self {
         let bin = sibling_bin("mononoke");
         let log_file =
             File::create(log).unwrap_or_else(|err| panic!("log {}: {err}", log.display()));
@@ -206,6 +248,7 @@ impl Running {
         let mut child = Command::new(&bin)
             .arg("--http-port")
             .arg(port.to_string())
+            .args(extra)
             .arg(repo)
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(stderr))
@@ -318,6 +361,94 @@ fn http_clone_and_push() {
         served,
         b"beta\n",
         "served a.txt {served:?}\nmononoke:\n{}",
+        read_log(&log)
+    );
+}
+
+#[test]
+fn https_clone_and_push() {
+    let temp = TempDir::new("hs");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let (cert, key) = write_test_cert(&temp.0);
+    let (server, https_port) = Running::start_https(&repo, &log, &cert, &key);
+    let url = format!("https://127.0.0.1:{https_port}/");
+    let cacerts = format!("web.cacerts={}", cfg_path(&cert));
+    let clone = hg(&temp.0, &["clone", &url, "dest", "--config", &cacerts]);
+    assert!(
+        clone.status.success(),
+        "hg clone failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        clone.status,
+        String::from_utf8_lossy(&clone.stdout),
+        String::from_utf8_lossy(&clone.stderr),
+        read_log(&log)
+    );
+    let dest = temp.0.join("dest");
+    let body = fs::read(dest.join("a.txt"))
+        .unwrap_or_else(|err| panic!("read dest a.txt: {err}\nmononoke:\n{}", read_log(&log)));
+    assert_eq!(
+        body,
+        b"alpha\n",
+        "a.txt bytes {body:?}\nmononoke:\n{}",
+        read_log(&log)
+    );
+
+    fs::write(dest.join("a.txt"), b"beta\n").expect("write beta");
+    assert_hg(
+        &hg(&dest, &["commit", "-m", "second", "-u", "test"]),
+        "commit second",
+    );
+    let push = hg(&dest, &["push", &url, "--config", &cacerts]);
+    assert!(
+        push.status.success(),
+        "hg push failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        push.status,
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr),
+        read_log(&log)
+    );
+
+    let logged = hg(&repo, &["log", "-T", "{desc}"]);
+    assert_hg(&logged, "served hg log");
+    let text = String::from_utf8_lossy(&logged.stdout);
+    assert!(
+        text.contains("second"),
+        "log {text:?} does not contain second\nmononoke:\n{}",
+        read_log(&log)
+    );
+
+    assert_hg(&hg(&repo, &["update", "-C"]), "update served repo");
+    let served = fs::read(repo.join("a.txt")).expect("served a.txt");
+    assert_eq!(
+        served,
+        b"beta\n",
+        "served a.txt {served:?}\nmononoke:\n{}",
+        read_log(&log)
+    );
+    drop(server);
+}
+
+#[test]
+fn https_clone_fails_without_the_server_cert() {
+    let temp = TempDir::new("hf");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let (cert, key) = write_test_cert(&temp.0);
+    let (_server, https_port) = Running::start_https(&repo, &log, &cert, &key);
+    let url = format!("https://127.0.0.1:{https_port}/");
+    let dest = temp.0.join("dest");
+    let clone = hg(&temp.0, &["clone", &url, "dest"]);
+    assert!(
+        !clone.status.success(),
+        "hg clone trusted an untrusted cert: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        clone.status,
+        String::from_utf8_lossy(&clone.stdout),
+        String::from_utf8_lossy(&clone.stderr),
+        read_log(&log)
+    );
+    assert!(
+        !dest.join("a.txt").exists(),
+        "working copy created without trusting the server cert\nmononoke:\n{}",
         read_log(&log)
     );
 }
@@ -461,11 +592,7 @@ fn ssh_push_appears_in_served_repo() {
     let served = fs::read(repo.join("a.txt")).expect("served a.txt");
     assert_eq!(served, b"beta\n", "served a.txt {served:?}");
 
-    let again = hg_ssh(
-        &temp.0,
-        &["clone", "ssh://user@dummy/repo", "dest2"],
-        &shim,
-    );
+    let again = hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "dest2"], &shim);
     assert!(
         again.status.success(),
         "second clone failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
@@ -594,8 +721,8 @@ fn unbundle_rejects_mismatched_heads_without_writing() {
     raw[..8].copy_from_slice(&(nanos as u64).to_le_bytes());
     raw[0] |= 0x01;
     let head = mercurial_types::NodeHash::from_bytes(&raw).expect("fresh node");
-    let reply = mononoke::push::apply_unbundle(&repo.join(".hg"), &[head], b"")
-        .expect("apply_unbundle");
+    let reply =
+        mononoke::push::apply_unbundle(&repo.join(".hg"), &[head], b"").expect("apply_unbundle");
     assert_eq!(reply, b"0\n");
     assert_eq!(changelog_len(&repo), before, "changelog length changed");
 }

@@ -10,13 +10,17 @@
 //! POST body. Response bodies are the command bytes with no SSH length prefix.
 
 use std::collections::HashMap;
+use std::io::BufReader;
+use std::path::Path;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use hgproto::{HgService, Request, Response};
 use slog::{error, info, o, Drain, Logger};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::TlsAcceptor;
 
 use crate::errors::{Error, Result};
 use crate::repo::{Repo, RepoClient};
@@ -40,6 +44,77 @@ pub async fn serve_http(listener: TcpListener, repo: Arc<Repo>) -> Result<()> {
     }
 }
 
+/// Server-authenticated TLS. Clients are not asked for a certificate.
+pub fn tls_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> {
+    install_crypto_provider();
+    let certs = load_certs(cert_path)?;
+    let key = load_key(key_path)?;
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| Error::from(format!("tls config: {err}")))?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Accept TLS, then run the same HTTP v1 connection handler as `serve_http`.
+pub async fn serve_https(
+    listener: TcpListener,
+    repo: Arc<Repo>,
+    acceptor: TlsAcceptor,
+) -> Result<()> {
+    let log = http_logger();
+    loop {
+        let (sock, addr) = listener.accept().await?;
+        let _ = sock.set_nodelay(true);
+        info!(log, "HTTPS connection from {:?}", addr);
+        let repo = Arc::clone(&repo);
+        let log = log.clone();
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let sock = match acceptor.accept(sock).await {
+                Ok(tls) => tls,
+                Err(err) => {
+                    error!(log, "TLS handshake failed: {}", err);
+                    return;
+                }
+            };
+            if let Err(err) = connection(sock, repo, log.clone()).await {
+                error!(log, "HTTPS connection failed: {}", err);
+            }
+        });
+    }
+}
+
+fn install_crypto_provider() {
+    // rustls 0.23 has no process-default provider until one is installed.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let file = std::fs::File::open(path)
+        .map_err(|err| Error::from(format!("open tls cert {}: {err}", path.display())))?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| Error::from(format!("parse tls cert {}: {err}", path.display())))?;
+    if certs.is_empty() {
+        return Err(format!("tls cert {} is empty", path.display()).into());
+    }
+    Ok(certs)
+}
+
+fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    let file = std::fs::File::open(path)
+        .map_err(|err| Error::from(format!("open tls key {}: {err}", path.display())))?;
+    let mut reader = BufReader::new(file);
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|err| Error::from(format!("parse tls key {}: {err}", path.display())))?
+        .ok_or_else(|| Error::from(format!("tls key {} is empty", path.display())))
+}
+
 fn http_logger() -> Logger {
     let decorator = slog_term::PlainSyncDecorator::new(std::io::stderr());
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
@@ -47,7 +122,10 @@ fn http_logger() -> Logger {
     Logger::root(drain, o!("proto" => "http"))
 }
 
-async fn connection(mut sock: TcpStream, repo: Arc<Repo>, log: Logger) -> Result<()> {
+async fn connection<S>(mut sock: S, repo: Arc<Repo>, log: Logger) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let client = RepoClient::new(repo, &log);
     let service = HgService::new_with_logger(client, &log);
     let mut buf = Vec::new();
@@ -119,7 +197,10 @@ fn command_name(incoming: &Incoming) -> Result<String> {
     Ok(cmd.to_string())
 }
 
-async fn read_request(sock: &mut TcpStream, buf: &mut Vec<u8>) -> Result<Option<Incoming>> {
+async fn read_request<S>(sock: &mut S, buf: &mut Vec<u8>) -> Result<Option<Incoming>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let header = loop {
         if let Some(end) = find_double_crlf(buf) {
             break buf.drain(..end).collect::<Vec<_>>();
@@ -137,11 +218,14 @@ async fn read_request(sock: &mut TcpStream, buf: &mut Vec<u8>) -> Result<Option<
     parse_request(sock, buf, &header).await
 }
 
-async fn parse_request(
-    sock: &mut TcpStream,
+async fn parse_request<S>(
+    sock: &mut S,
     buf: &mut Vec<u8>,
     header: &[u8],
-) -> Result<Option<Incoming>> {
+) -> Result<Option<Incoming>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let text =
         std::str::from_utf8(header).map_err(|_| Error::from("HTTP headers are not utf-8"))?;
     let mut lines = text.split("\r\n");
@@ -280,14 +364,20 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
         .map(|idx| idx + 4)
 }
 
-async fn read_some(sock: &mut TcpStream, buf: &mut Vec<u8>) -> Result<usize> {
+async fn read_some<S>(sock: &mut S, buf: &mut Vec<u8>) -> Result<usize>
+where
+    S: AsyncRead + Unpin,
+{
     let mut tmp = [0u8; 8192];
     let n = sock.read(&mut tmp).await?;
     buf.extend_from_slice(&tmp[..n]);
     Ok(n)
 }
 
-async fn read_exact(sock: &mut TcpStream, buf: &mut Vec<u8>, len: usize) -> Result<Vec<u8>> {
+async fn read_exact<S>(sock: &mut S, buf: &mut Vec<u8>, len: usize) -> Result<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
     while buf.len() < len {
         if read_some(sock, buf).await? == 0 {
             return Err("client closed during HTTP body".into());
@@ -296,12 +386,10 @@ async fn read_exact(sock: &mut TcpStream, buf: &mut Vec<u8>, len: usize) -> Resu
     Ok(buf.drain(..len).collect())
 }
 
-async fn write_hg(
-    sock: &mut TcpStream,
-    content_type: &str,
-    body: &[u8],
-    close: bool,
-) -> Result<()> {
+async fn write_hg<S>(sock: &mut S, content_type: &str, body: &[u8], close: bool) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let connection = if close { "close" } else { "keep-alive" };
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",

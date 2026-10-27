@@ -291,10 +291,11 @@ async fn repo_listen(
     repo: repo::Repo,
     listen_log: &Logger,
     http: Option<(String, u16)>,
+    https: Option<(String, u16, PathBuf, PathBuf)>,
 ) -> Result<()> {
     let repo = Arc::new(repo);
-    // Bind HTTP before the unix socket so a client that waits for the socket
-    // file knows the TCP port is already accepting.
+    // Bind HTTP and HTTPS before the unix socket so a client that waits for
+    // the socket file knows the TCP ports are already accepting.
     if let Some((addr, port)) = http {
         let bind_addr = format!("{addr}:{port}");
         let tcp = tokio::net::TcpListener::bind(&bind_addr)
@@ -307,6 +308,22 @@ async fn repo_listen(
             if let Err(err) = mononoke::http::serve_http(tcp, http_repo).await {
                 error!(http_log, "HTTP listener failed: {}", err);
                 log_causes(&http_log, &err, false);
+            }
+        });
+    }
+    if let Some((addr, port, cert, key)) = https {
+        let acceptor = mononoke::http::tls_acceptor(&cert, &key)?;
+        let bind_addr = format!("{addr}:{port}");
+        let tcp = tokio::net::TcpListener::bind(&bind_addr)
+            .await
+            .chain_err(|| format!("HTTPS bind {bind_addr}"))?;
+        info!(listen_log, "Listening for HTTPS on {}", bind_addr);
+        let https_repo = Arc::clone(&repo);
+        let https_log = listen_log.clone();
+        tokio::spawn(async move {
+            if let Err(err) = mononoke::http::serve_https(tcp, https_repo, acceptor).await {
+                error!(https_log, "HTTPS listener failed: {}", err);
+                log_causes(&https_log, &err, false);
             }
         });
     }
@@ -328,15 +345,23 @@ async fn repo_listen(
     }
 }
 
-fn run<'a, I>(repos: I, http_addr: &str, http_port: u16, root_log: &Logger) -> Result<()>
+fn run<'a, I>(
+    repos: I,
+    http_addr: &str,
+    http_port: u16,
+    https: Option<(String, u16, PathBuf, PathBuf)>,
+    root_log: &Logger,
+) -> Result<()>
 where
     I: IntoIterator<Item = &'a str>,
 {
     let mut http = Some((http_addr.to_string(), http_port));
+    let mut https = https;
     let threads = repos
         .into_iter()
         .map(|repopath| {
             let http = http.take();
+            let https = https.take();
             init_repo(root_log, repopath).and_then(|(sockname, repo)| {
                 let repopath = PathBuf::from(repopath);
                 let listen_log = root_log.new(o!("repo" => format!("{:?}", repopath)));
@@ -351,7 +376,7 @@ where
                         Err(err) => return Err(Error::from(err)),
                     };
                     let unw = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        rt.block_on(repo_listen(&sockname, repo, &listen_log, http))
+                        rt.block_on(repo_listen(&sockname, repo, &listen_log, http, https))
                     }));
                     match unw {
                         Err(err) => {
@@ -411,6 +436,25 @@ fn main() {
                 .help("HTTP listen port"),
         )
         .arg(
+            Arg::new("https-port")
+                .long("https-port")
+                .value_name("PORT")
+                .default_value("8443")
+                .help("HTTPS listen port"),
+        )
+        .arg(
+            Arg::new("tls-cert")
+                .long("tls-cert")
+                .value_name("PATH")
+                .help("PEM certificate for HTTPS"),
+        )
+        .arg(
+            Arg::new("tls-key")
+                .long("tls-key")
+                .value_name("PATH")
+                .help("PEM private key for HTTPS"),
+        )
+        .arg(
             Arg::new("REPODIR")
                 .help("paths to repo dirs (parent of .hg)")
                 .required(true)
@@ -453,7 +497,40 @@ fn main() {
         }
     };
 
-    if let Err(ref err) = run(repos, http_addr, http_port, &root_log) {
+    let https = match (
+        matches.get_one::<String>("tls-cert"),
+        matches.get_one::<String>("tls-key"),
+    ) {
+        (None, None) => None,
+        (Some(_), None) => {
+            error!(root_log, "missing --tls-key");
+            std::process::exit(1);
+        }
+        (None, Some(_)) => {
+            error!(root_log, "missing --tls-cert");
+            std::process::exit(1);
+        }
+        (Some(cert), Some(key)) => {
+            let https_port_text = matches
+                .get_one::<String>("https-port")
+                .expect("https-port has a default");
+            let https_port = match https_port_text.parse::<u16>() {
+                Ok(port) => port,
+                Err(_) => {
+                    error!(root_log, "invalid --https-port {}", https_port_text);
+                    std::process::exit(1);
+                }
+            };
+            Some((
+                http_addr.clone(),
+                https_port,
+                PathBuf::from(cert),
+                PathBuf::from(key),
+            ))
+        }
+    };
+
+    if let Err(ref err) = run(repos, http_addr, http_port, https, &root_log) {
         error!(root_log, "Failed: {}", err);
         log_causes(&root_log, err, false);
         std::process::exit(1);
