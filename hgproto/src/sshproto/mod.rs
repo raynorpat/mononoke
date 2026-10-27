@@ -10,7 +10,7 @@
 //! https://www.mercurial-scm.org/wiki/WireProtocol though they're scant on detail.
 //!
 //! The encoding is:
-//! ```
+//! ```text
 //! command := <command> '\n' <key-value>{N}
 //! key-value := star | kv
 //! star := '*' ' ' <count> kv{count}
@@ -25,7 +25,7 @@
 //! list := (<hash> ' ')* <item>
 //!
 //! Responses to commands are always:
-//! ```
+//! ```text
 //! <numbytes> '\n'
 //! <byte>{numbytes}
 //! ```
@@ -33,24 +33,22 @@
 //! Each command has its own encoding of the response.
 
 use bytes::BytesMut;
-use tokio_io::codec::{Decoder, Encoder};
+use tokio_util::codec::{Decoder, Encoder};
 
-use {Request, Response};
-use errors::*;
+use crate::errors::{Error, Result};
+use crate::{Request, Response};
 
 pub mod request;
 pub mod response;
 
-
 pub struct HgSshCommandEncode;
 pub struct HgSshCommandDecode;
 
-impl Encoder for HgSshCommandEncode {
-    type Item = Response;
+impl Encoder<Response> for HgSshCommandEncode {
     type Error = Error;
 
-    fn encode(&mut self, v: Response, out: &mut BytesMut) -> Result<()> {
-        response::encode(&v, out);
+    fn encode(&mut self, item: Response, dst: &mut BytesMut) -> Result<()> {
+        response::encode(&item, dst);
         Ok(())
     }
 }
@@ -59,7 +57,7 @@ impl Decoder for HgSshCommandDecode {
     type Item = Request;
     type Error = Error;
 
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Request>> {
-        request::parse(buf)
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Request>> {
+        request::parse(src)
     }
 }

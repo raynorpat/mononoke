@@ -4,13 +4,13 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use std::io::{self, Write};
 use std::fmt::Display;
+use std::io::{self, Write};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-use batch;
-use Response;
+use crate::batch;
+use crate::Response;
 
 fn separated<I, W>(write: &mut W, iter: I, sep: &str) -> io::Result<()>
 where
@@ -37,7 +37,7 @@ pub fn encode(response: &Response, out: &mut BytesMut) {
     let res = encode_cmd(response);
     out.reserve(10 + res.len());
     if !response.is_stream() {
-        out.put_slice(format!("{}\n", res.len()).as_bytes());
+        out.extend_from_slice(format!("{}\n", res.len()).as_bytes());
     }
     out.put(res);
 }
@@ -45,15 +45,13 @@ pub fn encode(response: &Response, out: &mut BytesMut) {
 /// Encode the result of an individual command completion. This is used by both
 /// encode and batch encoding.
 pub fn encode_cmd(response: &Response) -> Bytes {
-    use Response::*;
-
     match response {
-        &Batch(ref results) => {
+        Response::Batch(results) => {
             let escaped_results: Vec<_> = results.iter().map(batch::escape).collect();
-            Bytes::from(escaped_results.join(&b';'))
+            Bytes::from(escaped_results.join(&b";"[..]))
         }
 
-        &Hello(ref map) => {
+        Response::Hello(map) => {
             let mut out = Vec::new();
 
             for (k, caps) in map.iter() {
@@ -63,7 +61,7 @@ pub fn encode_cmd(response: &Response) -> Bytes {
             Bytes::from(out)
         }
 
-        &Between(ref vecs) => {
+        Response::Between(vecs) => {
             let mut out = Vec::new();
 
             for v in vecs {
@@ -73,9 +71,9 @@ pub fn encode_cmd(response: &Response) -> Bytes {
             Bytes::from(out)
         }
 
-        &Debugwireargs(ref res) => res.clone(),
+        Response::Debugwireargs(res) | Response::Getbundle(res) => res.clone(),
 
-        &Heads(ref set) => {
+        Response::Heads(set) => {
             let mut out = Vec::new();
 
             separated(&mut out, set, " ").expect("write to vec failed");
@@ -83,7 +81,7 @@ pub fn encode_cmd(response: &Response) -> Bytes {
             Bytes::from(out)
         }
 
-        &Known(ref knowns) => {
+        Response::Known(knowns) => {
             let out: Vec<_> = knowns
                 .iter()
                 .map(|known| if *known { b'1' } else { b'0' })
@@ -92,8 +90,6 @@ pub fn encode_cmd(response: &Response) -> Bytes {
             Bytes::from(out)
         }
 
-        &Getbundle(ref res) => res.clone(),
-
-        r => panic!("Response for {:?} unimplemented", r),
+        other => panic!("Response for {:?} unimplemented", other),
     }
 }

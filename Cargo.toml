@@ -10,4 +10,5 @@ members = [
     "sshrelay",
     "mercurial",
     "mercurial-bundles",
+    "hgproto",
 ]

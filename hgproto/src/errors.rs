@@ -6,45 +6,99 @@
 
 use std::io;
 
-use mercurial;
-use mercurial_bundles;
+use thiserror::Error;
 
-#[recursion_limit = "1024"]
-error_chain! {
-    errors {
-        Unimplemented(op: String) {
-            description("unimplemented operation")
-            display("unimplemented operation '{}'", op)
-        }
-        CommandParse(buf: Vec<u8>) {
-            description("command parse failed")
-            display("command parse failed for \"{}\"", String::from_utf8_lossy(&buf))
-        }
-        BatchInvalid(bs: Vec<u8>) {
-            description("malformed batch command")
-            display("malformed batch command '{}'", String::from_utf8_lossy(&bs))
-        }
-        BatchEscape(ch: u8) {
-            description("unknown escape character in batch command")
-            display("unknown escape character in batch command '{}'", ch)
+#[macro_export]
+macro_rules! bail {
+    ($e:expr) => {
+        return Err($crate::Error::from($e))
+    };
+    ($fmt:expr, $($arg:tt)+) => {
+        return Err($crate::Error::from(format!($fmt, $($arg)+)))
+    };
+}
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("{0}")]
+    Msg(String),
+    #[error("unimplemented operation '{0}'")]
+    Unimplemented(String),
+    #[error("command parse failed for \"{0}\"")]
+    CommandParse(String),
+    #[error("malformed batch command '{0}'")]
+    BatchInvalid(String),
+    #[error("unknown escape character in batch command '{0}'")]
+    BatchEscape(u8),
+    #[error("{context}")]
+    WithChain {
+        context: Box<Error>,
+        #[source]
+        cause: Box<Error>,
+    },
+    #[error(transparent)]
+    Mercurial(#[from] mercurial::Error),
+    #[error(transparent)]
+    MercurialBundles(#[from] mercurial_bundles::Error),
+    #[error(transparent)]
+    Fmt(#[from] std::fmt::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Utf8(#[from] std::str::Utf8Error),
+}
+
+pub type ErrorKind = Error;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    pub fn with_chain<E, C>(error: E, context: C) -> Self
+    where
+        E: Into<Error>,
+        C: Into<Error>,
+    {
+        Error::WithChain {
+            context: Box::new(context.into()),
+            cause: Box::new(error.into()),
         }
     }
+}
 
-    links {
-        Mercurial(mercurial::Error, mercurial::ErrorKind);
-        MercurialBundles(mercurial_bundles::Error, mercurial_bundles::ErrorKind);
+impl From<&str> for Error {
+    fn from(msg: &str) -> Self {
+        Error::Msg(msg.to_owned())
     }
+}
 
-    foreign_links {
-        Fmt(::std::fmt::Error);
-        Io(::std::io::Error);
-        Utf8(::std::str::Utf8Error);
-        SendError(::futures::sync::mpsc::SendError<Vec<u8>>);
+impl From<String> for Error {
+    fn from(msg: String) -> Self {
+        Error::Msg(msg)
     }
 }
 
 impl From<Error> for io::Error {
-    fn from(e: Error) -> Self {
-        io::Error::new(io::ErrorKind::Other, format!("Error: {}", e))
+    fn from(err: Error) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, format!("Error: {}", err))
+    }
+}
+
+pub trait ResultExt<T> {
+    fn chain_err<F, D>(self, op: F) -> Result<T>
+    where
+        F: FnOnce() -> D,
+        D: Into<Error>;
+}
+
+impl<T, E> ResultExt<T> for std::result::Result<T, E>
+where
+    E: Into<Error>,
+{
+    fn chain_err<F, D>(self, op: F) -> Result<T>
+    where
+        F: FnOnce() -> D,
+        D: Into<Error>,
+    {
+        self.map_err(|err| Error::with_chain(err, op()))
     }
 }

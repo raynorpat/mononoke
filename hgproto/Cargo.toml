@@ -1,0 +1,20 @@
+[package]
+name = "hgproto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1"
+futures = "0.3"
+futures-ext = { path = "../futures-ext" }
+mercurial = { path = "../mercurial" }
+mercurial-bundles = { path = "../mercurial-bundles" }
+mercurial-types = { path = "../mercurial-types" }
+slog = "2"
+sshrelay = { path = "../sshrelay" }
+thiserror = "2"
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[dev-dependencies]
+maplit = "1"
+quickcheck = "1"

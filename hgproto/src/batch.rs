@@ -11,7 +11,7 @@
 
 use bytes::Bytes;
 
-use errors::*;
+use crate::errors::{Error, Result};
 
 /// Unescape a batch-escaped argument key or value.
 pub fn unescape(bs: &[u8]) -> Result<Vec<u8>> {
@@ -20,14 +20,16 @@ pub fn unescape(bs: &[u8]) -> Result<Vec<u8>> {
         if idx > 0 {
             // "::" or ":<end of string>" are both illegal.
             if slice.is_empty() {
-                bail!(ErrorKind::BatchInvalid(bs.to_vec()));
+                crate::bail!(Error::BatchInvalid(
+                    String::from_utf8_lossy(bs).into_owned()
+                ));
             }
             out.push(match slice[0] {
                 b'c' => b':',
                 b'o' => b',',
                 b's' => b';',
                 b'e' => b'=',
-                ch => bail!(ErrorKind::BatchEscape(ch)),
+                ch => crate::bail!(Error::BatchEscape(ch)),
             });
             out.extend_from_slice(&slice[1..]);
         } else {
@@ -40,7 +42,7 @@ pub fn unescape(bs: &[u8]) -> Result<Vec<u8>> {
 /// Escape a batch result.
 pub fn escape(res: &Bytes) -> Vec<u8> {
     let mut out = Vec::with_capacity(res.len());
-    for b in res {
+    for &b in res {
         match b {
             b':' => out.extend_from_slice(b":c"),
             b',' => out.extend_from_slice(b":o"),
@@ -54,7 +56,7 @@ pub fn escape(res: &Bytes) -> Vec<u8> {
 
 #[cfg(test)]
 mod test {
-    use quickcheck::TestResult;
+    use quickcheck::{quickcheck, TestResult};
 
     use super::*;
 

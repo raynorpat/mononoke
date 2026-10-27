@@ -6,23 +6,21 @@
 
 //! Mercurial protocol service framework
 //!
-//! To implement a Mercurial service, implement `HgCommands` and then use it to handle incominng
+//! To implement a Mercurial service, implement `HgCommands` and then use it to handle incoming
 //! connections.
 use std::collections::{HashMap, HashSet};
 
-use slog::Logger;
-
 use bytes::{Bytes, BytesMut};
-use tokio_service::Service;
-use futures::stream::{BoxStream, Stream};
-use futures::future::{self, BoxFuture, Future};
+use futures::future::{self, FutureExt};
+use futures::TryStreamExt;
+use slog::{debug, info, o, Logger};
 
 use futures_ext::futures_ordered;
 use mercurial_types::NodeHash;
 
-use errors::*;
-use {BranchRes, GetbundleArgs, Request, Response};
-use sshproto;
+use crate::errors::Error;
+use crate::sshproto;
+use crate::{BranchRes, GetbundleArgs, Request, Response};
 
 pub struct HgService<H> {
     commands: H,
@@ -44,149 +42,57 @@ impl<H: HgCommands> HgService<H> {
         }
     }
 
-    pub fn command(&self, req: Request) -> BoxFuture<Response, Error>
-    where
-        H: HgCommands,
-    {
-        if let Some(ref logger) = self.logger {
-            match &req {
-                &Request::Batch { .. } => (),
-                req => debug!(logger, "Got request: {:?}", req),
+    pub fn call(&self, req: Request) -> HgCommandRes<Response> {
+        self.command(req)
+    }
+
+    pub fn command(&self, req: Request) -> HgCommandRes<Response> {
+        if let Some(logger) = &self.logger {
+            if !matches!(req, Request::Batch { .. }) {
+                debug!(logger, "Got request: {:?}", req);
             }
         }
         let hgcmds = &self.commands;
 
         match req {
-            Request::Batch { cmds } => {
-                self.batch(cmds)
-                    .map(Response::Batch)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            Request::Between { pairs } => {
-                hgcmds
-                    .between(pairs)
-                    .map(Response::Between)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            Request::Branchmap => {
-                hgcmds
-                    .branchmap()
-                    .map(Response::Branchmap)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            Request::Branches { nodes } => {
-                hgcmds
-                    .branches(nodes)
-                    .map(Response::Branches)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            Request::Clonebundles => {
-                hgcmds
-                    .clonebundles()
-                    .map(Response::Clonebundles)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            Request::Capabilities => {
-                hgcmds
-                    .capabilities()
-                    .map(Response::Capabilities)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
+            Request::Batch { cmds } => map_cmd(self.batch(cmds), Response::Batch),
+            Request::Between { pairs } => map_cmd(hgcmds.between(pairs), Response::Between),
+            Request::Branchmap => map_cmd(hgcmds.branchmap(), Response::Branchmap),
+            Request::Branches { nodes } => map_cmd(hgcmds.branches(nodes), Response::Branches),
+            Request::Clonebundles => map_cmd(hgcmds.clonebundles(), Response::Clonebundles),
+            Request::Capabilities => map_cmd(hgcmds.capabilities(), Response::Capabilities),
             Request::Changegroup { roots } => {
-                hgcmds
-                    .changegroup(roots)
-                    .map(|_| Response::Changegroup)
-                    .map_err(self::Error::into)
-                    .boxed()
+                map_cmd(hgcmds.changegroup(roots), |_| Response::Changegroup)
             }
             Request::Changegroupsubset { bases, heads } => {
-                hgcmds
-                    .changegroupsubset(bases, heads)
-                    .map(|_| Response::Changegroupsubset)
-                    .map_err(self::Error::into)
-                    .boxed()
+                map_cmd(hgcmds.changegroupsubset(bases, heads), |_| {
+                    Response::Changegroupsubset
+                })
             }
-            Request::Debugwireargs { one, two, all_args } => {
-                self.debugwireargs(one, two, all_args)
-                    .map(Response::Debugwireargs)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            Request::Getbundle(args) => {
-                hgcmds
-                    .getbundle(args)
-                    .map(Response::Getbundle)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            Request::Heads => {
-                hgcmds
-                    .heads()
-                    .map(Response::Heads)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            Request::Hello => {
-                hgcmds
-                    .hello()
-                    .map(Response::Hello)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
+            Request::Debugwireargs { one, two, all_args } => map_cmd(
+                self.debugwireargs(one, two, all_args),
+                Response::Debugwireargs,
+            ),
+            Request::Getbundle(args) => map_cmd(hgcmds.getbundle(args), Response::Getbundle),
+            Request::Heads => map_cmd(hgcmds.heads(), Response::Heads),
+            Request::Hello => map_cmd(hgcmds.hello(), Response::Hello),
             Request::Listkeys { namespace } => {
-                hgcmds
-                    .listkeys(namespace)
-                    .map(Response::Listkeys)
-                    .map_err(self::Error::into)
-                    .boxed()
+                map_cmd(hgcmds.listkeys(namespace), Response::Listkeys)
             }
-            Request::Lookup { key } => {
-                hgcmds
-                    .lookup(key)
-                    .map(Response::Lookup)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            Request::Known { nodes } => {
-                hgcmds
-                    .known(nodes)
-                    .map(Response::Known)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
+            Request::Lookup { key } => map_cmd(hgcmds.lookup(key), Response::Lookup),
+            Request::Known { nodes } => map_cmd(hgcmds.known(nodes), Response::Known),
             Request::Pushkey {
                 namespace,
                 key,
                 old,
                 new,
-            } => {
-                hgcmds
-                    .pushkey(namespace, key, old, new)
-                    .map(|_| Response::Pushkey)
-                    .map_err(self::Error::into)
-                    .boxed()
+            } => map_cmd(hgcmds.pushkey(namespace, key, old, new), |_| {
+                Response::Pushkey
+            }),
+            Request::Streamout => map_cmd(hgcmds.stream_out(), |_| Response::Streamout),
+            Request::Unbundle { heads, bundle } => {
+                map_cmd(hgcmds.unbundle(heads, bundle), |_| Response::Unbundle)
             }
-            Request::Streamout => {
-                hgcmds
-                    .stream_out()
-                    .map(|_| Response::Streamout)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            Request::Unbundle { heads } => {
-                hgcmds
-                    .unbundle(heads)
-                    .map(|_| Response::Unbundle)
-                    .map_err(self::Error::into)
-                    .boxed()
-            }
-            //_ => unimplemented!()
         }
     }
 
@@ -203,16 +109,21 @@ impl<H: HgCommands> HgService<H> {
             // separate ssh-specific and general wireproto command parsers, but
             // we want to rewrite it soon anyway so it's not really worth doing
             // at the moment.
-            let mut full_cmd = BytesMut::from([cmd.0, cmd.1].join(&b'\n'));
+            let mut full_cmd = BytesMut::with_capacity(cmd.0.len() + 1 + cmd.1.len());
+            full_cmd.extend_from_slice(&cmd.0);
+            full_cmd.extend_from_slice(b"\n");
+            full_cmd.extend_from_slice(&cmd.1);
             let parsed = match sshproto::request::parse_batch(&mut full_cmd) {
                 // TODO: collect all parsing errors, not just the first one?
-                Err(err) => return future::err(err).boxed(),
+                Err(err) => return box_ready(Err(err)),
                 Ok(None) => {
-                    return future::err(ErrorKind::BatchInvalid(full_cmd.to_vec()).into()).boxed();
+                    return box_ready(Err(Error::BatchInvalid(
+                        String::from_utf8_lossy(&full_cmd).into_owned(),
+                    )));
                 }
                 Ok(Some(cmd)) => cmd,
             };
-            if let Some(ref logger) = self.logger {
+            if let Some(logger) = &self.logger {
                 info!(logger, "batch command: {:?}", parsed);
             }
             parsed_cmds.push(parsed);
@@ -226,10 +137,12 @@ impl<H: HgCommands> HgService<H> {
             .map(|cmd| self.command(cmd))
             .collect();
 
-        let encoded_futures = response_futures
-            .into_iter()
-            .map(|cmd| cmd.map(|res| sshproto::response::encode_cmd(&res)));
-        futures_ordered(encoded_futures).collect().boxed()
+        let encoded_futures = response_futures.into_iter().map(|cmd| {
+            cmd.map(|res| res.map(|response| sshproto::response::encode_cmd(&response)))
+        });
+        futures_ordered(encoded_futures)
+            .try_collect::<Vec<Bytes>>()
+            .boxed()
     }
 
     // @wireprotocommand('debugwireargs', 'one two *')
@@ -246,15 +159,15 @@ impl<H: HgCommands> HgService<H> {
         out.push(b' ');
         out.extend_from_slice(&two[..]);
         out.push(b' ');
-        out.extend_from_slice(get_or_none(&all_args, &b"three"[..]));
+        out.extend_from_slice(get_or_none(&all_args, b"three"));
         out.push(b' ');
-        out.extend_from_slice(get_or_none(&all_args, &b"four"[..]));
+        out.extend_from_slice(get_or_none(&all_args, b"four"));
         out.push(b' ');
         // Note that "five" isn't actually read off the wire -- instead, the
         // default value "None" is used.
         out.extend_from_slice(NONE);
 
-        future::ok(out.into()).boxed()
+        box_ready(Ok(out.into()))
     }
 }
 
@@ -263,23 +176,21 @@ const NONE: &[u8] = b"None";
 #[inline]
 fn get_or_none<'a>(map: &'a HashMap<Vec<u8>, Vec<u8>>, key: &'a [u8]) -> &'a [u8] {
     match map.get(key) {
-        Some(ref val) => val,
-        None => &NONE,
+        Some(val) => val,
+        None => NONE,
     }
 }
 
-impl<H> Service for HgService<H>
+fn map_cmd<T, F>(fut: HgCommandRes<T>, f: F) -> HgCommandRes<Response>
 where
-    H: HgCommands,
+    T: Send + 'static,
+    F: FnOnce(T) -> Response + Send + 'static,
 {
-    type Request = Request;
-    type Response = Response;
-    type Error = Error;
-    type Future = BoxFuture<Response, Self::Error>;
+    fut.map(move |res| res.map(f)).boxed()
+}
 
-    fn call(&self, req: Request) -> Self::Future {
-        self.command(req)
-    }
+fn box_ready<T: Send + 'static>(res: Result<T, Error>) -> HgCommandRes<T> {
+    future::ready(res).boxed()
 }
 
 #[inline]
@@ -288,11 +199,11 @@ where
     S: Into<String>,
     T: Send + 'static,
 {
-    future::err(ErrorKind::Unimplemented(op.into()).into()).boxed()
+    box_ready(Err(Error::Unimplemented(op.into())))
 }
 
-// Async response from an Hg command
-pub type HgCommandRes<T> = BoxFuture<T, Error>;
+// Async response from an Hg command.
+pub type HgCommandRes<T> = futures::future::BoxFuture<'static, Result<T, Error>>;
 
 // Trait representing Mercurial protocol operations, generic across protocols
 // Derived from hg/mercurial/wireprotocol.py, functions with the `@wireprotocommand`
@@ -381,24 +292,29 @@ pub trait HgCommands {
     }
 
     // @wireprotocommand('stream_out')
-    fn stream_out(&self) -> HgCommandRes<BoxStream<Vec<u8>, Error>> {
+    fn stream_out(
+        &self,
+    ) -> HgCommandRes<futures::stream::BoxStream<'static, std::result::Result<Vec<u8>, Error>>>
+    {
         // XXX raw streaming?
         unimplemented("stream_out")
     }
 
     // @wireprotocommand('unbundle', 'heads')
-    fn unbundle(
-        &self,
-        _heads: Vec<NodeHash>, /* , _stream: BoxStream<Vec<u8>, Error> */
-    ) -> HgCommandRes<()> {
+    fn unbundle(&self, _heads: Vec<NodeHash>, _bundle: Bytes) -> HgCommandRes<Bytes> {
         unimplemented("unbundle")
     }
 }
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
+
+    use futures::executor::block_on;
+    use futures::future::FutureExt;
+
     use super::*;
-    use futures::future;
+    use crate::{Request, Response};
 
     struct Dummy;
     impl HgCommands for Dummy {
@@ -406,7 +322,7 @@ mod test {
             let mut res = HashMap::new();
             res.insert("capabilities".into(), vec!["something".into()]);
 
-            future::ok(res).boxed()
+            future::ready(Ok(res)).boxed()
         }
     }
 
@@ -414,7 +330,7 @@ mod test {
     fn hello() {
         let service = HgService::new(Dummy);
 
-        let r = service.call(Request::Hello).wait();
+        let r = block_on(service.call(Request::Hello));
         println!("hello r = {:?}", r);
         let mut res: HashMap<String, Vec<String>> = HashMap::new();
         res.insert("capabilities".into(), vec!["something".into()]);
@@ -429,11 +345,18 @@ mod test {
     fn unimpl() {
         let service = HgService::new(Dummy);
 
-        let r = service.call(Request::Heads).wait();
+        let r = block_on(service.call(Request::Heads));
         println!("heads r = {:?}", r);
 
         match r {
-            Err(ref err) => println!("got expected error {:?}", err),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("heads"),
+                    "error display should name the command, got {}",
+                    msg
+                );
+            }
             bad => panic!("Bad result {:?}", bad),
         }
     }
