@@ -6,6 +6,7 @@
 
 #![deny(warnings)]
 
+pub mod bundle;
 pub mod errors;
 pub mod listener;
 pub mod repo;

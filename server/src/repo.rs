@@ -22,10 +22,12 @@ use futures::future::BoxFuture;
 use futures::{future, stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use hgproto::{self, GetbundleArgs, HgCommandRes, HgCommands};
 use mercurial::changeset::RevlogChangeset;
+use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{parts, Bundle2EncodeBuilder};
 use mercurial_types::{percent_encode, Changeset, NodeHash, Parents, NULL_HASH};
 use slog::{info, o, Logger};
 
+use crate::bundle::history_part;
 use crate::errors::Result;
 
 pub struct Repo {
@@ -99,6 +101,41 @@ impl RepoClient {
     }
 }
 
+fn listkeys_requested(args: &GetbundleArgs, namespace: &[u8]) -> bool {
+    args.listkeys.iter().any(|key| key.as_slice() == namespace)
+}
+
+fn empty_listkeys_part(namespace: &str) -> hgproto::Result<PartEncodeBuilder> {
+    // A zero-length payload chunk ends the part. `listkey_part` on an empty
+    // map emits that chunk and then another terminator, which the client reads
+    // as the end of the bundle and drops every following part.
+    let mut part = PartEncodeBuilder::mandatory("listkeys")?;
+    part.add_mparam("namespace", namespace.to_owned())?;
+    Ok(part)
+}
+
+async fn bookmark_pairs(repo: &Repo) -> hgproto::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let bookmarks = repo.hgrepo.bookmarks()?;
+    let names: Vec<Vec<u8>> = bookmarks
+        .keys()
+        .map_err(|err| hgproto::Error::from(mercurial::Error::from(err)))
+        .try_collect()
+        .await?;
+    let mut pairs = Vec::new();
+    for name in names {
+        if let Some((hash, _version)) = bookmarks
+            .get(&name)
+            .await
+            .map_err(|err| hgproto::Error::from(mercurial::Error::from(err)))?
+        {
+            // AsciiString doesn't currently implement AsRef<[u8]>, so switch to Vec which does.
+            let hash = hash.to_hex().as_str().as_bytes().to_vec();
+            pairs.push((name, hash));
+        }
+    }
+    Ok(pairs)
+}
+
 async fn create_bundle(repo: &Repo, args: GetbundleArgs) -> hgproto::Result<Bytes> {
     let writer = Cursor::new(Vec::new());
     let mut bundle = Bundle2EncodeBuilder::new(writer);
@@ -106,32 +143,22 @@ async fn create_bundle(repo: &Repo, args: GetbundleArgs) -> hgproto::Result<Byte
     // whether it's a framing issue or something else.
     bundle.set_compressor_type(CompressorType::Uncompressed);
 
-    // Bookmark listkeys only. History in getbundle is a later task.
-    if args
-        .listkeys
-        .iter()
-        .any(|key| key.as_slice() == b"bookmarks")
-    {
-        let bookmarks = repo.hgrepo.bookmarks()?;
-        let names: Vec<Vec<u8>> = bookmarks
-            .keys()
-            .map_err(|err| hgproto::Error::from(mercurial::Error::from(err)))
-            .try_collect()
-            .await?;
-        let mut pairs = Vec::new();
-        for name in names {
-            if let Some((hash, _version)) = bookmarks
-                .get(&name)
-                .await
-                .map_err(|err| hgproto::Error::from(mercurial::Error::from(err)))?
-            {
-                // AsciiString doesn't currently implement AsRef<[u8]>, so switch to Vec which does.
-                let hash = hash.to_hex().as_str().as_bytes().to_vec();
-                pairs.push((name, hash));
-            }
+    let history = history_part(&repo.hgrepo, &args.common)
+        .map_err(|err| hgproto::Error::from(err.to_string()))?;
+    bundle.add_part(history);
+
+    if listkeys_requested(&args, b"phases") {
+        bundle.add_part(empty_listkeys_part("phases")?);
+    }
+
+    if listkeys_requested(&args, b"bookmarks") {
+        let pairs = bookmark_pairs(repo).await?;
+        if pairs.is_empty() {
+            bundle.add_part(empty_listkeys_part("bookmarks")?);
+        } else {
+            let items = stream::iter(pairs.into_iter().map(Ok::<_, std::io::Error>));
+            bundle.add_part(parts::listkey_part("bookmarks", items)?);
         }
-        let items = stream::iter(pairs.into_iter().map(Ok::<_, std::io::Error>));
-        bundle.add_part(parts::listkey_part("bookmarks", items)?);
     }
 
     let cursor = bundle.build().await?;
@@ -191,6 +218,24 @@ impl Stream for ParentStream {
 }
 
 impl HgCommands for RepoClient {
+    // @wireprotocommand('branchmap')
+    fn branchmap(&self) -> HgCommandRes<HashMap<String, HashSet<NodeHash>>> {
+        info!(self.logger, "branchmap");
+        let repo = Arc::clone(&self.repo);
+        async move {
+            let heads = repo
+                .hgrepo
+                .get_heads()
+                .map_err(hgproto::Error::from)
+                .try_collect::<HashSet<_>>()
+                .await?;
+            let mut map = HashMap::new();
+            map.insert("default".to_string(), heads);
+            Ok(map)
+        }
+        .boxed()
+    }
+
     // @wireprotocommand('between', 'pairs')
     fn between(&self, pairs: Vec<(NodeHash, NodeHash)>) -> HgCommandRes<Vec<Vec<NodeHash>>> {
         info!(self.logger, "between pairs {:?}", pairs);
@@ -233,6 +278,20 @@ impl HgCommands for RepoClient {
                 .try_collect::<Vec<_>>()
                 .await?;
             Ok(heads.into_iter().collect())
+        }
+        .boxed()
+    }
+
+    // @wireprotocommand('listkeys', 'namespace')
+    fn listkeys(&self, namespace: String) -> HgCommandRes<HashMap<Vec<u8>, Vec<u8>>> {
+        info!(self.logger, "listkeys {}", namespace);
+        let repo = Arc::clone(&self.repo);
+        async move {
+            match namespace.as_str() {
+                "phases" => Ok(HashMap::new()),
+                "bookmarks" => Ok(bookmark_pairs(&repo).await?.into_iter().collect()),
+                _ => Ok(HashMap::new()),
+            }
         }
         .boxed()
     }
