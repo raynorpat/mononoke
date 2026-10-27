@@ -8,19 +8,15 @@
 
 use std::fmt::{self, Display};
 use std::str::FromStr;
-use std::result;
 
 use ascii::{AsciiStr, AsciiString};
-use quickcheck::{Arbitrary, Gen, single_shrinker};
 
-use errors::*;
-use hash::{self, Sha1};
-use serde;
+use crate::errors::Result;
+use crate::hash::{self, Sha1};
 
 pub const NULL_HASH: NodeHash = NodeHash(hash::NULL);
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
-#[derive(HeapSizeOf)]
 pub struct NodeHash(Sha1);
 
 impl NodeHash {
@@ -47,7 +43,6 @@ impl NodeHash {
     }
 }
 
-
 struct StringVisitor;
 
 impl<'de> serde::de::Visitor<'de> for StringVisitor {
@@ -57,14 +52,14 @@ impl<'de> serde::de::Visitor<'de> for StringVisitor {
         formatter.write_str("40 hex digits")
     }
 
-    fn visit_str<E>(self, value: &str) -> ::std::result::Result<Self::Value, E>
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
         Ok(value.to_string())
     }
 
-    fn visit_string<E>(self, value: String) -> ::std::result::Result<Self::Value, E>
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
@@ -73,7 +68,7 @@ impl<'de> serde::de::Visitor<'de> for StringVisitor {
 }
 
 impl serde::ser::Serialize for NodeHash {
-    fn serialize<S>(&self, serializer: S) -> ::std::result::Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -82,7 +77,7 @@ impl serde::ser::Serialize for NodeHash {
 }
 
 impl<'de> serde::de::Deserialize<'de> for NodeHash {
-    fn deserialize<D>(deserializer: D) -> ::std::result::Result<NodeHash, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<NodeHash, D::Error>
     where
         D: serde::de::Deserializer<'de>,
     {
@@ -100,8 +95,8 @@ impl From<Sha1> for NodeHash {
     }
 }
 
-impl<'a> From<&'a Sha1> for NodeHash {
-    fn from(h: &'a Sha1) -> NodeHash {
+impl From<&Sha1> for NodeHash {
+    fn from(h: &Sha1) -> NodeHash {
         NodeHash(*h)
     }
 }
@@ -115,7 +110,7 @@ impl AsRef<[u8]> for NodeHash {
 impl FromStr for NodeHash {
     type Err = <Sha1 as FromStr>::Err;
 
-    fn from_str(s: &str) -> result::Result<NodeHash, Self::Err> {
+    fn from_str(s: &str) -> Result<NodeHash> {
         Sha1::from_str(s).map(NodeHash)
     }
 }
@@ -126,12 +121,19 @@ impl Display for NodeHash {
     }
 }
 
-impl Arbitrary for NodeHash {
-    fn arbitrary<G: Gen>(g: &mut G) -> Self {
-        NodeHash(Sha1::arbitrary(g))
-    }
+#[cfg(test)]
+mod arbitrary_impl {
+    use super::{NULL_HASH, NodeHash};
+    use crate::hash::Sha1;
+    use quickcheck::{Arbitrary, Gen, single_shrinker};
 
-    fn shrink(&self) -> Box<Iterator<Item = Self>> {
-        single_shrinker(NULL_HASH)
+    impl Arbitrary for NodeHash {
+        fn arbitrary(g: &mut Gen) -> Self {
+            NodeHash(Sha1::arbitrary(g))
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            single_shrinker(NULL_HASH)
+        }
     }
 }

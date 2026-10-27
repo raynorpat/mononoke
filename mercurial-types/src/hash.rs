@@ -8,11 +8,10 @@ use std::fmt::{self, Debug, Display};
 use std::str::FromStr;
 
 use ascii::{AsciiStr, AsciiString};
-use quickcheck::{Arbitrary, Gen, single_shrinker};
-use rust_crypto::digest::Digest;
-use rust_crypto::sha1;
+use serde::{Deserialize, Serialize};
+use sha1::Digest;
 
-use errors::*;
+use crate::errors::{Error, Result};
 
 pub const NULL: Sha1 = Sha1([0; 20]);
 
@@ -20,8 +19,7 @@ pub const NULL: Sha1 = Sha1([0; 20]);
 ///
 /// Mercurial bases all its hashing on SHA-1, but this type is only used to build
 /// more specific typed hashes.
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
-#[derive(Serialize, Deserialize, HeapSizeOf)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct Sha1([u8; 20]);
 
 const HEX_CHARS: &[u8] = b"0123456789abcdef";
@@ -32,12 +30,11 @@ impl Sha1 {
     pub fn from_bytes<B: AsRef<[u8]>>(bytes: B) -> Result<Sha1> {
         let bytes = bytes.as_ref();
         if bytes.len() != 20 {
-            bail!(ErrorKind::InvalidSha1Input("need exactly 20 bytes".into()));
-        } else {
-            let mut ret = Sha1([0; 20]);
-            &mut ret.0[..].copy_from_slice(bytes);
-            Ok(ret)
+            return Err(Error::InvalidSha1Input("need exactly 20 bytes".into()));
         }
+        let mut ret = Sha1([0; 20]);
+        ret.0.copy_from_slice(bytes);
+        Ok(ret)
     }
 
     /// Construct a `Sha1` from a hex-encoded `AsciiStr`.
@@ -65,13 +62,11 @@ impl Sha1 {
 pub struct Context(sha1::Sha1);
 
 /// Compute the `Sha1` for a slice of bytes.
-impl<'a> From<&'a [u8]> for Sha1 {
+impl From<&[u8]> for Sha1 {
     fn from(data: &[u8]) -> Sha1 {
-        let mut sha1 = sha1::Sha1::new();
-        sha1.input(data);
-
+        let digest = sha1::Sha1::digest(data);
         let mut ret = NULL;
-        sha1.result(&mut ret.0[..]);
+        ret.0.copy_from_slice(&digest);
         ret
     }
 }
@@ -88,8 +83,8 @@ impl FromStr for Sha1 {
 
     fn from_str(s: &str) -> Result<Sha1> {
         if s.len() < 40 {
-            bail!(ErrorKind::InvalidSha1Input(
-                "need at least 40 hex digits".into()
+            return Err(Error::InvalidSha1Input(
+                "need at least 40 hex digits".into(),
             ));
         }
 
@@ -98,7 +93,7 @@ impl FromStr for Sha1 {
         for idx in 0..ret.0.len() {
             ret.0[idx] = match u8::from_str_radix(&s[(idx * 2)..(idx * 2 + 2)], 16) {
                 Ok(v) => v,
-                Err(_) => bail!(ErrorKind::InvalidSha1Input("bad digit".into())),
+                Err(_) => return Err(Error::InvalidSha1Input("bad digit".into())),
             }
         }
 
@@ -119,21 +114,6 @@ impl Debug for Sha1 {
     }
 }
 
-impl Arbitrary for Sha1 {
-    fn arbitrary<G: Gen>(g: &mut G) -> Self {
-        let mut bytes = [0; 20];
-        // The null hash is special, so give it a 5% chance of happening
-        if !g.gen_weighted_bool(20) {
-            g.fill_bytes(&mut bytes);
-        }
-        Sha1::from_bytes(&bytes).unwrap()
-    }
-
-    fn shrink(&self) -> Box<Iterator<Item = Self>> {
-        single_shrinker(NULL)
-    }
-}
-
 impl Context {
     /// Construct a `Context`
     pub fn new() -> Context {
@@ -145,22 +125,45 @@ impl Context {
     where
         T: AsRef<[u8]>,
     {
-        self.0.input(data.as_ref())
+        self.0.update(data.as_ref())
     }
 
-    pub fn finish(mut self) -> Sha1 {
+    pub fn finish(self) -> Sha1 {
+        let digest = self.0.finalize();
         let mut ret = NULL;
-        self.0.result(&mut ret.0[..]);
+        ret.0.copy_from_slice(&digest);
         ret
     }
 }
 
+#[cfg(test)]
+mod arbitrary_impl {
+    use super::Sha1;
+    use quickcheck::{Arbitrary, Gen, single_shrinker};
+
+    impl Arbitrary for Sha1 {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let mut bytes = [0; 20];
+            // The null hash is special, so give it a 5% chance of happening
+            if usize::arbitrary(g) % 20 != 0 {
+                for byte in &mut bytes {
+                    *byte = u8::arbitrary(g);
+                }
+            }
+            Sha1::from_bytes(&bytes).unwrap()
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            single_shrinker(super::NULL)
+        }
+    }
+}
 
 #[cfg(test)]
 mod test {
     use super::{NULL, Sha1};
-    use std::str::FromStr;
     use quickcheck::TestResult;
+    use std::str::FromStr;
 
     #[cfg_attr(rustfmt, rustfmt_skip)]
     const NILHASH: Sha1 = Sha1([0xda, 0x39, 0xa3, 0xee,
@@ -214,25 +217,29 @@ mod test {
             Ok(_) => panic!("unexpected OK - zero len"),
             Err(_) => (),
         };
-        match Sha1::from_str("da39a3ee5e6b4b0d3255bfef95601890afd8070") {    // one char missing
+        match Sha1::from_str("da39a3ee5e6b4b0d3255bfef95601890afd8070") {
+            // one char missing
             Ok(_) => panic!("unexpected OK - trunc"),
             Err(_) => (),
         };
-        match Sha1::from_str("xda39a3ee5e6b4b0d3255bfef95601890afd8070") {    // one char bad
+        match Sha1::from_str("xda39a3ee5e6b4b0d3255bfef95601890afd8070") {
+            // one char bad
             Ok(_) => panic!("unexpected OK - badchar end"),
             Err(_) => (),
         };
-        match Sha1::from_str("da39a3ee5e6b4b0d3255bfef95601890afd8070x") {    // one char bad
+        match Sha1::from_str("da39a3ee5e6b4b0d3255bfef95601890afd8070x") {
+            // one char bad
             Ok(_) => panic!("unexpected OK - badchar end"),
             Err(_) => (),
         };
-        match Sha1::from_str("da39a3ee5e6b4b0d325Xbfef95601890afd80709") {    // one char missing
+        match Sha1::from_str("da39a3ee5e6b4b0d325Xbfef95601890afd80709") {
+            // one char missing
             Ok(_) => panic!("unexpected OK - trunc"),
             Err(_) => (),
         };
     }
 
-    quickcheck! {
+    quickcheck::quickcheck! {
         fn parse_roundtrip(v: Vec<u8>) -> TestResult {
             if v.len() != 20 {
                 return TestResult::discard()

@@ -4,7 +4,8 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use futures::{Future, Stream};
+use futures::future::Future;
+use futures::stream::Stream;
 
 /// A general source control Node
 ///
@@ -15,8 +16,8 @@ pub trait Node: Sized {
     type Content;
     type Error;
 
-    type GetParents: Stream<Item = Self, Error = Self::Error>;
-    type GetContent: Future<Item = Self::Content, Error = Self::Error>;
+    type GetParents: Stream<Item = Result<Self, Self::Error>> + Send;
+    type GetContent: Future<Output = Result<Self::Content, Self::Error>> + Send;
 
     fn get_parents(&self) -> Self::GetParents;
     fn get_content(&self) -> Self::GetContent;

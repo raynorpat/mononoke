@@ -4,13 +4,13 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use hash::{self, Context};
-use nodehash::NodeHash;
+use serde::{Deserialize, Serialize};
 
-use blob::Blob;
+use crate::blob::Blob;
+use crate::hash::{self, Context};
+use crate::nodehash::NodeHash;
 
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
-#[derive(Serialize, Deserialize, HeapSizeOf)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash, Serialize, Deserialize)]
 pub enum Parents {
     None,
     One(NodeHash),
@@ -20,9 +20,9 @@ pub enum Parents {
 impl Parents {
     pub fn get_nodes(&self) -> (Option<&NodeHash>, Option<&NodeHash>) {
         match self {
-            &Parents::None => (None, None),
-            &Parents::One(ref p1) => (Some(p1), None),
-            &Parents::Two(ref p1, ref p2) => (Some(p1), Some(p2)),
+            Parents::None => (None, None),
+            Parents::One(p1) => (Some(p1), None),
+            Parents::Two(p1, p2) => (Some(p1), Some(p2)),
         }
     }
 }
@@ -51,8 +51,7 @@ impl Iterator for ParentIter {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
-#[derive(Serialize, Deserialize, HeapSizeOf)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Hash, Serialize, Deserialize)]
 pub struct BlobNode<T = Vec<u8>> {
     blob: Blob<T>,
     parents: Parents,
@@ -80,9 +79,9 @@ where
             (Some(p1), Some(p2)) => (Parents::Two(*p1, *p2), true),
         };
         BlobNode {
-            blob: blob,
+            blob,
             parents: p,
-            renamed: renamed,
+            renamed,
         }
     }
 
@@ -109,10 +108,10 @@ where
         let null = hash::NULL;
 
         let (h1, h2) = match &self.parents {
-            &Parents::None => (&null, &null),
-            &Parents::One(ref p1) => (&null, p1.sha1()),
-            &Parents::Two(ref p1, ref p2) if p1 > p2 => (p2.sha1(), p1.sha1()),
-            &Parents::Two(ref p1, ref p2) => (p1.sha1(), p2.sha1()),
+            Parents::None => (&null, &null),
+            Parents::One(p1) => (&null, p1.sha1()),
+            Parents::Two(p1, p2) if p1 > p2 => (p2.sha1(), p1.sha1()),
+            Parents::Two(p1, p2) => (p1.sha1(), p2.sha1()),
         };
 
         self.as_blob().as_slice().map(|data| {
@@ -129,8 +128,8 @@ where
 
 #[cfg(test)]
 mod test {
-    use blob::Blob;
     use super::*;
+    use crate::blob::Blob;
 
     #[test]
     fn test_node_none() {

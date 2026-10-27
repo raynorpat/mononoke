@@ -4,24 +4,22 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-#[recursion_limit = "1024"]
-error_chain! {
-    errors {
-        InvalidSha1Input(msg: String) {
-            description("invalid sha-1 input")
-            display("invalid sha-1 input: {}", msg)
-        }
-        InvalidPath(msg: String) {
-            description("invalid path")
-            display("invalid path: {}", msg)
-        }
-        InvalidFragmentList(msg: String) {
-            description("invalid fragment list")
-            display("invalid fragment list: {}", msg)
-        }
-    }
+use thiserror::Error;
 
-    foreign_links {
-        Utf8(::std::str::Utf8Error);
-    }
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("invalid sha-1 input: {0}")]
+    InvalidSha1Input(String),
+    #[error("invalid path: {0}")]
+    InvalidPath(String),
+    #[error("invalid fragment list: {0}")]
+    InvalidFragmentList(String),
+    #[error("invalid fragment: start {start} > end {end}")]
+    InvalidFragment { start: usize, end: usize },
+    #[error(transparent)]
+    Utf8(#[from] std::str::Utf8Error),
 }
+
+pub type ErrorKind = Error;
+
+pub type Result<T> = std::result::Result<T, Error>;

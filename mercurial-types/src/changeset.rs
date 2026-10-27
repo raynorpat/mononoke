@@ -7,14 +7,15 @@
 use std::collections::BTreeMap;
 use std::ops::Deref;
 
-use futures::future::{BoxFuture, Future};
-use futures::stream::{self, BoxStream, Stream};
+use futures::future::BoxFuture;
+use futures::future::TryFutureExt;
+use futures::stream::{self, BoxStream, StreamExt};
 
-use repo::Repo;
-use node::Node;
-use nodehash::NodeHash;
-use blobnode::Parents;
-use path::Path;
+use crate::blobnode::Parents;
+use crate::node::Node;
+use crate::nodehash::NodeHash;
+use crate::path::Path;
+use crate::repo::Repo;
 
 pub trait Changeset: Send + 'static {
     fn manifestid(&self) -> &NodeHash;
@@ -25,7 +26,7 @@ pub trait Changeset: Send + 'static {
     fn time(&self) -> &Time;
     fn parents(&self) -> &Parents;
 
-    fn boxed(self) -> Box<Changeset>
+    fn boxed(self) -> Box<dyn Changeset>
     where
         Self: Sized,
     {
@@ -33,7 +34,7 @@ pub trait Changeset: Send + 'static {
     }
 }
 
-impl Changeset for Box<Changeset> {
+impl Changeset for Box<dyn Changeset> {
     fn manifestid(&self) -> &NodeHash {
         (**self).manifestid()
     }
@@ -103,24 +104,27 @@ impl<R> Node for RepoChangeset<R>
 where
     R: Repo + Clone + Send,
 {
-    type Content = Box<Changeset>;
+    type Content = Box<dyn Changeset>;
     type Error = R::Error;
 
-    type GetParents = BoxStream<Self, Self::Error>;
-    type GetContent = BoxFuture<Self::Content, Self::Error>;
+    type GetParents = BoxStream<'static, Result<Self, Self::Error>>;
+    type GetContent = BoxFuture<'static, Result<Self::Content, Self::Error>>;
 
     fn get_parents(&self) -> Self::GetParents {
-        self.repo.get_changeset_by_nodeid(&self.csid) // Future<Changeset>
-            .map(|cs| stream::iter(cs.parents().into_iter().map(|p| Ok(p)))) // Future<Stream<>>
-            .flatten_stream() // Stream<NodeHash>
-            .map({
-                let repo = self.repo.clone();
-                move |p| Self::new(repo.clone(), p)
-            }) // Stream<Self>
+        let repo = self.repo.clone();
+        self.repo
+            .get_changeset_by_nodeid(&self.csid)
+            .map_ok(move |cs| {
+                let parents: Vec<_> = cs.parents().into_iter().collect();
+                stream::iter(parents.into_iter().map(move |parent| {
+                    Ok(Self::new(repo.clone(), parent))
+                }))
+            })
+            .try_flatten_stream()
             .boxed()
     }
 
     fn get_content(&self) -> Self::GetContent {
-        self.repo.get_changeset_by_nodeid(&self.csid).boxed()
+        self.repo.get_changeset_by_nodeid(&self.csid)
     }
 }

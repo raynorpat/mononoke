@@ -6,13 +6,13 @@
 
 use std::fmt::{self, Display};
 
-use futures::BoxFuture;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 
-use blob::Blob;
-use blobnode::Parents;
-use path::Path;
-use nodehash::NodeHash;
+use crate::blob::Blob;
+use crate::blobnode::Parents;
+use crate::nodehash::NodeHash;
+use crate::path::Path;
 
 /// Interface for a manifest
 pub trait Manifest: Send + 'static {
@@ -21,10 +21,10 @@ pub trait Manifest: Send + 'static {
     fn lookup(
         &self,
         path: &Path,
-    ) -> BoxFuture<Option<Box<Entry<Error = Self::Error>>>, Self::Error>;
-    fn list(&self) -> BoxStream<Box<Entry<Error = Self::Error>>, Self::Error>;
+    ) -> BoxFuture<'static, Result<Option<Box<dyn Entry<Error = Self::Error>>>, Self::Error>>;
+    fn list(&self) -> BoxStream<'static, Result<Box<dyn Entry<Error = Self::Error>>, Self::Error>>;
 
-    fn boxed(self) -> Box<Manifest<Error = Self::Error>>
+    fn boxed(self) -> Box<dyn Manifest<Error = Self::Error>>
     where
         Self: Sized,
     {
@@ -41,22 +41,22 @@ pub enum Type {
 }
 
 pub enum Content<E> {
-    File(Blob<Vec<u8>>), // TODO stream
-    Executable(Blob<Vec<u8>>), // TODO stream
+    File(Blob<Vec<u8>>),
+    Executable(Blob<Vec<u8>>),
     Symlink(Path),
-    Tree(Box<Manifest<Error = E>>),
+    Tree(Box<dyn Manifest<Error = E>>),
 }
 
 pub trait Entry: Send + 'static {
     type Error: Send + 'static;
 
     fn get_type(&self) -> Type;
-    fn get_parents(&self) -> BoxFuture<Parents, Self::Error>;
-    fn get_content(&self) -> BoxFuture<Content<Self::Error>, Self::Error>;
+    fn get_parents(&self) -> BoxFuture<'static, Result<Parents, Self::Error>>;
+    fn get_content(&self) -> BoxFuture<'static, Result<Content<Self::Error>, Self::Error>>;
     fn get_hash(&self) -> &NodeHash;
     fn get_path(&self) -> &Path;
 
-    fn boxed(self) -> Box<Entry<Error = Self::Error>>
+    fn boxed(self) -> Box<dyn Entry<Error = Self::Error>>
     where
         Self: Sized,
     {
@@ -64,7 +64,7 @@ pub trait Entry: Send + 'static {
     }
 }
 
-impl<E> Entry for Box<Entry<Error = E>>
+impl<E> Entry for Box<dyn Entry<Error = E>>
 where
     E: Send + 'static,
 {
@@ -74,11 +74,11 @@ where
         (**self).get_type()
     }
 
-    fn get_parents(&self) -> BoxFuture<Parents, Self::Error> {
+    fn get_parents(&self) -> BoxFuture<'static, Result<Parents, Self::Error>> {
         (**self).get_parents()
     }
 
-    fn get_content(&self) -> BoxFuture<Content<Self::Error>, Self::Error> {
+    fn get_content(&self) -> BoxFuture<'static, Result<Content<Self::Error>, Self::Error>> {
         (**self).get_content()
     }
 
@@ -94,10 +94,10 @@ where
 impl Display for Type {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         let s = match self {
-            &Type::Symlink => "l",
-            &Type::Executable => "x",
-            &Type::Tree => "t",
-            &Type::File => "",
+            Type::Symlink => "l",
+            Type::Executable => "x",
+            Type::Tree => "t",
+            Type::File => "",
         };
         write!(fmt, "{}", s)
     }

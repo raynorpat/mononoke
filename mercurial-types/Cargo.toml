@@ -1,0 +1,16 @@
+[package]
+name = "mercurial-types"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+thiserror = "2"
+sha1 = "0.10"
+ascii = "1"
+itertools = "0.13"
+serde = { version = "1", features = ["derive"] }
+bytes = "1"
+futures = "0.3"
+
+[dev-dependencies]
+quickcheck = "1"

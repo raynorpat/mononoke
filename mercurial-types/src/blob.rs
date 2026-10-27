@@ -4,12 +4,13 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use hash::Sha1;
-use super::NodeHash;
+use serde::{Deserialize, Serialize};
+
+use crate::hash::Sha1;
+use crate::NodeHash;
 
 /// Representation of a blob of data.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-#[derive(Serialize, Deserialize, HeapSizeOf)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize, Deserialize)]
 pub enum Blob<T> {
     /// Modified data with no corresponding hash
     Dirty(T),
@@ -24,13 +25,12 @@ pub enum Blob<T> {
 /// Hash of a blob.
 ///
 /// This is implemented as a `Sha1` hash.
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-#[derive(Serialize, Deserialize, HeapSizeOf)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize, Deserialize)]
 pub struct BlobHash(Sha1);
 
 /// Compute the hash of a byte slice, resulting in a `BlobHash`
-impl<'a> From<&'a [u8]> for BlobHash {
-    fn from(data: &'a [u8]) -> Self {
+impl From<&[u8]> for BlobHash {
+    fn from(data: &[u8]) -> Self {
         BlobHash(Sha1::from(data))
     }
 }
@@ -46,27 +46,23 @@ where
                 let hash = BlobHash::from(data.as_ref());
                 Blob::Clean(data, hash)
             }
-            b @ Blob::Clean(..) |
-            b @ Blob::Extern(..) |
-            b @ Blob::NodeId(..) => b,
+            b @ (Blob::Clean(..) | Blob::Extern(..) | Blob::NodeId(..)) => b,
         }
     }
 
     pub fn size(&self) -> Option<usize> {
         match self {
-            &Blob::Dirty(ref data) => Some(data.as_ref().len()),
-            &Blob::Clean(_, ref data) => Some(data.as_ref().len()),
-            &Blob::Extern(..) |
-            &Blob::NodeId(..) => None,
+            Blob::Dirty(data) => Some(data.as_ref().len()),
+            Blob::Clean(_, data) => Some(data.as_ref().len()),
+            Blob::Extern(..) | Blob::NodeId(..) => None,
         }
     }
 
     pub fn as_inner(&self) -> Option<&T> {
         match self {
-            &Blob::Dirty(ref data) => Some(data),
-            &Blob::Clean(ref data, _) => Some(data),
-            &Blob::Extern(..) |
-            &Blob::NodeId(..) => None,
+            Blob::Dirty(data) => Some(data),
+            Blob::Clean(data, _) => Some(data),
+            Blob::Extern(..) | Blob::NodeId(..) => None,
         }
     }
 
@@ -80,17 +76,16 @@ where
 
     pub fn as_slice(&self) -> Option<&[u8]> {
         match self {
-            &Blob::Dirty(ref data) => Some(data.as_ref()),
-            &Blob::Clean(ref data, _) => Some(data.as_ref()),
-            &Blob::Extern(..) |
-            &Blob::NodeId(..) => None,
+            Blob::Dirty(data) => Some(data.as_ref()),
+            Blob::Clean(data, _) => Some(data.as_ref()),
+            Blob::Extern(..) | Blob::NodeId(..) => None,
         }
     }
 }
 
 /// Construct a dirty blob from raw data.
-impl<'a> From<&'a [u8]> for Blob<Vec<u8>> {
-    fn from(data: &'a [u8]) -> Self {
+impl From<&[u8]> for Blob<Vec<u8>> {
+    fn from(data: &[u8]) -> Self {
         Blob::Dirty(Vec::from(data))
     }
 }
@@ -102,16 +97,15 @@ impl From<Vec<u8>> for Blob<Vec<u8>> {
 }
 
 /// Get a reference to the `Blob`'s data, if it has some (ie, not `Extern`)
-impl<'a, T> Into<Option<&'a [u8]>> for &'a Blob<T>
+impl<'a, T> From<&'a Blob<T>> for Option<&'a [u8]>
 where
     T: AsRef<[u8]>,
 {
-    fn into(self) -> Option<&'a [u8]> {
-        match self {
-            &Blob::Clean(ref data, _) => Some(data.as_ref()),
-            &Blob::Dirty(ref data) => Some(data.as_ref()),
-            &Blob::Extern(..) |
-            &Blob::NodeId(..) => None,
+    fn from(blob: &'a Blob<T>) -> Option<&'a [u8]> {
+        match blob {
+            Blob::Clean(data, _) => Some(data.as_ref()),
+            Blob::Dirty(data) => Some(data.as_ref()),
+            Blob::Extern(..) | Blob::NodeId(..) => None,
         }
     }
 }
