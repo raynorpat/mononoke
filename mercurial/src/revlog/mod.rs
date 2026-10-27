@@ -711,45 +711,45 @@ impl RevlogInner {
         let p1 = self.parent_rev(rev.p1)?;
         let p2 = self.parent_rev(rev.p2)?;
         let linkrev = rev.linkrev.unwrap_or(u32::MAX);
-        let rev_idx = self.revision_count()?;
-        if self.header.features.contains(parser::INLINE) {
-            let new_size = self.idx.as_slice().len() + self.fixed_entry_size() + compressed.len();
-            if new_size > INLINE_LIMIT {
-                self.split_inline()?;
+        // Disk rename can fail after this snapshot. Roll the bytes back so a retry
+        // does not append a second revision.
+        let saved = self.snapshot();
+        let appended = (|| -> Result<u32> {
+            let rev_idx = self.revision_count()?;
+            if self.header.features.contains(parser::INLINE) {
+                let new_size =
+                    self.idx.as_slice().len() + self.fixed_entry_size() + compressed.len();
+                if new_size > INLINE_LIMIT {
+                    self.split_inline()?;
+                }
+            } else if self.data.is_none() && rev_idx > 0 {
+                return Err("Can't append without data".into());
             }
-        } else if self.data.is_none() && rev_idx > 0 {
-            return Err("Can't append without data".into());
-        }
 
-        self.write_snapshot(
-            rev_idx,
-            &rev.node,
-            p1,
-            p2,
-            linkrev,
-            rev.text.len() as u32,
-            &compressed,
-        )?;
-        self.persist()?;
-        Ok(rev_idx)
+            self.write_snapshot(
+                rev_idx,
+                &rev.node,
+                p1,
+                p2,
+                linkrev,
+                rev.text.len() as u32,
+                &compressed,
+            )?;
+            self.persist()?;
+            Ok(rev_idx)
+        })();
+        if appended.is_err() {
+            self.restore(saved);
+        }
+        appended
     }
 
-    /// `None` and an unknown hash are a null parent (`u32::MAX`).
+    /// `None` is a null parent (`u32::MAX`). `Some` must already be in this revlog.
     fn parent_rev(&mut self, parent: Option<NodeHash>) -> Result<u32> {
-        let Some(node) = parent else {
-            return Ok(u32::MAX);
-        };
-        if let Some(idx) = self.nodeidx.get(&node).copied() {
-            return Ok(idx.as_u32());
+        match parent {
+            None => Ok(u32::MAX),
+            Some(node) => self.get_idx_by_nodeid(&node).map(|idx| idx.as_u32()),
         }
-        let count = self.revision_count()?;
-        for n in 0..count {
-            let entry = self.get_entry(RevIdx::from(n as usize))?;
-            if entry.nodeid == node {
-                return Ok(n);
-            }
-        }
-        Ok(u32::MAX)
     }
 
     fn revision_count(&self) -> Result<u32> {
@@ -900,10 +900,44 @@ impl RevlogInner {
             }
             self.data_vec()?.extend_from_slice(compressed);
         }
-        self.idxoff
-            .insert(RevIdx::from(rev_idx as usize), entry_off);
+        // A hole above the cached prefix makes `get_entry` assert. Leave the
+        // map unchanged so the walker can still start at the previous high-water mark.
+        self.note_inline_offset(rev_idx, entry_off);
         self.nodeidx.insert(*node, RevIdx::from(rev_idx as usize));
         Ok(())
+    }
+
+    fn note_inline_offset(&mut self, rev_idx: u32, entry_off: usize) {
+        if !self.header.features.contains(parser::INLINE) {
+            return;
+        }
+        let Some(&high) = self.idxoff.keys().next_back() else {
+            return;
+        };
+        if high.as_u32().checked_add(1) == Some(rev_idx) {
+            self.idxoff
+                .insert(RevIdx::from(rev_idx as usize), entry_off);
+        }
+    }
+
+    fn snapshot(&self) -> RevlogSnapshot {
+        RevlogSnapshot {
+            header: self.header,
+            idx: self.idx.as_slice().to_vec(),
+            data: self.data.as_ref().map(|data| data.as_slice().to_vec()),
+            idxoff: self.idxoff.clone(),
+            nodeidx: self.nodeidx.clone(),
+            data_path: self.data_path.clone(),
+        }
+    }
+
+    fn restore(&mut self, saved: RevlogSnapshot) {
+        self.header = saved.header;
+        self.idx = Datafile::Loaded(saved.idx);
+        self.data = saved.data.map(Datafile::Loaded);
+        self.idxoff = saved.idxoff;
+        self.nodeidx = saved.nodeidx;
+        self.data_path = saved.data_path;
     }
 
     fn idx_vec(&mut self) -> &mut Vec<u8> {
@@ -934,14 +968,51 @@ impl RevlogInner {
     }
 
     fn persist(&self) -> Result<()> {
-        if let Some(path) = &self.idx_path {
-            std::fs::write(path, self.idx.as_slice())?;
-        }
+        // Data file first. A replaced index must not point at a `.d` that is still old or empty.
         if let (Some(path), Some(data)) = (&self.data_path, &self.data) {
-            std::fs::write(path, data.as_slice())?;
+            replace_file(path, data.as_slice())?;
+        }
+        if let Some(path) = &self.idx_path {
+            replace_file(path, self.idx.as_slice())?;
         }
         Ok(())
     }
+}
+
+struct RevlogSnapshot {
+    header: Header,
+    idx: Vec<u8>,
+    data: Option<Vec<u8>>,
+    idxoff: BTreeMap<RevIdx, usize>,
+    nodeidx: HashMap<NodeHash, RevIdx>,
+    data_path: Option<PathBuf>,
+}
+
+/// Write `bytes` to a same-directory temp file, then rename it over `path`.
+///
+/// `std::fs::write` truncates the destination first. A crash there leaves an empty
+/// index, which reopens as an empty revlog.
+fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = sibling_tmp(path);
+    if let Err(err) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+fn sibling_tmp(path: &Path) -> PathBuf {
+    let mut tmp = path.to_path_buf();
+    let name = match path.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => "revlog".to_string(),
+    };
+    tmp.set_file_name(format!(".{name}.append-tmp"));
+    tmp
 }
 
 fn opt_rev(idx: Option<RevIdx>) -> u32 {

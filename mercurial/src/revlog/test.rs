@@ -110,13 +110,12 @@ fn incompressible(len: usize) -> Vec<u8> {
 fn append_snapshot_round_trips_zstd() {
     let mut revlog = Revlog::new(Vec::new(), None).expect("empty revlog");
     let node = node_with_tail(1);
-    let unknown = node_with_tail(9);
     let idx = revlog
         .append_snapshot(
             RevlogAppend {
                 node,
                 p1: None,
-                p2: Some(unknown),
+                p2: None,
                 linkrev: None,
                 text: b"alpha\n".to_vec(),
             },
@@ -309,5 +308,85 @@ fn append_snapshot_split_writes_data_file() {
     assert_eq!(got.as_blob().as_slice(), Some(text.as_slice()));
     drop(reopened);
     drop(revlog);
+    assert!(!dir.join(".log.i.append-tmp").exists());
+    assert!(!dir.join(".log.d.append-tmp").exists());
     std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn append_snapshot_inline_middle_revision_stays_readable() {
+    let mut built = Revlog::new(Vec::new(), None).expect("empty revlog");
+    for (tail, text) in [(1u8, &b"one\n"[..]), (2, &b"two\n"[..])] {
+        built
+            .append_snapshot(
+                RevlogAppend {
+                    node: node_with_tail(tail),
+                    p1: None,
+                    p2: None,
+                    linkrev: None,
+                    text: text.to_vec(),
+                },
+                RevlogCompression::Zstd,
+            )
+            .expect("build");
+    }
+    let bytes = built.inner.lock().expect("lock poisoned").idx.as_slice().to_vec();
+    drop(built);
+
+    // Fresh open primes only revision 0, leaving a gap before the tip.
+    let mut revlog = Revlog::new(bytes, None).expect("reload");
+    let idx = revlog
+        .append_snapshot(
+            RevlogAppend {
+                node: node_with_tail(3),
+                p1: None,
+                p2: None,
+                linkrev: None,
+                text: b"three\n".to_vec(),
+            },
+            RevlogCompression::Zstd,
+        )
+        .expect("append");
+    assert_eq!(idx, 2);
+    let middle = revlog.get_rev(RevIdx::from(1u32)).expect("middle");
+    assert_eq!(middle.as_blob().as_slice(), Some(&b"two\n"[..]));
+    let first = revlog.get_rev(RevIdx::from(0u32)).expect("first");
+    assert_eq!(first.as_blob().as_slice(), Some(&b"one\n"[..]));
+    let tip = revlog.get_rev(RevIdx::from(idx)).expect("tip");
+    assert_eq!(tip.as_blob().as_slice(), Some(&b"three\n"[..]));
+}
+
+#[test]
+fn append_snapshot_rejects_unknown_parent() {
+    let mut revlog = Revlog::new(Vec::new(), None).expect("empty revlog");
+    revlog
+        .append_snapshot(
+            RevlogAppend {
+                node: node_with_tail(1),
+                p1: None,
+                p2: None,
+                linkrev: None,
+                text: b"alpha\n".to_vec(),
+            },
+            RevlogCompression::Zstd,
+        )
+        .expect("seed");
+
+    let err = revlog
+        .append_snapshot(
+            RevlogAppend {
+                node: node_with_tail(2),
+                p1: Some(node_with_tail(9)),
+                p2: None,
+                linkrev: None,
+                text: b"beta\n".to_vec(),
+            },
+            RevlogCompression::Zstd,
+        )
+        .expect_err("unknown parent");
+    let msg = err.to_string();
+    assert!(msg.contains("not found"), "{}", msg);
+    assert!(revlog.get_rev(RevIdx::from(1u32)).is_err());
+    let kept = revlog.get_rev(RevIdx::from(0u32)).expect("unchanged");
+    assert_eq!(kept.as_blob().as_slice(), Some(&b"alpha\n"[..]));
 }
