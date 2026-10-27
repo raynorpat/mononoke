@@ -606,6 +606,126 @@ fn ssh_push_appears_in_served_repo() {
 }
 
 #[test]
+fn ssh_push_rejects_changed_remote_heads() {
+    let temp = TempDir::new("r");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let _server = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+
+    let first = hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "first"], &shim);
+    assert!(
+        first.status.success(),
+        "first clone failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        first.status,
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+        read_log(&log)
+    );
+    let second = hg_ssh(
+        &temp.0,
+        &["clone", "ssh://user@dummy/repo", "second"],
+        &shim,
+    );
+    assert!(
+        second.status.success(),
+        "second clone failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        second.status,
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+        read_log(&log)
+    );
+
+    let first_dir = temp.0.join("first");
+    fs::write(first_dir.join("first.txt"), b"first\n").expect("write first.txt");
+    assert_hg(&hg(&first_dir, &["add", "first.txt"]), "add first.txt");
+    assert_hg(
+        &hg(&first_dir, &["commit", "-m", "from first", "-u", "test"]),
+        "commit first",
+    );
+
+    let second_dir = temp.0.join("second");
+    fs::write(second_dir.join("second.txt"), b"second\n").expect("write second.txt");
+    assert_hg(&hg(&second_dir, &["add", "second.txt"]), "add second.txt");
+    assert_hg(
+        &hg(&second_dir, &["commit", "-m", "from second", "-u", "test"]),
+        "commit second",
+    );
+    // Discovery freezes the heads the client saw. preoutgoing then lands the
+    // other clone, so check:heads is stale by the time the bundle is applied.
+    // A push after that discovery would die locally with "new remote head"
+    // and never send the part.
+    let hook_path = temp.0.join("push-first.cmd");
+    let hook = format!(
+        "@echo off\r\nset HGPLAIN=1\r\nset HGRCPATH=\r\nhg -R \"{}\" --config ui.ssh=\"{}\" push\r\n",
+        first_dir.display(),
+        cfg_path(&shim)
+    );
+    fs::write(&hook_path, hook).expect("write hook");
+    let hook_cfg = format!("hooks.preoutgoing={}", cfg_path(&hook_path));
+    let raced = hg_ssh(
+        &second_dir,
+        &[
+            "push",
+            "--config",
+            hook_cfg.as_str(),
+            "--config",
+            "hooks.preoutgoing:run-with-plain=true",
+        ],
+        &shim,
+    );
+    let raced_err = String::from_utf8_lossy(&raced.stderr);
+    assert!(
+        !raced.status.success(),
+        "stale push succeeded: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        raced.status,
+        String::from_utf8_lossy(&raced.stdout),
+        raced_err,
+        read_log(&log)
+    );
+    assert!(
+        raced_err.contains("push failed:"),
+        "stderr missing push failed:\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        String::from_utf8_lossy(&raced.stdout),
+        raced_err,
+        read_log(&log)
+    );
+
+    assert_hg(&hg(&repo, &["update", "-C"]), "update served repo");
+    let served_first = fs::read(repo.join("first.txt"))
+        .unwrap_or_else(|err| panic!("served first.txt: {err}\nmononoke:\n{}", read_log(&log)));
+    assert_eq!(
+        served_first, b"first\n",
+        "served first.txt {served_first:?}"
+    );
+    assert!(
+        !repo.join("second.txt").exists(),
+        "served repo contains second.txt\nmononoke:\n{}",
+        read_log(&log)
+    );
+
+    let later = hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "later"], &shim);
+    assert!(
+        later.status.success(),
+        "later clone failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        later.status,
+        String::from_utf8_lossy(&later.stdout),
+        String::from_utf8_lossy(&later.stderr),
+        read_log(&log)
+    );
+    let later_dir = temp.0.join("later");
+    let cloned_first = fs::read(later_dir.join("first.txt")).expect("cloned first.txt");
+    assert_eq!(
+        cloned_first, b"first\n",
+        "cloned first.txt {cloned_first:?}"
+    );
+    assert!(
+        !later_dir.join("second.txt").exists(),
+        "later clone contains second.txt"
+    );
+}
+
+#[test]
 fn ssh_push_bookmark_updates_served_repo() {
     let temp = TempDir::new("k");
     let repo = init_zstd_repo(&temp.0);

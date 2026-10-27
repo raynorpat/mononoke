@@ -42,6 +42,8 @@ static KNOWN_PARAMS: LazyLock<HashMap<&'static AsciiStr, HashSet<&'static str>>>
         let mut m: HashMap<&'static AsciiStr, HashSet<&'static str>> = HashMap::new();
         add_part!(m, "changegroup", ["version", "nbchanges", "treemanifest"]);
         add_part!(m, "pushkey", ["namespace", "key", "old", "new"]);
+        // No parameters. The heads are the part payload, not a param.
+        m.insert(AsciiStr::from_ascii("check:heads").unwrap(), HashSet::new());
         m
     });
 
@@ -80,6 +82,7 @@ enum PayloadDecode<R> {
     Cg2(
         futures_ext::decode::LayeredDecode<PayloadBytes<R>, changegroup::unpacker::Cg2Unpacker>,
     ),
+    CheckHeads(futures_ext::decode::LayeredDecode<PayloadBytes<R>, CheckHeadsDecoder>),
     Skip(futures_ext::decode::LayeredDecode<PayloadBytes<R>, SkipDecoder>),
 }
 
@@ -104,10 +107,28 @@ impl Decoder for SkipDecoder {
     }
 }
 
+struct CheckHeadsDecoder;
+
+impl Decoder for CheckHeadsDecoder {
+    type Item = InnerPart;
+    type Error = Error;
+
+    // Leave the bytes buffered. `LayeredDecode` calls `decode_eof` only when
+    // the buffer is non-empty, and the whole part is one payload.
+    fn decode(&mut self, _buf: &mut BytesMut) -> Result<Option<InnerPart>> {
+        Ok(None)
+    }
+
+    fn decode_eof(&mut self, buf: &mut BytesMut) -> Result<Option<InnerPart>> {
+        Ok(Some(InnerPart::CheckHeads(buf.split().freeze())))
+    }
+}
+
 impl<R> Cg2InnerStream<R> {
     pub fn into_outer(self) -> OuterStream<R> {
         let bytes = match self.inner {
             PayloadDecode::Cg2(inner) => StreamWrapper::into_inner(inner),
+            PayloadDecode::CheckHeads(inner) => StreamWrapper::into_inner(inner),
             PayloadDecode::Skip(inner) => StreamWrapper::into_inner(inner),
         };
         let take = StreamWrapper::into_inner(bytes);
@@ -124,6 +145,7 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match &mut self.get_mut().inner {
             PayloadDecode::Cg2(inner) => Pin::new(inner).poll_next(cx),
+            PayloadDecode::CheckHeads(inner) => Pin::new(inner).poll_next(cx),
             PayloadDecode::Skip(inner) => Pin::new(inner).poll_next(cx),
         }
     }
@@ -132,18 +154,22 @@ where
 #[derive(Debug, Eq, PartialEq)]
 pub enum InnerPart {
     Cg2(changegroup::Part),
+    /// Payload of a `check:heads` part: concatenated 20-byte node ids.
+    CheckHeads(Bytes),
 }
 
 impl InnerPart {
     pub fn is_cg2(&self) -> bool {
         match self {
             InnerPart::Cg2(_) => true,
+            InnerPart::CheckHeads(_) => false,
         }
     }
 
     pub fn cg2_part(self) -> changegroup::Part {
         match self {
             InnerPart::Cg2(part) => part,
+            InnerPart::CheckHeads(_) => panic!("cg2_part called on check:heads"),
         }
     }
 }
@@ -191,6 +217,7 @@ where
         "changegroup" => PayloadDecode::Cg2(bytes.decode(changegroup::unpacker::Cg2Unpacker::new(
             logger.new(o!("stream" => "cg2")),
         ))),
+        "check:heads" => PayloadDecode::CheckHeads(bytes.decode(CheckHeadsDecoder)),
         // Pushkey data is in the part header. Other recognized parts are not stored.
         _ => PayloadDecode::Skip(bytes.decode(SkipDecoder)),
     };

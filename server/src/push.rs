@@ -18,7 +18,7 @@ use mercurial::RevlogRepo;
 use mercurial_bundles::bundle2::Bundle2Stream;
 use mercurial_bundles::changegroup::{CgDeltaChunk, Part, Section};
 use mercurial_bundles::part_encode::PartEncodeBuilder;
-use mercurial_bundles::{Bundle2Item, PartHeader};
+use mercurial_bundles::{Bundle2Item, InnerPart, PartHeader};
 use mercurial_types::delta::Delta;
 use mercurial_types::{NodeHash, NULL_HASH};
 
@@ -27,6 +27,7 @@ use crate::errors::{Error, Result};
 pub(crate) struct Applied {
     pub(crate) body: Vec<u8>,
     pub(crate) changegroup_ids: Vec<u32>,
+    pub(crate) push_raced: bool,
 }
 
 pub fn apply_unbundle(repo_path: &std::path::Path, heads: &[NodeHash], bundle: &[u8]) -> Result<Vec<u8>> {
@@ -49,6 +50,14 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
         return Ok(Applied {
             body: b"0\n".to_vec(),
             changegroup_ids: Vec::new(),
+            push_raced: false,
+        });
+    }
+    if !check_heads_agree(repo, bundle)? {
+        return Ok(Applied {
+            body: Vec::new(),
+            changegroup_ids: Vec::new(),
+            push_raced: true,
         });
     }
 
@@ -85,11 +94,20 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
     Ok(Applied {
         body: b"1\n".to_vec(),
         changegroup_ids,
+        push_raced: false,
     })
 }
 
-pub(crate) async fn reply_bundle(body: &[u8], ids: &[u32]) -> Result<Bytes> {
-    let ids = if ids.is_empty() { vec![0] } else { ids.to_vec() };
+pub(crate) async fn reply_bundle(applied: &Applied) -> Result<Bytes> {
+    if applied.push_raced {
+        return push_raced_bundle().await;
+    }
+    let body = applied.body.as_slice();
+    let ids = if applied.changegroup_ids.is_empty() {
+        vec![0]
+    } else {
+        applied.changegroup_ids.clone()
+    };
     let ret = if body == b"0\n" { "0" } else { "1" };
     let mut bundle = mercurial_bundles::Bundle2EncodeBuilder::new(Cursor::new(Vec::new()));
     bundle.set_compressor_type(CompressorType::Uncompressed);
@@ -106,6 +124,68 @@ pub(crate) async fn reply_bundle(body: &[u8], ids: &[u32]) -> Result<Bytes> {
     }
     let cursor = bundle.build().await.map_err(bundle_err)?;
     Ok(Bytes::from(cursor.into_inner()))
+}
+
+async fn push_raced_bundle() -> Result<Bytes> {
+    let mut bundle = mercurial_bundles::Bundle2EncodeBuilder::new(Cursor::new(Vec::new()));
+    bundle.set_compressor_type(CompressorType::Uncompressed);
+    let mut part = PartEncodeBuilder::mandatory("error:pushraced").map_err(bundle_err)?;
+    part.add_mparam(
+        "message",
+        "remote repository changed while pushing - please try again",
+    )
+    .map_err(bundle_err)?;
+    bundle.add_part(part);
+    let cursor = bundle.build().await.map_err(bundle_err)?;
+    Ok(Bytes::from(cursor.into_inner()))
+}
+
+fn check_heads_agree(repo: &RevlogRepo, bundle: &[u8]) -> Result<bool> {
+    let current = repo.changelog_revlog().get_heads()?;
+    let mut in_part = false;
+    let mut buf = Vec::new();
+    let mut raced = false;
+    drain_bundle(bundle, |item| {
+        match item {
+            Bundle2Item::Start(_) => {}
+            Bundle2Item::Header(header) => {
+                finish_check_heads(&mut in_part, &mut buf, &current, &mut raced)?;
+                in_part = header.part_type_lower().as_str() == "check:heads";
+            }
+            Bundle2Item::Inner(InnerPart::CheckHeads(bytes)) if in_part => {
+                buf.extend_from_slice(&bytes);
+            }
+            Bundle2Item::Inner(_) => {}
+        }
+        Ok(())
+    })?;
+    finish_check_heads(&mut in_part, &mut buf, &current, &mut raced)?;
+    Ok(!raced)
+}
+
+fn finish_check_heads(
+    in_part: &mut bool,
+    buf: &mut Vec<u8>,
+    current: &std::collections::HashSet<NodeHash>,
+    raced: &mut bool,
+) -> Result<()> {
+    if !*in_part {
+        return Ok(());
+    }
+    *in_part = false;
+    if buf.len() % 20 != 0 {
+        return Err("check:heads payload is not a multiple of 20 bytes".into());
+    }
+    let mut offered = std::collections::HashSet::new();
+    for chunk in buf.chunks(20) {
+        let node = NodeHash::from_bytes(chunk).map_err(|err| Error::from(err.to_string()))?;
+        offered.insert(node);
+    }
+    buf.clear();
+    if offered != *current {
+        *raced = true;
+    }
+    Ok(())
 }
 
 fn bundle_err(err: impl std::fmt::Display) -> Error {

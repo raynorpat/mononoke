@@ -377,7 +377,7 @@ impl HgCommands for RepoClient {
         async move {
             let applied = crate::push::apply_repo(&repo.hgrepo, &heads, &bundle)
                 .map_err(|err| hgproto::Error::from(err.to_string()))?;
-            crate::push::reply_bundle(&applied.body, &applied.changegroup_ids)
+            crate::push::reply_bundle(&applied)
                 .await
                 .map_err(|err| hgproto::Error::from(err.to_string()))
         }
