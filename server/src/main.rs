@@ -286,8 +286,31 @@ where
     Ok(())
 }
 
-async fn repo_listen(sockname: &Path, repo: repo::Repo, listen_log: &Logger) -> Result<()> {
+async fn repo_listen(
+    sockname: &Path,
+    repo: repo::Repo,
+    listen_log: &Logger,
+    http: Option<(String, u16)>,
+) -> Result<()> {
     let repo = Arc::new(repo);
+    // Bind HTTP before the unix socket so a client that waits for the socket
+    // file knows the TCP port is already accepting.
+    if let Some((addr, port)) = http {
+        let bind_addr = format!("{addr}:{port}");
+        let tcp = tokio::net::TcpListener::bind(&bind_addr)
+            .await
+            .chain_err(|| format!("HTTP bind {bind_addr}"))?;
+        info!(listen_log, "Listening for HTTP on {}", bind_addr);
+        let http_repo = Arc::clone(&repo);
+        let http_log = listen_log.clone();
+        tokio::spawn(async move {
+            if let Err(err) = mononoke::http::serve_http(tcp, http_repo).await {
+                error!(http_log, "HTTP listener failed: {}", err);
+                log_causes(&http_log, &err, false);
+            }
+        });
+    }
+
     let bound = listener::listener(sockname).await?;
 
     loop {
@@ -305,13 +328,15 @@ async fn repo_listen(sockname: &Path, repo: repo::Repo, listen_log: &Logger) -> 
     }
 }
 
-fn run<'a, I>(repos: I, root_log: &Logger) -> Result<()>
+fn run<'a, I>(repos: I, http_addr: &str, http_port: u16, root_log: &Logger) -> Result<()>
 where
     I: IntoIterator<Item = &'a str>,
 {
+    let mut http = Some((http_addr.to_string(), http_port));
     let threads = repos
         .into_iter()
         .map(|repopath| {
+            let http = http.take();
             init_repo(root_log, repopath).and_then(|(sockname, repo)| {
                 let repopath = PathBuf::from(repopath);
                 let listen_log = root_log.new(o!("repo" => format!("{:?}", repopath)));
@@ -326,7 +351,7 @@ where
                         Err(err) => return Err(Error::from(err)),
                     };
                     let unw = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        rt.block_on(repo_listen(&sockname, repo, &listen_log))
+                        rt.block_on(repo_listen(&sockname, repo, &listen_log, http))
                     }));
                     match unw {
                         Err(err) => {
@@ -372,6 +397,20 @@ fn main() {
                 .help("print debug level output"),
         )
         .arg(
+            Arg::new("http-addr")
+                .long("http-addr")
+                .value_name("ADDR")
+                .default_value("127.0.0.1")
+                .help("HTTP listen address"),
+        )
+        .arg(
+            Arg::new("http-port")
+                .long("http-port")
+                .value_name("PORT")
+                .default_value("8000")
+                .help("HTTP listen port"),
+        )
+        .arg(
             Arg::new("REPODIR")
                 .help("paths to repo dirs (parent of .hg)")
                 .required(true)
@@ -400,7 +439,21 @@ fn main() {
         .map(String::as_str)
         .collect();
 
-    if let Err(ref err) = run(repos, &root_log) {
+    let http_addr = matches
+        .get_one::<String>("http-addr")
+        .expect("http-addr has a default");
+    let http_port_text = matches
+        .get_one::<String>("http-port")
+        .expect("http-port has a default");
+    let http_port = match http_port_text.parse::<u16>() {
+        Ok(port) => port,
+        Err(_) => {
+            error!(root_log, "invalid --http-port {}", http_port_text);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(ref err) = run(repos, http_addr, http_port, &root_log) {
         error!(root_log, "Failed: {}", err);
         log_causes(&root_log, err, false);
         std::process::exit(1);

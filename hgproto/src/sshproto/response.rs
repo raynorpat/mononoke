@@ -107,6 +107,25 @@ pub fn encode_cmd(response: &Response) -> Bytes {
             Bytes::from(out)
         }
 
+        // Raw branch lines. `encode` adds the SSH length prefix.
+        Response::Branchmap(map) => {
+            let mut names: Vec<_> = map.keys().collect();
+            names.sort();
+            let mut out = Vec::new();
+            for name in names {
+                out.extend_from_slice(name.as_bytes());
+                let mut nodes: Vec<_> = map[name].iter().collect();
+                nodes.sort();
+                for node in nodes {
+                    out.push(b' ');
+                    let hex = node.to_hex();
+                    out.extend_from_slice(hex.as_str().as_bytes());
+                }
+                out.push(b'\n');
+            }
+            Bytes::from(out)
+        }
+
         other => panic!("Response for {:?} unimplemented", other),
     }
 }

@@ -44,6 +44,8 @@ fn wireprotocaps() -> Vec<String> {
         "getbundle".to_string(),
         "unbundle".to_string(),
         "pushkey".to_string(),
+        "branchmap".to_string(),
+        "listkeys".to_string(),
     ]
 }
 
@@ -64,6 +66,12 @@ fn bundle2caps() -> String {
     }
 
     percent_encode(&encodedcaps.join("\n"))
+}
+
+fn advertised_caps() -> Vec<String> {
+    let mut caps = wireprotocaps();
+    caps.push(format!("bundle2={}", bundle2caps()));
+    caps
 }
 
 impl Repo {
@@ -325,14 +333,18 @@ impl HgCommands for RepoClient {
         async move { create_bundle(&repo, args).await }.boxed()
     }
 
+    // @wireprotocommand('capabilities')
+    fn capabilities(&self) -> HgCommandRes<Vec<String>> {
+        info!(self.logger, "capabilities");
+        future::ok(advertised_caps()).boxed()
+    }
+
     // @wireprotocommand('hello')
     fn hello(&self) -> HgCommandRes<HashMap<String, Vec<String>>> {
         info!(self.logger, "Hello -> capabilities");
 
         let mut res = HashMap::new();
-        let mut caps = wireprotocaps();
-        caps.push(format!("bundle2={}", bundle2caps()));
-        res.insert("capabilities".to_string(), caps);
+        res.insert("capabilities".to_string(), advertised_caps());
 
         future::ok(res).boxed()
     }

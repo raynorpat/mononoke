@@ -8,6 +8,7 @@
 
 pub mod bundle;
 pub mod errors;
+pub mod http;
 pub mod listener;
 pub mod push;
 pub mod repo;

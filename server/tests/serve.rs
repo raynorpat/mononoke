@@ -7,8 +7,21 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Serializes ephemeral HTTP port allocation so parallel tests do not bind the same port.
+static HTTP_BIND: Mutex<()> = Mutex::new(());
+
+fn lock_ports() -> std::sync::MutexGuard<'static, ()> {
+    HTTP_BIND.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+    listener.local_addr().expect("ephemeral addr").port()
+}
 
 fn sibling_bin(name: &str) -> PathBuf {
     let mononoke = PathBuf::from(env!("CARGO_BIN_EXE_mononoke"));
@@ -173,10 +186,17 @@ impl Drop for TempDir {
 
 struct Running {
     child: Child,
+    port: u16,
 }
 
 impl Running {
     fn start(repo: &Path, log: &Path) -> Self {
+        let _guard = lock_ports();
+        let port = free_port();
+        Self::spawn(repo, log, port)
+    }
+
+    fn spawn(repo: &Path, log: &Path, port: u16) -> Self {
         let bin = sibling_bin("mononoke");
         let log_file =
             File::create(log).unwrap_or_else(|err| panic!("log {}: {err}", log.display()));
@@ -184,6 +204,8 @@ impl Running {
             .try_clone()
             .unwrap_or_else(|err| panic!("clone log handle: {err}"));
         let mut child = Command::new(&bin)
+            .arg("--http-port")
+            .arg(port.to_string())
             .arg(repo)
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(stderr))
@@ -193,7 +215,7 @@ impl Running {
         let started = Instant::now();
         loop {
             if sock.exists() {
-                return Running { child };
+                return Running { child, port };
             }
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -238,6 +260,66 @@ fn hg_ssh(dir: &Path, args: &[&str], shim: &Path) -> Output {
         .env("HGPLAIN", "1")
         .env("HGRCPATH", "");
     output_timeout(&mut cmd, Duration::from_secs(120))
+}
+
+#[test]
+fn http_clone_and_push() {
+    let temp = TempDir::new("h");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let clone = hg(&temp.0, &["clone", &url, "dest"]);
+    assert!(
+        clone.status.success(),
+        "hg clone failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        clone.status,
+        String::from_utf8_lossy(&clone.stdout),
+        String::from_utf8_lossy(&clone.stderr),
+        read_log(&log)
+    );
+    let dest = temp.0.join("dest");
+    let body = fs::read(dest.join("a.txt"))
+        .unwrap_or_else(|err| panic!("read dest a.txt: {err}\nmononoke:\n{}", read_log(&log)));
+    assert_eq!(
+        body,
+        b"alpha\n",
+        "a.txt bytes {body:?}\nmononoke:\n{}",
+        read_log(&log)
+    );
+
+    fs::write(dest.join("a.txt"), b"beta\n").expect("write beta");
+    assert_hg(
+        &hg(&dest, &["commit", "-m", "second", "-u", "test"]),
+        "commit second",
+    );
+    let push = hg(&dest, &["push", &url]);
+    assert!(
+        push.status.success(),
+        "hg push failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        push.status,
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr),
+        read_log(&log)
+    );
+
+    let logged = hg(&repo, &["log", "-T", "{desc}"]);
+    assert_hg(&logged, "served hg log");
+    let text = String::from_utf8_lossy(&logged.stdout);
+    assert!(
+        text.contains("second"),
+        "log {text:?} does not contain second\nmononoke:\n{}",
+        read_log(&log)
+    );
+
+    assert_hg(&hg(&repo, &["update", "-C"]), "update served repo");
+    let served = fs::read(repo.join("a.txt")).expect("served a.txt");
+    assert_eq!(
+        served,
+        b"beta\n",
+        "served a.txt {served:?}\nmononoke:\n{}",
+        read_log(&log)
+    );
 }
 
 #[test]
