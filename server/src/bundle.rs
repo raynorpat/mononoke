@@ -96,12 +96,14 @@ pub fn history_part(repo: &RevlogRepo, common: &[NodeHash]) -> Result<PartEncode
 
         if missing_set.contains(&node) {
             let blob = ready(repo.get_changeset_blob_by_nodeid(&node))??;
+            let renamed = blob.maybe_renamed();
             let parents = *blob.parents();
             let text = full_text(&blob)?;
             parts.push(fulltext_chunk(
                 Section::Changeset,
                 node,
                 &parents,
+                renamed,
                 node,
                 text,
             )?);
@@ -111,12 +113,14 @@ pub fn history_part(repo: &RevlogRepo, common: &[NodeHash]) -> Result<PartEncode
 
     for (manifest_id, linknode) in manifest_revs {
         let blob = ready(repo.get_manifest_blob_by_nodeid(&manifest_id))??;
+        let renamed = blob.maybe_renamed();
         let parents = *blob.parents();
         let text = full_text(&blob)?;
         parts.push(fulltext_chunk(
             Section::Manifest,
             manifest_id,
             &parents,
+            renamed,
             linknode,
             text,
         )?);
@@ -127,12 +131,14 @@ pub fn history_part(repo: &RevlogRepo, common: &[NodeHash]) -> Result<PartEncode
         for (filenode, linknode) in revs {
             let revlog = repo.get_file_revlog(&path)?;
             let blob = revlog.get_rev_by_nodeid(&filenode)?;
+            let renamed = blob.maybe_renamed();
             let parents = *blob.parents();
             let text = full_text(&blob)?;
             parts.push(fulltext_chunk(
                 Section::Filelog(path.clone()),
                 filenode,
                 &parents,
+                renamed,
                 linknode,
                 text,
             )?);
@@ -207,10 +213,12 @@ fn fulltext_delta(text: Vec<u8>) -> Result<Delta> {
     .map_err(|err| Error::from(err.to_string()))
 }
 
-fn parent_nodes(parents: &Parents) -> (NodeHash, NodeHash) {
+fn parent_nodes(parents: &Parents, renamed: bool) -> (NodeHash, NodeHash) {
     match *parents {
         Parents::None => (NULL_HASH, NULL_HASH),
-        Parents::One(p1) => (p1, NULL_HASH),
+        // BlobNode stores a p2-only filelog parent as Parents::One with renamed set.
+        Parents::One(p) if renamed => (NULL_HASH, p),
+        Parents::One(p) => (p, NULL_HASH),
         Parents::Two(p1, p2) => (p1, p2),
     }
 }
@@ -219,10 +227,11 @@ fn fulltext_chunk(
     section: Section,
     node: NodeHash,
     parents: &Parents,
+    renamed: bool,
     linknode: NodeHash,
     text: Vec<u8>,
 ) -> Result<Part> {
-    let (p1, p2) = parent_nodes(parents);
+    let (p1, p2) = parent_nodes(parents, renamed);
     Ok(Part::CgChunk(
         section,
         CgDeltaChunk {
@@ -234,4 +243,52 @@ fn fulltext_chunk(
             delta: fulltext_delta(text)?,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_parent() -> NodeHash {
+        NodeHash::from_bytes(&[0x11; 20]).expect("parent")
+    }
+
+    fn file_chunk(blob: &BlobNode) -> CgDeltaChunk {
+        let text = full_text(blob).expect("text");
+        match fulltext_chunk(
+            Section::Filelog(Path::new(b"a.txt").expect("path")),
+            blob.nodeid().expect("filenode"),
+            blob.parents(),
+            blob.maybe_renamed(),
+            NULL_HASH,
+            text,
+        )
+        .expect("chunk")
+        {
+            Part::CgChunk(_, chunk) => chunk,
+            Part::SectionEnd(_) | Part::End => panic!("expected a filelog chunk"),
+        }
+    }
+
+    #[test]
+    fn renamed_filelog_parent_stays_in_p2() {
+        let parent = sample_parent();
+        let renamed = BlobNode::new(b"copied\n".to_vec(), None, Some(&parent));
+        assert!(renamed.maybe_renamed());
+        assert_eq!(*renamed.parents(), Parents::One(parent));
+
+        let chunk = file_chunk(&renamed);
+        assert_eq!(
+            (chunk.p1, chunk.p2),
+            (NULL_HASH, parent),
+            "p2-only parent encoded as ({:?}, {:?})",
+            chunk.p1,
+            chunk.p2
+        );
+
+        let plain = BlobNode::new(b"plain\n".to_vec(), Some(&parent), None);
+        assert!(!plain.maybe_renamed());
+        let chunk = file_chunk(&plain);
+        assert_eq!((chunk.p1, chunk.p2), (parent, NULL_HASH));
+    }
 }
