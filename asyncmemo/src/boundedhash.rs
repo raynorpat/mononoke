@@ -8,7 +8,8 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 
 use linked_hash_map::{self, LinkedHashMap};
-use weight::Weight;
+
+use crate::weight::Weight;
 
 #[derive(Debug, Clone)]
 pub struct BoundedHash<K, V>
@@ -17,10 +18,10 @@ where
 {
     hash: LinkedHashMap<K, V>,
 
-    entrylimit: usize, // max number of entries
+    entrylimit: usize,  // max number of entries
     weightlimit: usize, // max weight of entries
 
-    keysizes: usize, // sum of key weights
+    keysizes: usize,   // sum of key weights
     entrysizes: usize, // sum of (completed) entry weights
 }
 
@@ -170,7 +171,7 @@ where
     }
 
     /// Similar to other `Entry` variants, but only for occuped entries
-    pub fn entry(&mut self, key: K) -> Option<Entry<K, V>> {
+    pub fn entry(&mut self, key: K) -> Option<Entry<'_, K, V>> {
         let ptr = self as *mut _;
         if let linked_hash_map::Entry::Occupied(occ) = self.hash.entry(key) {
             Some(Entry {
@@ -266,7 +267,8 @@ mod test {
         let mut c = BoundedHash::new(10, 1000);
 
         {
-            let ok = c.insert(Weighted("hello", 10), Weighted("world", 100))
+            let ok = c
+                .insert(Weighted("hello", 10), Weighted("world", 100))
                 .is_ok();
 
             assert!(ok, "insert failed");
@@ -292,7 +294,8 @@ mod test {
     fn entry() {
         let mut c = BoundedHash::new(10, 1000);
 
-        let ok = c.insert(Weighted("hello", 10), Weighted("world", 100))
+        let ok = c
+            .insert(Weighted("hello", 10), Weighted("world", 100))
             .is_ok();
 
         assert!(ok, "insert failed");
@@ -327,21 +330,24 @@ mod test {
     fn toobig() {
         let mut c = BoundedHash::new(10, 1000);
 
-        let ok = c.insert(Weighted("hello", 10), Weighted("world", 100))
+        let ok = c
+            .insert(Weighted("hello", 10), Weighted("world", 100))
             .is_ok();
 
         assert!(ok, "insert failed");
         assert_eq!(c.total_weight(), 10 + 100);
         assert_eq!(c.len(), 1);
 
-        let err = c.insert(Weighted("bubble", 10), Weighted("lead", 1000))
+        let err = c
+            .insert(Weighted("bubble", 10), Weighted("lead", 1000))
             .is_err();
         assert!(err, "insert worked?");
 
         assert_eq!(c.total_weight(), 10 + 100);
         assert_eq!(c.len(), 1);
 
-        let ok = c.insert(Weighted("bubble", 10), Weighted("balloon", 880))
+        let ok = c
+            .insert(Weighted("bubble", 10), Weighted("balloon", 880))
             .is_ok();
         assert!(ok, "insert failed?");
 

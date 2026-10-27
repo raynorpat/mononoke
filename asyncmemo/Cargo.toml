@@ -1,0 +1,11 @@
+[package]
+name = "asyncmemo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures = "0.3"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+linked-hash-map = "0.5"
+mercurial-types = { path = "../mercurial-types" }

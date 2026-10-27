@@ -18,17 +18,12 @@
 //! TODO: add interface to choose eviction policy/predicate
 #![deny(warnings)]
 
-#[macro_use]
-extern crate futures;
-extern crate linked_hash_map;
-extern crate heapsize;
-
 use std::hash::Hash;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::usize;
+use std::task::{Context, Poll};
 
-use futures::{Async, Future, Poll};
-use futures::future::IntoFuture;
+use futures::future::TryFuture;
 
 #[cfg(test)]
 mod test;
@@ -57,18 +52,16 @@ where
 /// should only depend on the value of the `key` parameter.
 /// It may fail - the failure will be propagated to one of the callers, and the result won't
 /// be cached.
+///
+/// `Value` is a future whose `Output` is `Result<success, error>`. Only the success value is cached.
 pub trait Filler {
     type Key;
-    type Value: IntoFuture;
+    type Value: TryFuture;
 
     fn fill(&self, key: &Self::Key) -> Self::Value;
 }
 
-// We really want a type bound on F, but currently that emits an annoying E0122 warning
-type CacheHash<F> = BoundedHash<
-    <F as Filler>::Key,
-    Slot<<<F as Filler>::Value as IntoFuture>::Future>,
->;
+type CacheHash<F> = BoundedHash<<F as Filler>::Key, Slot<<F as Filler>::Value>>;
 
 struct AsyncmemoInner<F>
 where
@@ -82,21 +75,21 @@ where
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 enum Slot<F>
 where
-    F: Future,
+    F: TryFuture,
 {
-    Waiting(F), // waiting for entry to become available
-    Full(F::Item), // got value
+    Waiting(F),
+    Full(F::Ok),
 }
 
 impl<F> Weight for Slot<F>
 where
-    F: Future,
-    F::Item: Weight,
+    F: TryFuture,
+    F::Ok: Weight,
 {
     fn get_weight(&self) -> usize {
         match self {
-            &Slot::Waiting(_) => 0,
-            &Slot::Full(ref v) => v.get_weight(),
+            Slot::Waiting(_) => 0,
+            Slot::Full(value) => value.get_weight(),
         }
     }
 }
@@ -114,47 +107,61 @@ where
 impl<F> MemoFuture<F>
 where
     F: Filler,
-    F::Key: Eq + Hash + Weight + Clone,
-    <F::Value as IntoFuture>::Item: Weight + Clone,
+    F::Key: Eq + Hash + Weight + Clone + Unpin,
+    F::Value: TryFuture + Unpin,
+    <F::Value as TryFuture>::Ok: Weight + Clone,
 {
     // Check for existing entry.
     fn handle_present(
         &self,
         hash: &mut CacheHash<F>,
-    ) -> Poll<Option<<Self as Future>::Item>, <Self as Future>::Error> {
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<<F::Value as TryFuture>::Ok>, <F::Value as TryFuture>::Error>> {
         // Do the lookup, and as much processing as we can while `ent` is in scope.
         // If we found it and have a result to return, then we can trim the cache once
         // `ent` goes out of scope.
         let found = if let Some(mut ent) = hash.entry(self.key.clone()) {
-            let ret = match ent.get_mut() {
+            let polled = match ent.get_mut() {
                 // Still in progress - bump it along, update entry if complete.
                 // We don't weigh the Future the Filler returns, so updating the Future
                 // via `poll` won't change the weight.
-                &mut Slot::Waiting(ref mut f) => try_ready!(f.poll()),
-
+                Slot::Waiting(fut) => match Pin::new(fut).try_poll(cx) {
+                    Poll::Pending => None,
+                    Poll::Ready(ready) => Some(ready),
+                },
                 // Got a complete value, return it directly
-                &mut Slot::Full(ref v) => return Ok(Async::Ready(Some(v.clone()))),
+                Slot::Full(value) => return Poll::Ready(Ok(Some(value.clone()))),
             };
 
-            let upd = Slot::Full(ret.clone());
+            match polled {
+                None => return Poll::Pending,
+                Some(Err(err)) => {
+                    // A finished future must not be polled again, and failures are not cached.
+                    ent.remove();
+                    return Poll::Ready(Err(err));
+                }
+                Some(Ok(ret)) => {
+                    let upd = Slot::Full(ret.clone());
 
-            // Now that `get_mut()` is out of scope, we can operate on `ent` again.
-            // Check to see if upd will fit into cache or not.
-            let trim = if ent.may_fit(&upd) {
-                // Store original in cache
-                ent.update(upd);
+                    // Now that `get_mut()` is out of scope, we can operate on `ent` again.
+                    // Check to see if upd will fit into cache or not.
+                    let trim = if ent.may_fit(&upd) {
+                        // Store original in cache
+                        ent.update(upd);
 
-                // trim in case update puts us over
-                true
-            } else {
-                // Delete entry we're not going to use
-                ent.remove();
+                        // trim in case update puts us over
+                        true
+                    } else {
+                        // Delete entry we're not going to use
+                        ent.remove();
 
-                // no need to trim
-                false
-            };
+                        // no need to trim
+                        false
+                    };
 
-            Some((ret, trim))
+                    Some((ret, trim))
+                }
+            }
         } else {
             None
         };
@@ -167,13 +174,14 @@ where
             }
             ret
         });
-        Ok(Async::Ready(ret))
+        Poll::Ready(Ok(ret))
     }
 
     fn handle_missing(
         &self,
         hash: &mut CacheHash<F>,
-    ) -> Poll<<Self as Future>::Item, <Self as Future>::Error> {
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<<F::Value as TryFuture>::Ok, <F::Value as TryFuture>::Error>> {
         // Does not exist - make space for it
         let ok = hash.trim_entries(1);
         assert!(ok, "Can't make room for one more entry?");
@@ -182,15 +190,15 @@ where
 
         // Get the future. If it is complete immediately, then insert the
         // value directly, otherwise store the future for further processing.
-        let mut f = self.cache.filler.fill(&key).into_future();
+        let mut fut = self.cache.filler.fill(&key);
 
-        match f.poll()? {
-            Async::NotReady => {
+        match Pin::new(&mut fut).try_poll(cx) {
+            Poll::Pending => {
                 // We require the weight limit to be large enough to hold a key - otherwise
                 // we can't hold the future to wait for it to complete. (We also discount the
                 // possible weight of the future itself, since it might be dynamic.)
-                let ok = hash.insert(key, Slot::Waiting(f)).is_ok();
-                if !ok {
+                let inserted = hash.insert(key, Slot::Waiting(fut)).is_ok();
+                if !inserted {
                     panic!(
                         "key weight {} too large for limit {}",
                         self.key.get_weight(),
@@ -198,37 +206,42 @@ where
                     );
                 }
 
-                Ok(Async::NotReady)
+                Poll::Pending
             }
 
-            Async::Ready(v) => {
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+
+            Poll::Ready(Ok(value)) => {
                 // Try to insert the entry. If it's too large, then we just give on caching
                 // the result and return it directly.
                 // XXX If "too-large" entries are common, then optimize out the redundant clone
                 // in that case.
-                let _ = hash.insert(key, Slot::Full(v.clone()));
+                let _ = hash.insert(key, Slot::Full(value.clone()));
 
-                Ok(Async::Ready(v))
+                Poll::Ready(Ok(value))
             }
         }
     }
 }
 
-impl<F> Future for MemoFuture<F>
+impl<F> std::future::Future for MemoFuture<F>
 where
     F: Filler,
-    F::Key: Eq + Hash + Weight + Clone,
-    <F::Value as IntoFuture>::Item: Weight + Clone,
+    F::Key: Eq + Hash + Weight + Clone + Unpin,
+    F::Value: TryFuture + Unpin,
+    <F::Value as TryFuture>::Ok: Weight + Clone,
 {
-    type Item = <F::Value as IntoFuture>::Item;
-    type Error = <F::Value as IntoFuture>::Error;
+    type Output = Result<<F::Value as TryFuture>::Ok, <F::Value as TryFuture>::Error>;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let mut hash = self.cache.hash.lock().expect("locked poisoned");
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut hash = this.cache.hash.lock().expect("locked poisoned");
 
-        match try_ready!(self.handle_present(&mut hash)) {
-            Some(ret) => Ok(Async::Ready(ret)),
-            None => self.handle_missing(&mut hash),
+        match this.handle_present(&mut hash, cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Some(ret))) => Poll::Ready(Ok(ret)),
+            Poll::Ready(Ok(None)) => this.handle_missing(&mut hash, cx),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
         }
     }
 }
@@ -237,7 +250,7 @@ impl<F> Asyncmemo<F>
 where
     F: Filler,
     F::Key: Hash + Eq + Weight,
-    <F::Value as IntoFuture>::Item: Weight,
+    <F::Value as TryFuture>::Ok: Weight,
 {
     /// Construct a new bounded cache. It enforces two distinct limits:
     /// - entrylimit - the max number of entries
@@ -253,7 +266,9 @@ where
             filler: fill,
         };
 
-        Asyncmemo { inner: Arc::new(inner) }
+        Asyncmemo {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Construct an unbounded cache.
@@ -321,6 +336,8 @@ where
     F::Key: Eq + Hash,
 {
     fn clone(&self) -> Self {
-        Asyncmemo { inner: self.inner.clone() }
+        Asyncmemo {
+            inner: self.inner.clone(),
+        }
     }
 }

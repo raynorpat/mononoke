@@ -5,8 +5,9 @@
 // GNU General Public License version 2 or any later version.
 
 use std::mem;
+use std::sync::Arc;
 
-use heapsize::HeapSizeOf;
+use mercurial_types::{BlobNode, NodeHash};
 
 /// Return the "weight" of a type.
 ///
@@ -17,14 +18,36 @@ pub trait Weight {
     fn get_weight(&self) -> usize;
 }
 
-/// Just implement Weight in terms of memory use for any type which implements `HeapSizeOf`.
-/// XXX Not sure how well this matches the O(1) requirement...
-impl<T> Weight for T
+impl Weight for String {
+    #[inline]
+    fn get_weight(&self) -> usize {
+        mem::size_of::<String>() + self.capacity()
+    }
+}
+
+impl<T> Weight for Arc<T>
 where
-    T: HeapSizeOf,
+    T: Weight + ?Sized,
 {
     #[inline]
     fn get_weight(&self) -> usize {
-        mem::size_of::<Self>() + self.heap_size_of_children()
+        mem::size_of::<Arc<T>>() + (**self).get_weight()
+    }
+}
+
+impl Weight for NodeHash {
+    #[inline]
+    fn get_weight(&self) -> usize {
+        mem::size_of::<Self>()
+    }
+}
+
+impl<T> Weight for BlobNode<T>
+where
+    T: AsRef<[u8]>,
+{
+    #[inline]
+    fn get_weight(&self) -> usize {
+        mem::size_of::<Self>() + self.size().unwrap_or(0)
     }
 }
