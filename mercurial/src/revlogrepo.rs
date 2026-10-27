@@ -250,17 +250,9 @@ impl RevlogRepo {
 
     fn file_index_path(&self, path: &Path) -> PathBuf {
         let dotencode = self.requirements.contains(&Required::Dotencode);
-        let mut index = self
-            .basepath
+        self.basepath
             .join("store")
-            .join("data")
-            .join(path.fsencode(dotencode));
-        if let Some(ext) = index.extension().map(|ext| ext.to_string_lossy().into_owned()) {
-            index.set_extension(format!("{}.i", ext));
-        } else {
-            index.set_extension("i");
-        }
-        index
+            .join(path.store_filelog(dotencode))
     }
 
     pub fn get_file_revlog(&self, path: &Path) -> Result<Revlog> {
@@ -422,6 +414,42 @@ mod test {
         opened
     }
 
+    fn hg(repo: &std::path::Path, args: &[&str]) -> process::Output {
+        let mut cmd = process::Command::new("hg");
+        cmd.current_dir(repo)
+            .args(args)
+            .env("HGPLAIN", "1")
+            .env("HGRCPATH", "");
+        cmd.output().unwrap_or_else(|err| panic!("spawn hg {args:?}: {err}"))
+    }
+
+    fn assert_hg(output: &process::Output, what: &str) {
+        assert!(
+            output.status.success(),
+            "{what} failed: status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn dir_has_index(dir: &std::path::Path) -> bool {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if dir_has_index(&path) {
+                    return true;
+                }
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("i") {
+                return true;
+            }
+        }
+        false
+    }
+
     #[test]
     fn unknown_requirement_names_the_line() {
         let err = open_requires("unknown", &["store", "revlogv1", "not-a-real-requirement"])
@@ -532,6 +560,73 @@ mod test {
             "{}",
             err
         );
+    }
+
+    #[test]
+    fn long_mixed_case_path_opens_from_store_dh() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mononoke-dh-{}-{}", process::id(), nanos));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp root");
+
+        let mut init = process::Command::new("hg");
+        init.current_dir(&root)
+            .args(["init", "repo"])
+            .args(["--config", "format.generaldelta=true"])
+            .args(["--config", "format.revlog-compression=zstd"])
+            .args(["--config", "format.sparse-revlog=false"])
+            .args(["--config", "format.use-persistent-nodemap=false"])
+            .args(["--config", "format.use-share-safe=false"])
+            .args(["--config", "format.use-dirstate-v2=false"])
+            .args([
+                "--config",
+                "format.exp-use-copies-side-data-changeset=false",
+            ])
+            .env("HGPLAIN", "1")
+            .env("HGRCPATH", "");
+        assert_hg(&init.output().expect("spawn hg init"), "hg init");
+
+        let repo = root.join("repo");
+        let name: String = std::iter::once('A')
+            .chain(std::iter::repeat('b').take(113))
+            .collect();
+        assert_eq!(name.len(), 114);
+        fs::write(repo.join(&name), b"long\n").expect("write long file");
+        assert_hg(&hg(&repo, &["add", &name]), "hg add");
+        assert_hg(&hg(&repo, &["commit", "-m", "long", "-u", "test"]), "hg commit");
+
+        let requires = fs::read_to_string(repo.join(".hg").join("requires")).expect("requires");
+        assert!(
+            requires.lines().any(|line| line == "dotencode"),
+            "requires missing dotencode:\n{requires}"
+        );
+
+        let data_index = repo
+            .join(".hg")
+            .join("store")
+            .join("data")
+            .join(format!("{name}.i"));
+        assert!(
+            !data_index.exists(),
+            "unexpected index at {}",
+            data_index.display()
+        );
+
+        let dh = repo.join(".hg").join("store").join("dh");
+        assert!(dir_has_index(&dh), "no index under {}", dh.display());
+
+        let opened = RevlogRepo::open(repo.join(".hg")).expect("open repo");
+        let path = mercurial_types::Path::new(name.as_bytes()).expect("path");
+        let revlog = opened.get_file_revlog(&path).expect("filelog");
+        let node = revlog
+            .get_rev(crate::revlog::RevIdx::from(0u32))
+            .expect("rev 0");
+        assert_eq!(node.as_blob().as_slice(), Some(&b"long\n"[..]));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
 

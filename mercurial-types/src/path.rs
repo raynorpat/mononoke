@@ -63,6 +63,23 @@ impl Path {
         ret
     }
 
+    /// Store-relative revlog index, `data/…i` or hashed `dh/…i`.
+    pub fn store_filelog(&self, dotencode: bool) -> PathBuf {
+        let mut raw = Vec::with_capacity(self.0.len() + 7);
+        raw.extend_from_slice(b"data/");
+        raw.extend_from_slice(&self.0);
+        raw.extend_from_slice(b".i");
+
+        let de = encodedir(&raw);
+        let encoded = fncache_encode(&de, dotencode);
+        let chosen = if raw.len() > MAX_STORE_PATH_LEN || encoded.len() > MAX_STORE_PATH_LEN {
+            hashencode(&de, dotencode)
+        } else {
+            encoded
+        };
+        pathbuf_from_slashes(&chosen)
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
@@ -165,7 +182,6 @@ fn fnencode<E: AsRef<[u8]>>(elem: E) -> Vec<u8> {
     ret
 }
 
-#[allow(dead_code)] // XXX TODO
 fn lowerencode(elem: &[u8]) -> Vec<u8> {
     let mut ret = Vec::new();
 
@@ -224,6 +240,126 @@ fn auxencode<E: AsRef<[u8]>>(elem: E, dotencode: bool) -> Vec<u8> {
     }
 
     ret
+}
+
+const MAX_STORE_PATH_LEN: usize = 120;
+const DIR_PREFIX_LEN: usize = 8;
+const MAX_SHORT_DIRS_LEN: usize = 8 * (DIR_PREFIX_LEN + 1) - 4;
+
+/// `.hg/`, `.i/`, and `.d/` become `.hg.hg/`, `.i.hg/`, and `.d.hg/`.
+/// Replacements are not scanned again.
+fn encodedir(path: &[u8]) -> Vec<u8> {
+    let path = replace_bytes(path, b".hg/", b".hg.hg/");
+    let path = replace_bytes(&path, b".i/", b".i.hg/");
+    replace_bytes(&path, b".d/", b".d.hg/")
+}
+
+fn replace_bytes(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hay.len());
+    let mut i = 0;
+    while i < hay.len() {
+        if hay[i..].starts_with(from) {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(hay[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn fncache_encode(de: &[u8], dotencode: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(de.len());
+    for (i, elem) in de.split(|c| *c == b'/').enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(&auxencode(fnencode(elem), dotencode));
+    }
+    out
+}
+
+fn hashencode(de: &[u8], dotencode: bool) -> Vec<u8> {
+    let digest = sha1_hex(de);
+    let rest = de.get(5..).unwrap_or(&[]);
+    let lowered = lowerencode(rest);
+    let mut parts: Vec<Vec<u8>> = lowered
+        .split(|c| *c == b'/')
+        .map(|elem| auxencode(elem, dotencode))
+        .collect();
+    let basename = parts.pop().unwrap_or_default();
+    let ext = splitext(&basename);
+
+    let mut sdirs = Vec::new();
+    let mut sdirslen = 0usize;
+    for part in &parts {
+        let mut prefix = part[..DIR_PREFIX_LEN.min(part.len())].to_vec();
+        if let Some(last) = prefix.last_mut() {
+            if *last == b'.' || *last == b' ' {
+                *last = b'_';
+            }
+        }
+        let next = if sdirslen == 0 {
+            prefix.len()
+        } else {
+            let next = sdirslen + 1 + prefix.len();
+            if next > MAX_SHORT_DIRS_LEN {
+                break;
+            }
+            next
+        };
+        sdirs.push(prefix);
+        sdirslen = next;
+    }
+
+    let mut dirs = Vec::new();
+    for (i, dir) in sdirs.iter().enumerate() {
+        if i > 0 {
+            dirs.push(b'/');
+        }
+        dirs.extend_from_slice(dir);
+    }
+    if !dirs.is_empty() {
+        dirs.push(b'/');
+    }
+
+    let mut res = Vec::new();
+    res.extend_from_slice(b"dh/");
+    res.extend_from_slice(&dirs);
+    res.extend_from_slice(&digest);
+    res.extend_from_slice(ext);
+    if res.len() < MAX_STORE_PATH_LEN {
+        let space = MAX_STORE_PATH_LEN - res.len();
+        let filler = &basename[..space.min(basename.len())];
+        res.clear();
+        res.extend_from_slice(b"dh/");
+        res.extend_from_slice(&dirs);
+        res.extend_from_slice(filler);
+        res.extend_from_slice(&digest);
+        res.extend_from_slice(ext);
+    }
+    res
+}
+
+fn sha1_hex(data: &[u8]) -> Vec<u8> {
+    crate::hash::Sha1::from(data).to_hex().as_bytes().to_vec()
+}
+
+/// Extension including the dot. A name of only dots has none.
+fn splitext(name: &[u8]) -> &[u8] {
+    match name.iter().rposition(|byte| *byte == b'.') {
+        Some(dot) if name[..dot].iter().any(|byte| *byte != b'.') => &name[dot..],
+        _ => b"",
+    }
+}
+
+fn pathbuf_from_slashes(bytes: &[u8]) -> PathBuf {
+    let mut path = PathBuf::new();
+    for comp in bytes.split(|byte| *byte == b'/') {
+        path.push(str::from_utf8(comp).expect("store path is utf-8"));
+    }
+    path
 }
 
 impl Display for Path {
@@ -344,5 +480,14 @@ mod test {
         let p = a.fsencode(false);
 
         assert_eq!(p, PathBuf::from("_h_e_l_l_o.d.hg/_w_o_r_l_d.d"));
+    }
+
+    #[test]
+    fn store_filelog_short_mixed_case_stays_under_data() {
+        let path = Path::new(b"Foo.txt").unwrap();
+        assert_eq!(
+            path.store_filelog(true),
+            std::path::Path::new("data").join("_foo.txt.i")
+        );
     }
 }
