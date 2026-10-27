@@ -44,6 +44,8 @@ pub enum Required {
     Lz4revlog,
     SqlDirstate,
     RevlogCompressionZstd,
+    ShareSafe,
+    SparseRevlog,
 }
 
 impl Display for Required {
@@ -61,6 +63,8 @@ impl Display for Required {
             Required::Lz4revlog => "lz4revlog",
             Required::SqlDirstate => "sqldirstate",
             Required::RevlogCompressionZstd => "revlog-compression-zstd",
+            Required::ShareSafe => "share-safe",
+            Required::SparseRevlog => "sparserevlog",
         };
         write!(fmt, "{}", s)
     }
@@ -83,6 +87,8 @@ impl FromStr for Required {
             "lz4revlog" => Ok(Required::Lz4revlog),
             "sqldirstate" => Ok(Required::SqlDirstate),
             "revlog-compression-zstd" => Ok(Required::RevlogCompressionZstd),
+            "share-safe" => Ok(Required::ShareSafe),
+            "sparserevlog" => Ok(Required::SparseRevlog),
             unk => Err(ErrorKind::UnknownReq(unk.into()).into()),
         }
     }
@@ -136,6 +142,18 @@ impl RevlogRepo {
         let file = fs::File::open(base.join("requires")).chain_err(|| "Can't open `requires`")?;
         for line in BufReader::new(file).lines() {
             req.insert(line.chain_err(|| "Line read failed")?.parse()?);
+        }
+        if req.contains(&Required::ShareSafe) {
+            let file = match fs::File::open(store.join("requires")) {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Err("share-safe is set but `.hg/store/requires` is missing".into());
+                }
+                Err(err) => return Err(err.into()),
+            };
+            for line in BufReader::new(file).lines() {
+                req.insert(line.chain_err(|| "Line read failed")?.parse()?);
+            }
         }
         if req.contains(&Required::Treemanifest) {
             return Err("treemanifest is not served".into());
@@ -368,6 +386,14 @@ mod test {
     use super::RevlogRepo;
 
     fn open_requires(label: &str, lines: &[&str]) -> crate::errors::Result<RevlogRepo> {
+        open_split(label, lines, None)
+    }
+
+    fn open_split(
+        label: &str,
+        outer: &[&str],
+        store: Option<&[&str]>,
+    ) -> crate::errors::Result<RevlogRepo> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -380,7 +406,14 @@ mod test {
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("store")).expect("store");
-        fs::write(dir.join("requires"), format!("{}\n", lines.join("\n"))).expect("requires");
+        fs::write(dir.join("requires"), format!("{}\n", outer.join("\n"))).expect("requires");
+        if let Some(lines) = store {
+            fs::write(
+                dir.join("store").join("requires"),
+                format!("{}\n", lines.join("\n")),
+            )
+            .expect("store requires");
+        }
         let empty = include_bytes!("revlog/empty.i.bin");
         fs::write(dir.join("store").join("00changelog.i"), empty).expect("changelog");
         fs::write(dir.join("store").join("00manifest.i"), empty).expect("manifest");
@@ -391,10 +424,10 @@ mod test {
 
     #[test]
     fn unknown_requirement_names_the_line() {
-        let err = open_requires("unknown", &["store", "revlogv1", "share-safe"])
+        let err = open_requires("unknown", &["store", "revlogv1", "not-a-real-requirement"])
             .expect_err("unknown requirement");
         let msg = err.to_string();
-        assert!(msg.contains("share-safe"), "{}", msg);
+        assert!(msg.contains("not-a-real-requirement"), "{}", msg);
     }
 
     #[test]
@@ -419,6 +452,86 @@ mod test {
             ],
         )
         .expect("open");
+    }
+
+    #[test]
+    fn share_safe_reads_store_requires() {
+        let repo = open_split(
+            "share",
+            &["share-safe"],
+            Some(&[
+                "dotencode",
+                "fncache",
+                "generaldelta",
+                "revlog-compression-zstd",
+                "revlogv1",
+                "sparserevlog",
+                "store",
+            ]),
+        )
+        .expect("open");
+        let names: Vec<_> = repo.get_requirements().iter().map(|r| r.to_string()).collect();
+        for line in [
+            "share-safe",
+            "sparserevlog",
+            "generaldelta",
+            "revlogv1",
+            "revlog-compression-zstd",
+            "store",
+            "fncache",
+            "dotencode",
+        ] {
+            assert!(names.iter().any(|n| n == line), "{line} missing from {names:?}");
+        }
+    }
+
+    #[test]
+    fn share_safe_missing_store_requires_names_share_safe() {
+        let err = open_split("missing", &["share-safe"], None).expect_err("missing store/requires");
+        let msg = err.to_string();
+        assert!(msg.contains("share-safe"), "{msg}");
+        assert!(!msg.contains("Unknown requirement"), "{msg}");
+    }
+
+    #[test]
+    fn same_line_in_both_requires_files_opens() {
+        open_split(
+            "both",
+            &["share-safe", "store"],
+            Some(&["store", "sparserevlog"]),
+        )
+        .expect("union");
+    }
+
+    #[test]
+    fn treemanifest_in_store_requires_is_not_served() {
+        let err = open_split(
+            "tree-store",
+            &["share-safe"],
+            Some(&["store", "treemanifest"]),
+        )
+        .expect_err("treemanifest");
+        assert!(
+            err.to_string().contains("treemanifest is not served"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn unknown_store_requirement_names_the_line() {
+        let err = open_split(
+            "unk-store",
+            &["share-safe"],
+            Some(&["not-a-real-requirement"]),
+        )
+        .expect_err("unknown store line");
+        assert!(
+            err.to_string()
+                .contains("Unknown requirement \"not-a-real-requirement\""),
+            "{}",
+            err
+        );
     }
 }
 
