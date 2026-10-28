@@ -6,7 +6,7 @@
 
 //! Changegroup history for `getbundle`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -17,7 +17,7 @@ use mercurial_bundles::changegroup::{CgDeltaChunk, Part, Section};
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::parts::changegroup_part;
 use mercurial_types::delta::{Delta, Fragment};
-use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, Path, NULL_HASH};
+use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, NULL_HASH};
 
 use crate::errors::{Error, Result};
 
@@ -65,111 +65,98 @@ pub fn history_part(repo: &RevlogRepo, common: &[NodeHash]) -> Result<PartEncode
 }
 
 fn history_parts(repo: &RevlogRepo, common: &[NodeHash]) -> Result<Vec<Part>> {
-    let missing = missing_nodes(repo, common)?;
-    let missing_set: HashSet<NodeHash> = missing.iter().copied().collect();
+    let missing_set: HashSet<NodeHash> = missing_nodes(repo, common)?.into_iter().collect();
     let nodes = changelog_nodes(repo)?;
-    let mut available: HashSet<NodeHash> = common
+    // Indexed by changelog rev: is this changeset going to the client.
+    let missing: Vec<bool> = nodes
         .iter()
-        .copied()
-        .filter(|node| *node != NULL_HASH)
+        .map(|node| missing_set.contains(node))
         .collect();
 
     let mut parts = Vec::new();
-    let mut seen_manifests = HashSet::new();
-    let mut manifest_revs = Vec::new();
-    let mut seen_files: HashMap<Path, HashSet<NodeHash>> = HashMap::new();
-    let mut file_revs: BTreeMap<Path, Vec<(NodeHash, NodeHash)>> = BTreeMap::new();
-
-    for node in nodes {
-        let cs = ready(repo.get_changeset_by_nodeid(&node))??;
-        let manifest_id = *cs.manifestid();
-        let missing_cs = missing_set.contains(&node);
-        if !missing_cs {
-            available.insert(manifest_id);
+    let mut files = BTreeSet::new();
+    for (rev, node) in nodes.iter().enumerate() {
+        if !missing[rev] {
+            continue;
         }
-        if seen_manifests.insert(manifest_id) && missing_cs {
-            manifest_revs.push((manifest_id, node));
-        }
-
-        if !cs.files().is_empty() {
-            let manifest = ready(repo.get_manifest_by_nodeid(&manifest_id))??;
-            if !missing_cs {
-                for (_, details) in manifest.manifest() {
-                    available.insert(*details.nodeid());
-                }
-            }
-            for file in cs.files() {
-                let Some(details) = manifest.lookup(file) else {
-                    continue;
-                };
-                let filenode = *details.nodeid();
-                let seen = seen_files.entry(file.clone()).or_default();
-                if seen.insert(filenode) && missing_cs {
-                    file_revs
-                        .entry(file.clone())
-                        .or_default()
-                        .push((filenode, node));
-                }
-            }
-        }
-
-        if missing_cs {
-            let blob = ready(repo.get_changeset_blob_by_nodeid(&node))??;
-            let renamed = blob.maybe_renamed();
-            let parents = *blob.parents();
-            let text = full_text(&blob)?;
-            parts.push(fulltext_chunk(
-                Section::Changeset,
-                node,
-                &parents,
-                renamed,
-                node,
-                text,
-            )?);
-        }
+        let cs = ready(repo.get_changeset_by_nodeid(node))??;
+        files.extend(cs.files().iter().cloned());
+        let blob = ready(repo.get_changeset_blob_by_nodeid(node))??;
+        let renamed = blob.maybe_renamed();
+        let parents = *blob.parents();
+        let text = full_text(&blob)?;
+        parts.push(fulltext_chunk(
+            Section::Changeset,
+            *node,
+            &parents,
+            renamed,
+            *node,
+            text,
+        )?);
     }
     parts.push(Part::SectionEnd(Section::Changeset));
 
-    let manifest_log = repo.manifest_revlog();
-    let mut ordered_manifests = Vec::with_capacity(manifest_revs.len());
-    for (manifest_id, linknode) in manifest_revs {
-        ordered_manifests.push((manifest_log.index_of(&manifest_id)?, manifest_id, linknode));
-    }
-    ordered_manifests.sort_by_key(|(idx, _, _)| *idx);
-    for (_, manifest_id, linknode) in ordered_manifests {
-        parts.push(stored_revision(
-            &manifest_log,
-            Section::Manifest,
-            manifest_id,
-            linknode,
-            &available,
-        )?);
-        available.insert(manifest_id);
-    }
+    linked_revisions(
+        &repo.manifest_revlog(),
+        Section::Manifest,
+        &nodes,
+        &missing,
+        &mut parts,
+    )?;
     parts.push(Part::SectionEnd(Section::Manifest));
 
-    for (path, revs) in file_revs {
+    for path in files {
         let revlog = repo.get_file_revlog(&path)?;
-        let mut ordered = Vec::with_capacity(revs.len());
-        for (filenode, linknode) in revs {
-            ordered.push((revlog.index_of(&filenode)?, filenode, linknode));
+        let start = parts.len();
+        linked_revisions(
+            &revlog,
+            Section::Filelog(path.clone()),
+            &nodes,
+            &missing,
+            &mut parts,
+        )?;
+        if parts.len() > start {
+            parts.push(Part::SectionEnd(Section::Filelog(path)));
         }
-        ordered.sort_by_key(|(idx, _, _)| *idx);
-        for (_, filenode, linknode) in ordered {
-            parts.push(stored_revision(
-                &revlog,
-                Section::Filelog(path.clone()),
-                filenode,
-                linknode,
-                &available,
-            )?);
-            available.insert(filenode);
-        }
-        parts.push(Part::SectionEnd(Section::Filelog(path)));
     }
     parts.push(Part::End);
 
     Ok(parts)
+}
+
+/// Emit every revision of `revlog` whose linkrev is a missing changeset, in revision order.
+///
+/// A revision linked to a common changeset is already on the client, and every other
+/// earlier revision is sent before this one, so a stored delta base is always available.
+fn linked_revisions(
+    revlog: &Revlog,
+    section: Section,
+    nodes: &[NodeHash],
+    missing: &[bool],
+    parts: &mut Vec<Part>,
+) -> Result<()> {
+    for idx in 0..revlog.len()? {
+        let idx = RevIdx::from(idx);
+        let entry = revlog.get_entry(idx)?;
+        let linkrev = entry
+            .linkrev
+            .ok_or_else(|| Error::from("revision has no linkrev"))?
+            .as_u32() as usize;
+        if !*missing
+            .get(linkrev)
+            .ok_or_else(|| Error::from("linkrev is past the changelog"))?
+        {
+            continue;
+        }
+        parts.push(stored_revision(
+            revlog,
+            section.clone(),
+            idx,
+            entry.nodeid,
+            nodes[linkrev],
+        )?);
+    }
+    Ok(())
 }
 
 fn indexed_parents(revlog: &Revlog, idx: RevIdx) -> Result<(Parents, bool)> {
@@ -189,42 +176,35 @@ fn indexed_parents(revlog: &Revlog, idx: RevIdx) -> Result<(Parents, bool)> {
 fn stored_revision(
     revlog: &Revlog,
     section: Section,
+    idx: RevIdx,
     node: NodeHash,
     linknode: NodeHash,
-    available: &HashSet<NodeHash>,
 ) -> Result<Part> {
-    let idx = RevIdx::from(revlog.index_of(&node)?);
     let (parents, renamed) = indexed_parents(revlog, idx)?;
     match revlog.get_chunk(idx)? {
         Chunk::Literal(text) => fulltext_chunk(section, node, &parents, renamed, linknode, text),
         Chunk::Deltas(base_idx, deltas) => {
             let base = revlog.get_entry(base_idx)?.nodeid;
-            if available.contains(&base) {
-                let (p1, p2) = parent_nodes(&parents, renamed);
-                let fragments = deltas
-                    .into_iter()
-                    .map(|delta| Fragment {
-                        start: delta.start,
-                        end: delta.end,
-                        content: delta.content,
-                    })
-                    .collect();
-                Ok(Part::CgChunk(
-                    section,
-                    CgDeltaChunk {
-                        node,
-                        p1,
-                        p2,
-                        base,
-                        linknode,
-                        delta: Delta::new(fragments).map_err(|err| Error::from(err.to_string()))?,
-                    },
-                ))
-            } else {
-                let blob = revlog.get_rev_by_nodeid(&node)?;
-                let text = full_text(&blob)?;
-                fulltext_chunk(section, node, &parents, renamed, linknode, text)
-            }
+            let (p1, p2) = parent_nodes(&parents, renamed);
+            let fragments = deltas
+                .into_iter()
+                .map(|delta| Fragment {
+                    start: delta.start,
+                    end: delta.end,
+                    content: delta.content,
+                })
+                .collect();
+            Ok(Part::CgChunk(
+                section,
+                CgDeltaChunk {
+                    node,
+                    p1,
+                    p2,
+                    base,
+                    linknode,
+                    delta: Delta::new(fragments).map_err(|err| Error::from(err.to_string()))?,
+                },
+            ))
         }
     }
 }
@@ -329,6 +309,7 @@ mod tests {
     use std::str::FromStr;
 
     use mercurial::revlog::{RevIdx, Revlog};
+    use mercurial_types::Path;
 
     use super::*;
 
