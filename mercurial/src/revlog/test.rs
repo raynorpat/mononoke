@@ -315,6 +315,45 @@ fn append_snapshot_split_writes_data_file() {
 }
 
 #[test]
+fn append_snapshot_split_uses_given_data_path() {
+    // A hashed `dh/` filelog's `.d` has its own hash, not the `.i` name with `d`.
+    let dir = std::env::temp_dir().join(format!(
+        "mononoke-revlog-{}-split-named",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let idx_path = dir.join("log1111.i");
+    let data_path = dir.join("log2222.d");
+    std::fs::write(&idx_path, b"").expect("empty index");
+
+    let mut revlog = Revlog::from_idx_data(&idx_path, Some(&data_path)).expect("open");
+    for (tail, text) in [(1, b"alpha\n".to_vec()), (2, incompressible(INLINE_LIMIT))] {
+        revlog
+            .append_snapshot(
+                RevlogAppend {
+                    node: node_with_tail(tail),
+                    p1: None,
+                    p2: None,
+                    linkrev: None,
+                    text,
+                },
+                RevlogCompression::Zstd,
+            )
+            .expect("append");
+    }
+    drop(revlog);
+
+    assert!(data_path.exists(), "split did not write the given data path");
+    assert!(!dir.join("log1111.d").exists());
+    let reopened = Revlog::from_idx_data(&idx_path, Some(&data_path)).expect("reopen");
+    let kept = reopened.get_rev(RevIdx::from(0u32)).expect("first");
+    assert_eq!(kept.as_blob().as_slice(), Some(&b"alpha\n"[..]));
+    drop(reopened);
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
 fn append_snapshot_inline_middle_revision_stays_readable() {
     let mut built = Revlog::new(Vec::new(), None).expect("empty revlog");
     for (tail, text) in [(1u8, &b"one\n"[..]), (2, &b"two\n"[..])] {

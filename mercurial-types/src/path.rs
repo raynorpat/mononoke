@@ -63,12 +63,15 @@ impl Path {
         ret
     }
 
-    /// Store-relative revlog index, `data/…i` or hashed `dh/…i`.
-    pub fn store_filelog(&self, dotencode: bool) -> PathBuf {
-        let mut raw = Vec::with_capacity(self.0.len() + 7);
+    /// Store-relative filelog file with extension `ext` (`i` or `d`), `data/…` or hashed `dh/…`.
+    ///
+    /// A hashed name covers the extension, so the `.d` is not the `.i` with a new extension.
+    pub fn store_filelog(&self, dotencode: bool, ext: &[u8]) -> PathBuf {
+        let mut raw = Vec::with_capacity(self.0.len() + 6 + ext.len());
         raw.extend_from_slice(b"data/");
         raw.extend_from_slice(&self.0);
-        raw.extend_from_slice(b".i");
+        raw.push(b'.');
+        raw.extend_from_slice(ext);
 
         let de = encodedir(&raw);
         let encoded = fncache_encode(&de, dotencode);
@@ -486,8 +489,26 @@ mod test {
     fn store_filelog_short_mixed_case_stays_under_data() {
         let path = Path::new(b"Foo.txt").unwrap();
         assert_eq!(
-            path.store_filelog(true),
+            path.store_filelog(true, b"i"),
             std::path::Path::new("data").join("_foo.txt.i")
+        );
+    }
+
+    #[test]
+    fn hashed_filelog_data_file_has_its_own_hash() {
+        // Names Mercurial 7 wrote in mozilla-central's store.
+        let path = Path::new(
+            b"devtools/docs/user/remote_debugging/debugging_firefox_for_android_with_webide/remote-debugging-android-open-tabs.png",
+        )
+        .unwrap();
+        let dir = std::path::Path::new("dh/devtools/docs/user/remote_d/debuggin");
+        assert_eq!(
+            path.store_filelog(true, b"i"),
+            dir.join("remote-debugging-android-open-tabs.pnga21fc45b37284615573320a40498186c8e570826.i")
+        );
+        assert_eq!(
+            path.store_filelog(true, b"d"),
+            dir.join("remote-debugging-android-open-tabs.png91f07312cd3f5d4bb1b8b8306656c1e2030489d9.d")
         );
     }
 }

@@ -215,6 +215,9 @@ impl Revlog {
                     .chain_err(|| format!("Can't open data file {:?}", data_path))?;
                 inner.data = Some(datafile);
                 inner.data_path = Some(data_path);
+            } else if let Some(path) = datapath {
+                // Inline today, but an append split must write the caller's `.d`.
+                inner.data_path = Some(path.to_path_buf());
             }
         }
 

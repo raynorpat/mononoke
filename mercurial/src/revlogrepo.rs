@@ -248,11 +248,11 @@ impl RevlogRepo {
         self.inner.lock().expect("poisoned lock").manifest.clone()
     }
 
-    fn file_index_path(&self, path: &Path) -> PathBuf {
+    fn file_store_path(&self, path: &Path, ext: &[u8]) -> PathBuf {
         let dotencode = self.requirements.contains(&Required::Dotencode);
         self.basepath
             .join("store")
-            .join(path.store_filelog(dotencode))
+            .join(path.store_filelog(dotencode, ext))
     }
 
     pub fn get_file_revlog(&self, path: &Path) -> Result<Revlog> {
@@ -262,8 +262,9 @@ impl RevlogRepo {
             Entry::Occupied(log) => Ok(log.get().clone()),
 
             Entry::Vacant(missing) => {
-                let index = self.file_index_path(path);
-                let revlog = Revlog::from_idx_data(index, None as Option<String>)?;
+                let index = self.file_store_path(path, b"i");
+                let data = self.file_store_path(path, b"d");
+                let revlog = Revlog::from_idx_data(index, Some(data))?;
                 Ok(missing.insert(revlog).clone())
             }
         }
@@ -271,7 +272,7 @@ impl RevlogRepo {
 
     /// Filelog used for appends. Creates an empty index when the file is new.
     pub fn file_revlog_for_append(&self, path: &Path) -> Result<Revlog> {
-        let index = self.file_index_path(path);
+        let index = self.file_store_path(path, b"i");
         if !index.exists() {
             if let Some(dir) = index.parent() {
                 fs::create_dir_all(dir)?;
