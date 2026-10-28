@@ -395,7 +395,10 @@ fn changegroup_part_emits_cg02_fulltext() {
         changegroup::Part::End,
     ];
 
-    let part = changegroup_part(chunks).unwrap();
+    let part = changegroup_part(futures::stream::iter(
+        chunks.into_iter().map(Ok::<_, crate::errors::Error>),
+    ))
+    .unwrap();
     let cursor = Cursor::new(Vec::with_capacity(32 * 1024));
     let mut builder = Bundle2EncodeBuilder::new(cursor);
     builder.set_compressor_type(CompressorType::Uncompressed);

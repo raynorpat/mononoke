@@ -20,9 +20,9 @@ slog-term = "2"
 sshrelay = { path = "../sshrelay" }
 rustls-pemfile = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
 
 [dev-dependencies]
 mercurial-types = { path = "../mercurial-types" }

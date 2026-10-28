@@ -15,7 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use hgproto::{HgService, Request, Response};
+use futures::StreamExt;
+use hgproto::{BundleStream, HgService, Request, Response};
 use slog::{error, info, o, Drain, Logger};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -149,7 +150,24 @@ where
         };
         info!(log, "HTTP {} {}", incoming.method, cmd);
         let close = incoming.close;
-        match dispatch(&service, &incoming, &cmd).await {
+        let body = match dispatch(&service, &incoming, &cmd).await {
+            Ok(Response::Getbundle(bundle)) => {
+                // The 200 is already sent if the bundle fails, so the client sees a cut-off body.
+                match write_hg_stream(&mut sock, bundle, close).await {
+                    Ok(sent) => info!(log, "HTTP {} -> {} bytes streamed", cmd, sent),
+                    Err(err) => {
+                        error!(log, "HTTP {} failed while streaming: {}", cmd, err);
+                        return Ok(());
+                    }
+                }
+                if close {
+                    return Ok(());
+                }
+                continue;
+            }
+            other => other.and_then(|response| response_body(&response)),
+        };
+        match body {
             Ok(body) => {
                 info!(log, "HTTP {} -> {} bytes", cmd, body.len());
                 write_hg(&mut sock, "application/mercurial-0.1", &body, close).await?;
@@ -171,10 +189,9 @@ async fn dispatch(
     service: &HgService<RepoClient>,
     incoming: &Incoming,
     cmd: &str,
-) -> Result<Bytes> {
+) -> Result<Response> {
     let req = frame_request(cmd, &incoming.query, &incoming.body)?;
-    let response = service.command(req).await?;
-    response_body(&response)
+    Ok(service.command(req).await?)
 }
 
 struct Incoming {
@@ -400,6 +417,50 @@ where
     Ok(())
 }
 
+/// Chunked `getbundle` body, zlib-compressed as the bundle is produced. Returns the bytes sent.
+///
+/// Mercurial's HTTP client zlib-decompresses `getbundle` responses
+/// (`httppeer._callcompressable`) even when the media type is 0.1.
+async fn write_hg_stream<S>(sock: &mut S, bundle: BundleStream, close: bool) -> Result<u64>
+where
+    S: AsyncWrite + Unpin,
+{
+    use std::io::Write;
+    let connection = if close { "close" } else { "keep-alive" };
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/mercurial-0.1\r\nTransfer-Encoding: chunked\r\nConnection: {connection}\r\n\r\n"
+    );
+    sock.write_all(header.as_bytes()).await?;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut body = bundle.0;
+    let mut sent = 0;
+    while let Some(bytes) = body.next().await {
+        enc.write_all(&bytes?)?;
+        sent += write_chunk(sock, enc.get_mut()).await?;
+    }
+    sent += write_chunk(sock, &mut enc.finish()?).await?;
+    sock.write_all(b"0\r\n\r\n").await?;
+    Ok(sent)
+}
+
+/// Write `buf` as one HTTP chunk and clear it. An empty `buf` writes nothing,
+/// because an empty chunk ends the body.
+async fn write_chunk<S>(sock: &mut S, buf: &mut Vec<u8>) -> Result<u64>
+where
+    S: AsyncWrite + Unpin,
+{
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    sock.write_all(format!("{:x}\r\n", buf.len()).as_bytes())
+        .await?;
+    sock.write_all(buf).await?;
+    sock.write_all(b"\r\n").await?;
+    let len = buf.len() as u64;
+    buf.clear();
+    Ok(len)
+}
+
 fn frame_request(cmd: &str, query: &HashMap<String, Vec<u8>>, body: &[u8]) -> Result<Request> {
     let mut args = HashMap::new();
     for (key, value) in query {
@@ -494,7 +555,7 @@ fn frame_preview(buf: &[u8]) -> String {
 fn response_body(response: &Response) -> Result<Bytes> {
     match response {
         Response::Capabilities(caps) => Ok(Bytes::from(caps.join(" "))),
-        Response::Getbundle(raw) => Ok(Bytes::from(zlib_compress(raw)?)),
+        Response::Getbundle(_) => Err("getbundle is streamed by the connection".into()),
         Response::Lookup(node) => Ok(Bytes::from(format!("1 {node}\n"))),
         Response::Batch(_)
         | Response::Between(_)
@@ -512,13 +573,4 @@ fn response_body(response: &Response) -> Result<Bytes> {
         | Response::Changegroupsubset
         | Response::Streamout => Err("HTTP response is not implemented for this command".into()),
     }
-}
-
-/// Mercurial's HTTP client zlib-decompresses `getbundle` responses
-/// (`httppeer._callcompressable`) even when the media type is 0.1.
-fn zlib_compress(data: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Write;
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(data)?;
-    Ok(enc.finish()?)
 }

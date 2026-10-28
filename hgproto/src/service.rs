@@ -20,7 +20,7 @@ use mercurial_types::NodeHash;
 
 use crate::errors::Error;
 use crate::sshproto;
-use crate::{BranchRes, GetbundleArgs, Request, Response};
+use crate::{BranchRes, BundleStream, GetbundleArgs, Request, Response};
 
 pub struct HgService<H> {
     commands: H,
@@ -118,6 +118,10 @@ impl<H: HgCommands> HgService<H> {
                     return box_ready(Err(Error::BatchInvalid(
                         String::from_utf8_lossy(&full_cmd).into_owned(),
                     )));
+                }
+                // Mercurial does not batch getbundle, and its stream has no batch encoding.
+                Ok(Some(Request::Getbundle(_))) => {
+                    return box_ready(Err(Error::BatchInvalid("getbundle".into())));
                 }
                 Ok(Some(cmd)) => cmd,
             };
@@ -248,8 +252,7 @@ pub trait HgCommands {
     }
 
     // @wireprotocommand('getbundle', '*')
-    // TODO: make this streaming
-    fn getbundle(&self, _args: GetbundleArgs) -> HgCommandRes<Bytes> {
+    fn getbundle(&self, _args: GetbundleArgs) -> HgCommandRes<BundleStream> {
         unimplemented("getbundle")
     }
 
@@ -335,6 +338,20 @@ mod test {
 
         match r {
             Ok(Response::Hello(ref r)) if r == &res => (),
+            bad => panic!("Bad result {:?}", bad),
+        }
+    }
+
+    #[test]
+    fn batch_rejects_getbundle() {
+        let service = HgService::new(Dummy);
+
+        let r = block_on(service.call(Request::Batch {
+            cmds: vec![(b"getbundle".to_vec(), b"heads=".to_vec())],
+        }));
+
+        match r {
+            Err(Error::BatchInvalid(cmd)) => assert_eq!(cmd, "getbundle"),
             bad => panic!("Bad result {:?}", bad),
         }
     }

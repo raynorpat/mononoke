@@ -270,6 +270,18 @@ impl RevlogRepo {
         }
     }
 
+    /// Filelog for one pass over many files. Uses the cached one if there is
+    /// one, but does not cache what it opens, so its maps close when dropped.
+    pub fn read_file_revlog(&self, path: &Path) -> Result<Revlog> {
+        let inner = self.inner.lock().expect("poisoned lock");
+        if let Some(log) = inner.filelogcache.get(path) {
+            return Ok(log.clone());
+        }
+        let index = self.file_store_path(path, b"i");
+        let data = self.file_store_path(path, b"d");
+        Revlog::from_idx_data(index, Some(data))
+    }
+
     /// Filelog used for appends. Creates an empty index when the file is new.
     pub fn file_revlog_for_append(&self, path: &Path) -> Result<Revlog> {
         let index = self.file_store_path(path, b"i");

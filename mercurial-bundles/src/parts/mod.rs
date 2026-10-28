@@ -4,13 +4,9 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
 use bytes::Bytes;
 use futures::{Stream, TryFutureExt, TryStreamExt};
 
-use crate::bail;
 use crate::changegroup::{self, packer::Cg2Packer};
 use crate::errors::*;
 use crate::part_encode::PartEncodeBuilder;
@@ -44,35 +40,15 @@ where
 
 /// Mandatory `changegroup` part, version `02`.
 ///
-/// `chunks` are packed with `Cg2Packer` and the chunk bytes become the part
-/// payload. Callers choose bundle2 compression on `Bundle2EncodeBuilder`.
-pub fn changegroup_part(chunks: Vec<changegroup::Part>) -> Result<PartEncodeBuilder> {
+/// `chunks` are packed with `Cg2Packer` as the part is written, so the payload
+/// is never held whole. Callers choose bundle2 compression on `Bundle2EncodeBuilder`.
+pub fn changegroup_part<S, E>(chunks: S) -> Result<PartEncodeBuilder>
+where
+    S: Stream<Item = std::result::Result<changegroup::Part, E>> + Send + Unpin + 'static,
+    Error: From<E>,
+{
     let mut builder = PartEncodeBuilder::mandatory("changegroup")?;
     builder.add_mparam("version", "02")?;
-    builder.set_data_bytes(pack_changegroup(chunks)?)?;
+    builder.set_data_generated(Cg2Packer::new(chunks));
     Ok(builder)
-}
-
-fn pack_changegroup(chunks: Vec<changegroup::Part>) -> Result<Bytes> {
-    let mut packer = Cg2Packer::new(futures::stream::iter(
-        chunks.into_iter().map(Ok::<_, Error>),
-    ));
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut payload = Vec::new();
-    loop {
-        match Pin::new(&mut packer).poll_next(&mut cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                payload.extend_from_slice(&chunk.into_bytes()?);
-            }
-            Poll::Ready(Some(Err(err))) => return Err(err),
-            Poll::Ready(None) => break,
-            Poll::Pending => {
-                bail!(ErrorKind::Bundle2Encode(
-                    "changegroup packer would block".into()
-                ));
-            }
-        }
-    }
-    Ok(Bytes::from(payload))
 }

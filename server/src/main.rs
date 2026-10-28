@@ -270,6 +270,22 @@ where
         };
 
         match service.command(req).await {
+            // Getbundle has no ssh framing, so each piece goes out as it is produced.
+            Ok(hgproto::Response::Getbundle(bundle)) => {
+                let mut body = bundle.0;
+                while let Some(bytes) = body.next().await {
+                    let bytes = match bytes {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            command_failed(&conn_log, Error::from(err));
+                            return Ok(());
+                        }
+                    };
+                    if stdout.send(bytes).await.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
             Ok(response) => {
                 let mut out = BytesMut::new();
                 hgproto::sshproto::response::encode(&response, &mut out);

@@ -8,7 +8,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
-use std::io::Cursor;
 use std::mem;
 use std::path::Path;
 use std::pin::Pin;
@@ -20,12 +19,13 @@ use bookmarks::{Bookmarks, ListBookmarks};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{future, stream, FutureExt, Stream, StreamExt, TryStreamExt};
-use hgproto::{self, GetbundleArgs, HgCommandRes, HgCommands};
+use hgproto::{self, BundleStream, GetbundleArgs, HgCommandRes, HgCommands};
 use mercurial::changeset::RevlogChangeset;
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{parts, Bundle2EncodeBuilder};
 use mercurial_types::{percent_encode, Changeset, NodeHash, Parents, NULL_HASH};
 use slog::{info, o, Logger};
+use tokio_util::io::ReaderStream;
 
 use crate::bundle::history_part;
 use crate::errors::Result;
@@ -150,14 +150,17 @@ async fn bookmark_pairs(repo: &Repo) -> hgproto::Result<Vec<(Vec<u8>, Vec<u8>)>>
     Ok(pairs)
 }
 
-async fn create_bundle(repo: &Repo, args: GetbundleArgs) -> hgproto::Result<Bytes> {
-    let writer = Cursor::new(Vec::new());
+/// Bytes buffered between the bundle encoder and the connection writing them out.
+const BUNDLE_PIPE: usize = 1 << 20;
+
+async fn create_bundle(repo: &Repo, args: GetbundleArgs) -> hgproto::Result<BundleStream> {
+    let (reader, writer) = tokio::io::duplex(BUNDLE_PIPE);
     let mut bundle = Bundle2EncodeBuilder::new(writer);
     // TODO: select an appropriate compressor. zstd appears to hang -- need to figure out
     // whether it's a framing issue or something else.
     bundle.set_compressor_type(CompressorType::Uncompressed);
 
-    let history = history_part(&repo.hgrepo, &args.common)
+    let history = history_part(repo.hgrepo.clone(), args.common.clone())
         .map_err(|err| hgproto::Error::from(err.to_string()))?;
     bundle.add_part(history);
 
@@ -175,8 +178,18 @@ async fn create_bundle(repo: &Repo, args: GetbundleArgs) -> hgproto::Result<Byte
         }
     }
 
-    let cursor = bundle.build().await?;
-    Ok(Bytes::from(cursor.into_inner()))
+    // Drop the writer when encoding ends so the reader sees EOF.
+    let encode = tokio::spawn(async move { bundle.build().await.map(drop) });
+    let body = ReaderStream::new(reader).map_err(hgproto::Error::from);
+    let done = stream::once(async move {
+        match encode.await {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => Some(Err(hgproto::Error::from(err))),
+            Err(err) => Some(Err(hgproto::Error::from(err.to_string()))),
+        }
+    })
+    .filter_map(future::ready);
+    Ok(BundleStream(body.chain(done).boxed()))
 }
 
 struct ParentStream {
@@ -327,7 +340,7 @@ impl HgCommands for RepoClient {
     }
 
     // @wireprotocommand('getbundle', '*')
-    fn getbundle(&self, args: GetbundleArgs) -> HgCommandRes<Bytes> {
+    fn getbundle(&self, args: GetbundleArgs) -> HgCommandRes<BundleStream> {
         info!(self.logger, "Getbundle: {:?}", args);
         let repo = Arc::clone(&self.repo);
         async move { create_bundle(&repo, args).await }.boxed()

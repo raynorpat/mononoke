@@ -27,6 +27,15 @@ pub mod sshproto;
 pub use crate::errors::{Error, ErrorKind, Result, ResultExt};
 pub use crate::service::{HgCommandRes, HgCommands, HgService};
 
+/// `getbundle` bundle bytes, produced while they are sent.
+pub struct BundleStream(pub futures::stream::BoxStream<'static, Result<Bytes>>);
+
+impl Debug for BundleStream {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.write_str("BundleStream")
+    }
+}
+
 // result from `branches()`
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct BranchRes {
@@ -129,7 +138,7 @@ pub enum Response {
     Changegroup,
     Changegroupsubset,
     Debugwireargs(Bytes),
-    Getbundle(Bytes),
+    Getbundle(BundleStream),
     Heads(HashSet<NodeHash>),
     Hello(HashMap<String, Vec<String>>),
     Listkeys(HashMap<Vec<u8>, Vec<u8>>),

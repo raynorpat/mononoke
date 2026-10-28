@@ -15,6 +15,7 @@ use mercurial::revlog::{Chunk, RevIdx, Revlog};
 use mercurial::RevlogRepo;
 use mercurial_bundles::changegroup::{CgDeltaChunk, Part, Section};
 use mercurial_bundles::part_encode::PartEncodeBuilder;
+use mercurial_bundles::Error as BundleError;
 use mercurial_bundles::parts::changegroup_part;
 use mercurial_types::delta::{Delta, Fragment};
 use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, NULL_HASH};
@@ -59,12 +60,33 @@ pub fn missing_nodes(repo: &RevlogRepo, common: &[NodeHash]) -> Result<Vec<NodeH
         .collect())
 }
 
-pub fn history_part(repo: &RevlogRepo, common: &[NodeHash]) -> Result<PartEncodeBuilder> {
-    let parts = history_parts(repo, common)?;
+/// Parts queued between the revlog reader and the bundle writer.
+const PART_QUEUE: usize = 1024;
+
+/// Changegroup part whose chunks are read from the revlogs while it is written.
+///
+/// Revlog reads block, so they run on tokio's blocking pool instead of the
+/// connection's runtime thread. A dropped part stops the reader at its next send.
+pub fn history_part(repo: RevlogRepo, common: Vec<NodeHash>) -> Result<PartEncodeBuilder> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(PART_QUEUE);
+    tokio::task::spawn_blocking(move || {
+        let sent = history_parts(&repo, &common, &mut |part| {
+            tx.blocking_send(Ok(part))
+                .map_err(|_| Error::from("getbundle writer went away"))
+        });
+        if let Err(err) = sent {
+            let _ = tx.blocking_send(Err(BundleError::from(err.to_string())));
+        }
+    });
+    let parts = futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
     changegroup_part(parts).map_err(|err| Error::from(err.to_string()))
 }
 
-fn history_parts(repo: &RevlogRepo, common: &[NodeHash]) -> Result<Vec<Part>> {
+fn history_parts(
+    repo: &RevlogRepo,
+    common: &[NodeHash],
+    emit: &mut dyn FnMut(Part) -> Result<()>,
+) -> Result<()> {
     let missing_set: HashSet<NodeHash> = missing_nodes(repo, common)?.into_iter().collect();
     let nodes = changelog_nodes(repo)?;
     // Indexed by changelog rev: is this changeset going to the client.
@@ -73,7 +95,6 @@ fn history_parts(repo: &RevlogRepo, common: &[NodeHash]) -> Result<Vec<Part>> {
         .map(|node| missing_set.contains(node))
         .collect();
 
-    let mut parts = Vec::new();
     let mut files = BTreeSet::new();
     for (rev, node) in nodes.iter().enumerate() {
         if !missing[rev] {
@@ -85,46 +106,43 @@ fn history_parts(repo: &RevlogRepo, common: &[NodeHash]) -> Result<Vec<Part>> {
         let renamed = blob.maybe_renamed();
         let parents = *blob.parents();
         let text = full_text(&blob)?;
-        parts.push(fulltext_chunk(
+        emit(fulltext_chunk(
             Section::Changeset,
             *node,
             &parents,
             renamed,
             *node,
             text,
-        )?);
+        )?)?;
     }
-    parts.push(Part::SectionEnd(Section::Changeset));
+    emit(Part::SectionEnd(Section::Changeset))?;
 
     linked_revisions(
         &repo.manifest_revlog(),
         Section::Manifest,
         &nodes,
         &missing,
-        &mut parts,
+        emit,
     )?;
-    parts.push(Part::SectionEnd(Section::Manifest));
+    emit(Part::SectionEnd(Section::Manifest))?;
 
     for path in files {
-        let revlog = repo.get_file_revlog(&path)?;
-        let start = parts.len();
-        linked_revisions(
+        let revlog = repo.read_file_revlog(&path)?;
+        if linked_revisions(
             &revlog,
             Section::Filelog(path.clone()),
             &nodes,
             &missing,
-            &mut parts,
-        )?;
-        if parts.len() > start {
-            parts.push(Part::SectionEnd(Section::Filelog(path)));
+            emit,
+        )? {
+            emit(Part::SectionEnd(Section::Filelog(path)))?;
         }
     }
-    parts.push(Part::End);
-
-    Ok(parts)
+    emit(Part::End)
 }
 
 /// Emit every revision of `revlog` whose linkrev is a missing changeset, in revision order.
+/// Returns whether any revision was emitted.
 ///
 /// A revision linked to a common changeset is already on the client, and every other
 /// earlier revision is sent before this one, so a stored delta base is always available.
@@ -133,8 +151,9 @@ fn linked_revisions(
     section: Section,
     nodes: &[NodeHash],
     missing: &[bool],
-    parts: &mut Vec<Part>,
-) -> Result<()> {
+    emit: &mut dyn FnMut(Part) -> Result<()>,
+) -> Result<bool> {
+    let mut any = false;
     for idx in 0..revlog.len()? {
         let idx = RevIdx::from(idx);
         let entry = revlog.get_entry(idx)?;
@@ -142,21 +161,20 @@ fn linked_revisions(
             .linkrev
             .ok_or_else(|| Error::from("revision has no linkrev"))?
             .as_u32() as usize;
-        if !*missing
-            .get(linkrev)
-            .ok_or_else(|| Error::from("linkrev is past the changelog"))?
-        {
+        // A linkrev past `missing` is a push that landed after the changelog was read.
+        if !missing.get(linkrev).copied().unwrap_or(false) {
             continue;
         }
-        parts.push(stored_revision(
+        emit(stored_revision(
             revlog,
             section.clone(),
             idx,
             entry.nodeid,
             nodes[linkrev],
-        )?);
+        )?)?;
+        any = true;
     }
-    Ok(())
+    Ok(any)
 }
 
 fn indexed_parents(revlog: &Revlog, idx: RevIdx) -> Result<(Parents, bool)> {
@@ -561,6 +579,16 @@ mod tests {
             .collect()
     }
 
+    fn collect_parts(repo: &RevlogRepo, common: &[NodeHash]) -> Vec<Part> {
+        let mut parts = Vec::new();
+        history_parts(repo, common, &mut |part| {
+            parts.push(part);
+            Ok(())
+        })
+        .expect("history");
+        parts
+    }
+
     fn open_repo(repo: &std::path::Path) -> RevlogRepo {
         RevlogRepo::open(repo.join(".hg")).expect("open repo")
     }
@@ -569,7 +597,7 @@ mod tests {
     fn second_file_revision_uses_stored_base() {
         let temp = init_share_safe_repo();
         let repo = open_repo(&temp.repo);
-        let parts = history_parts(&repo, &[]).expect("history");
+        let parts = collect_parts(&repo, &[]);
         let chunks = filelog_chunks(&parts);
         assert_eq!(chunks.len(), 2, "filelog chunks");
         assert_eq!(chunks[0].base, NULL_HASH, "first file base");
@@ -597,7 +625,7 @@ mod tests {
         let common = NodeHash::from_str(std::str::from_utf8(&logged.stdout).expect("utf8").trim())
             .expect("changeset node");
         let repo = open_repo(&temp.repo);
-        let parts = history_parts(&repo, &[common]).expect("history");
+        let parts = collect_parts(&repo, &[common]);
         let chunks = filelog_chunks(&parts);
         assert_eq!(chunks.len(), 1, "filelog chunks");
 
