@@ -20,6 +20,7 @@ use mercurial::revlogrepo::Required;
 use mercurial::RevlogRepo;
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{Chunk, Error as BundleError};
+use mercurial_types::path::decodedir;
 use mercurial_types::{percent_encode, Path};
 
 use crate::bundle::read_in_order;
@@ -82,6 +83,8 @@ pub fn list_store(repo: &RevlogRepo) -> Result<Vec<StoreFile>> {
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
+        // fncache keeps `encodedir` names, such as `changelog.d.hg/` for a `changelog.d/` directory.
+        let line = decodedir(line);
         let path = line
             .strip_prefix(b"data/")
             .and_then(|rest| {
@@ -91,7 +94,7 @@ pub fn list_store(repo: &RevlogRepo) -> Result<Vec<StoreFile>> {
             .ok_or_else(|| {
                 Error::from(format!(
                     "stream clone: unexpected fncache entry {}",
-                    String::from_utf8_lossy(line)
+                    String::from_utf8_lossy(&line)
                 ))
             })?;
         paths.insert(path.to_vec());

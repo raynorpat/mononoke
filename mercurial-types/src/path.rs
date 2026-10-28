@@ -257,6 +257,13 @@ fn encodedir(path: &[u8]) -> Vec<u8> {
     replace_bytes(&path, b".d/", b".d.hg/")
 }
 
+/// Undo `encodedir`, as Mercurial's `store.decodedir` does when it reads fncache.
+pub fn decodedir(path: &[u8]) -> Vec<u8> {
+    let path = replace_bytes(path, b".d.hg/", b".d/");
+    let path = replace_bytes(&path, b".i.hg/", b".i/");
+    replace_bytes(&path, b".hg.hg/", b".hg/")
+}
+
 fn replace_bytes(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(hay.len());
     let mut i = 0;
@@ -483,6 +490,15 @@ mod test {
         let p = a.fsencode(false);
 
         assert_eq!(p, PathBuf::from("_h_e_l_l_o.d.hg/_w_o_r_l_d.d"));
+    }
+
+    #[test]
+    fn decodedir_matches_mercurial() {
+        // Cases from the `store.decodedir` docstring.
+        assert_eq!(decodedir(b"data/foo.i"), b"data/foo.i");
+        assert_eq!(decodedir(b"data/foo.i.hg/bla.i"), b"data/foo.i/bla.i");
+        assert_eq!(decodedir(b"data/foo.i.hg.hg/bla.i"), b"data/foo.i.hg/bla.i");
+        assert_eq!(decodedir(&encodedir(b"data/a.d/b.hg/c.i")), b"data/a.d/b.hg/c.i");
     }
 
     #[test]

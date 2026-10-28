@@ -1001,7 +1001,13 @@ fn stream_clone_and_changegroup_clone_match() {
     // Long enough that its filelog is hashed under `store/dh`.
     let long = format!("Long{}.txt", "x".repeat(130));
     fs::write(repo.join(&long), b"long\n").expect("write long file");
-    assert_hg(&hg(&repo, &["add", &long]), "hg add long");
+    // A directory Mercurial's fncache stores as `changelog.d.hg/`.
+    fs::create_dir_all(repo.join("changelog.d")).expect("mkdir changelog.d");
+    fs::write(repo.join("changelog.d").join("note.txt"), b"note\n").expect("write note");
+    assert_hg(
+        &hg(&repo, &["add", &long, "changelog.d/note.txt"]),
+        "hg add long",
+    );
     assert_hg(
         &hg(&repo, &["commit", "-m", "long", "-u", "test"]),
         "hg commit long",
@@ -1054,6 +1060,8 @@ fn stream_clone_and_changegroup_clone_match() {
         assert_hg(&hg(&dest, &["verify"]), &format!("{label} verify"));
         let body = fs::read(dest.join(&long)).expect("long file");
         assert_eq!(body, b"long\n", "{label} long file");
+        let note = fs::read(dest.join("changelog.d").join("note.txt")).expect("note");
+        assert_eq!(note, b"note\n", "{label} changelog.d/note.txt");
     }
     drop(server);
 }
