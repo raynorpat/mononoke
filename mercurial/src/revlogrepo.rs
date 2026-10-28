@@ -222,13 +222,6 @@ impl RevlogRepo {
         inner.manifest.get_rev(idx)
     }
 
-    pub fn get_manifest_blob_by_nodeid(
-        &self,
-        nodeid: &NodeHash,
-    ) -> BoxFuture<'static, StdResult<BlobNode, Error>> {
-        future::ready(self.manifest_blob(nodeid)).boxed()
-    }
-
     pub fn get_manifest_by_nodeid(
         &self,
         nodeid: &NodeHash,
