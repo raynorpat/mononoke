@@ -422,6 +422,11 @@ impl RevlogInner {
             Some(idx) => Ok(idx),   // cache hit
 
             None => {
+                // Once every revision is in the map, a miss is not in this
+                // revlog. Without this, each unknown node scans the whole index.
+                if self.nodeidx.len() == self.revision_count()? as usize {
+                    return Err(ErrorKind::Revlog(format!("nodeid {} not found", nodeid)).into());
+                }
                 // search the hard way
                 let mut posidx = None;
                 let res = self.into_iter().position(|(i, entry)| {

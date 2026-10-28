@@ -237,6 +237,52 @@ fn append_snapshot_converts_past_inline_limit() {
 }
 
 #[test]
+fn unknown_node_lookups_stay_misses_after_the_map_is_full() {
+    let mut revlog = Revlog::new(Vec::new(), None).expect("empty revlog");
+    let mut nodes = Vec::new();
+    for tail in 1..=3u8 {
+        let node = node_with_tail(tail);
+        revlog
+            .append_snapshot(
+                RevlogAppend {
+                    node,
+                    p1: nodes.last().copied(),
+                    p2: None,
+                    linkrev: None,
+                    text: vec![tail; 8],
+                },
+                RevlogCompression::Zstd,
+            )
+            .expect("append");
+        nodes.push(node);
+    }
+    let unknown = node_with_tail(0x42);
+    // The first miss scans, the second answers from the full map.
+    assert!(revlog.index_of(&unknown).is_err());
+    assert!(revlog.index_of(&unknown).is_err());
+    for (idx, node) in nodes.iter().enumerate() {
+        assert_eq!(revlog.index_of(node).expect("known node"), idx as u32);
+    }
+
+    let later = node_with_tail(4);
+    assert!(revlog.index_of(&later).is_err());
+    revlog
+        .append_snapshot(
+            RevlogAppend {
+                node: later,
+                p1: Some(nodes[2]),
+                p2: None,
+                linkrev: None,
+                text: vec![4; 8],
+            },
+            RevlogCompression::Zstd,
+        )
+        .expect("append later");
+    assert_eq!(revlog.index_of(&later).expect("appended node"), 3);
+    assert!(revlog.index_of(&unknown).is_err());
+}
+
+#[test]
 fn append_snapshot_round_trips_zlib() {
     let mut revlog = Revlog::new(Vec::new(), None).expect("empty revlog");
     let idx = revlog
