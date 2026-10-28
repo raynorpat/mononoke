@@ -20,6 +20,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryFutureExt};
 
 use asyncmemo::Filler;
+use mercurial_types::path::encodedir;
 use mercurial_types::{BlobNode, Changeset, Manifest, NodeHash, Path, Repo};
 use stockbookmarks::StockBookmarks;
 
@@ -302,30 +303,40 @@ impl RevlogRepo {
                 fs::create_dir_all(dir)?;
             }
             fs::write(&index, [])?;
-            self.record_fncache(&index)?;
+            self.record_fncache(path, b"i")?;
         }
         self.get_file_revlog(path)
     }
 
-    fn record_fncache(&self, index: &std::path::Path) -> Result<()> {
+    /// Add the filelog's `.d` to fncache once appends have split it out of the index.
+    pub fn record_file_data(&self, path: &Path) -> Result<()> {
+        if self.file_store_path(path, b"d").exists() {
+            self.record_fncache(path, b"d")?;
+        }
+        Ok(())
+    }
+
+    fn record_fncache(&self, path: &Path, ext: &[u8]) -> Result<()> {
         if !self.requirements.contains(&Required::Fncache) {
             return Ok(());
         }
-        let store = self.basepath.join("store");
-        let Ok(rel) = index.strip_prefix(&store) else {
-            return Ok(());
-        };
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        let fncache = store.join("fncache");
+        // Mercurial keeps the file name with only directory encoding, not the
+        // case-folded or hashed store path.
+        let mut name = b"data/".to_vec();
+        name.extend_from_slice(path.as_slice());
+        name.push(b'.');
+        name.extend_from_slice(ext);
+        let rel = encodedir(&name);
+        let fncache = self.basepath.join("store").join("fncache");
         let mut bytes = match fs::read(&fncache) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => return Err(err.into()),
         };
-        if bytes.split(|byte| *byte == b'\n').any(|line| line == rel.as_bytes()) {
+        if bytes.split(|byte| *byte == b'\n').any(|line| line == rel.as_slice()) {
             return Ok(());
         }
-        bytes.extend_from_slice(rel.as_bytes());
+        bytes.extend_from_slice(&rel);
         bytes.push(b'\n');
         fs::write(fncache, bytes)?;
         Ok(())

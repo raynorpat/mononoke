@@ -251,7 +251,7 @@ const MAX_SHORT_DIRS_LEN: usize = 8 * (DIR_PREFIX_LEN + 1) - 4;
 
 /// `.hg/`, `.i/`, and `.d/` become `.hg.hg/`, `.i.hg/`, and `.d.hg/`.
 /// Replacements are not scanned again.
-fn encodedir(path: &[u8]) -> Vec<u8> {
+pub fn encodedir(path: &[u8]) -> Vec<u8> {
     let path = replace_bytes(path, b".hg/", b".hg.hg/");
     let path = replace_bytes(&path, b".i/", b".i.hg/");
     replace_bytes(&path, b".d/", b".d.hg/")

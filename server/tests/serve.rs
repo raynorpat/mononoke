@@ -1065,3 +1065,82 @@ fn stream_clone_and_changegroup_clone_match() {
     }
     drop(server);
 }
+
+#[test]
+fn ssh_push_records_mercurial_fncache_names() {
+    let temp = TempDir::new("fn");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let clone = hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "dest"], &shim);
+    assert_hg(&clone, "clone");
+
+    let dest = temp.0.join("dest");
+    let long = format!("Long{}.txt", "x".repeat(130));
+    fs::write(dest.join("Mixed.txt"), b"mixed\n").expect("write Mixed.txt");
+    fs::create_dir_all(dest.join("changelog.d")).expect("mkdir changelog.d");
+    fs::write(dest.join("changelog.d").join("note.txt"), b"note\n").expect("write note");
+    fs::write(dest.join(&long), b"long\n").expect("write long");
+    // Incompressible and past the inline limit, so the filelog is split into a `.d`.
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let big: Vec<u8> = (0..200_000)
+        .map(|_| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 56) as u8
+        })
+        .collect();
+    fs::write(dest.join("big.bin"), &big).expect("write big.bin");
+    assert_hg(
+        &hg(
+            &dest,
+            &["add", "Mixed.txt", "changelog.d/note.txt", &long, "big.bin"],
+        ),
+        "add",
+    );
+    assert_hg(
+        &hg(&dest, &["commit", "-m", "names", "-u", "test"]),
+        "commit",
+    );
+    let push = hg_ssh(&dest, &["push"], &shim);
+    assert_hg(&push, "push");
+
+    let fncache =
+        fs::read_to_string(repo.join(".hg").join("store").join("fncache")).expect("served fncache");
+    let lines: Vec<&str> = fncache.lines().collect();
+    let long_entry = format!("data/{long}.i");
+    for want in [
+        "data/a.txt.i",
+        "data/Mixed.txt.i",
+        "data/changelog.d.hg/note.txt.i",
+        long_entry.as_str(),
+        "data/big.bin.i",
+        "data/big.bin.d",
+    ] {
+        assert!(
+            lines.contains(&want),
+            "fncache missing {want:?}:\n{fncache}"
+        );
+    }
+    assert_eq!(lines.len(), 6, "fncache:\n{fncache}");
+
+    let verify = hg(&repo, &["verify"]);
+    assert_hg(&verify, "served verify");
+    let stderr = String::from_utf8_lossy(&verify.stderr);
+    assert!(
+        !stderr.contains("warning"),
+        "served verify warned:\n{stderr}"
+    );
+
+    // A stream clone lists the store through fncache.
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let streamed = hg(&temp.0, &["clone", &url, "streamed"]);
+    assert_hg(&streamed, "stream clone");
+    let streamed_dir = temp.0.join("streamed");
+    assert_hg(&hg(&streamed_dir, &["verify"]), "stream clone verify");
+    assert_eq!(
+        fs::read(streamed_dir.join("big.bin")).expect("streamed big.bin"),
+        big
+    );
+    drop(server);
+}

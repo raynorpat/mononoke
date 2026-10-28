@@ -274,6 +274,9 @@ fn append_group(
             return Err("changegroup revision has no parent in the revlog".into());
         }
     }
+    if let Section::Filelog(path) = section {
+        repo.record_file_data(path)?;
+    }
     Ok(())
 }
 
