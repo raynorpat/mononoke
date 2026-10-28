@@ -47,6 +47,8 @@ pub enum Required {
     RevlogCompressionZstd,
     ShareSafe,
     SparseRevlog,
+    /// Working-copy format only. The server never reads a dirstate.
+    DirstateV2,
 }
 
 impl Display for Required {
@@ -66,6 +68,7 @@ impl Display for Required {
             Required::RevlogCompressionZstd => "revlog-compression-zstd",
             Required::ShareSafe => "share-safe",
             Required::SparseRevlog => "sparserevlog",
+            Required::DirstateV2 => "dirstate-v2",
         };
         write!(fmt, "{}", s)
     }
@@ -90,6 +93,7 @@ impl FromStr for Required {
             "revlog-compression-zstd" => Ok(Required::RevlogCompressionZstd),
             "share-safe" => Ok(Required::ShareSafe),
             "sparserevlog" => Ok(Required::SparseRevlog),
+            "dirstate-v2" => Ok(Required::DirstateV2),
             unk => Err(ErrorKind::UnknownReq(unk.into()).into()),
         }
     }
@@ -411,7 +415,7 @@ mod test {
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::RevlogRepo;
+    use super::{Required, RevlogRepo};
 
     fn open_requires(label: &str, lines: &[&str]) -> crate::errors::Result<RevlogRepo> {
         open_split(label, lines, None)
@@ -547,6 +551,18 @@ mod test {
         ] {
             assert!(names.iter().any(|n| n == line), "{line} missing from {names:?}");
         }
+    }
+
+    #[test]
+    fn dirstate_v2_requirement_is_accepted() {
+        // A working-copy requirement, so Mercurial keeps it in `.hg/requires`.
+        let repo = open_split(
+            "dsv2",
+            &["dirstate-v2", "share-safe"],
+            Some(&["fncache", "generaldelta", "revlogv1", "store"]),
+        )
+        .expect("dirstate-v2 repo opens");
+        assert!(repo.get_requirements().contains(&Required::DirstateV2));
     }
 
     #[test]

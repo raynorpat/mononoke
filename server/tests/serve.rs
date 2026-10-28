@@ -1185,3 +1185,64 @@ fn stream_clone_after_push_sees_the_push() {
     );
     drop(server);
 }
+
+#[test]
+fn dirstate_v2_repo_is_served_and_clients_keep_their_own_dirstate() {
+    // Without Mercurial's Rust extensions, hg refuses dirstate-v2 unless told the slow path is fine.
+    const SLOW_DSV2: &str = "storage.dirstate-v2.slow-path=allow";
+    let temp = TempDir::new("d2");
+    let mut init = Command::new("hg");
+    init.current_dir(&temp.0)
+        .args(["init", "repo"])
+        .args(["--config", "format.use-dirstate-v2=true"])
+        .args(["--config", SLOW_DSV2])
+        .args(["--config", "format.use-persistent-nodemap=false"])
+        .env("HGPLAIN", "1")
+        .env("HGRCPATH", "");
+    assert_hg(
+        &output_timeout(&mut init, Duration::from_secs(120)),
+        "hg init",
+    );
+    let repo = temp.0.join("repo");
+    let requires = fs::read_to_string(repo.join(".hg").join("requires")).expect("requires");
+    assert!(
+        requires.lines().any(|line| line == "dirstate-v2"),
+        "requires missing dirstate-v2:\n{requires}"
+    );
+    fs::write(repo.join("a.txt"), b"alpha\n").expect("write a.txt");
+    assert_hg(
+        &hg(&repo, &["add", "a.txt", "--config", SLOW_DSV2]),
+        "hg add",
+    );
+    assert_hg(
+        &hg(
+            &repo,
+            &["commit", "-m", "first", "-u", "test", "--config", SLOW_DSV2],
+        ),
+        "hg commit",
+    );
+
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    for (label, args) in [
+        ("stream", vec!["clone", url.as_str(), "stream"]),
+        (
+            "changegroup",
+            vec!["clone", "--pull", url.as_str(), "changegroup"],
+        ),
+    ] {
+        let clone = hg(&temp.0, &args);
+        assert_hg(&clone, &format!("{label} clone"));
+        let dest = temp.0.join(label);
+        assert_hg(&hg(&dest, &["verify"]), &format!("{label} verify"));
+        assert_eq!(fs::read(dest.join("a.txt")).expect("a.txt"), b"alpha\n");
+        // The working-copy format is the client's choice, not the server's.
+        let cloned = fs::read_to_string(dest.join(".hg").join("requires")).expect("requires");
+        assert!(
+            !cloned.lines().any(|line| line == "dirstate-v2"),
+            "{label} clone took dirstate-v2:\n{cloned}"
+        );
+    }
+    drop(server);
+}

@@ -56,7 +56,11 @@ pub fn stream_requirements(repo: &RevlogRepo) -> Option<String> {
         .filter(|req| {
             !matches!(
                 req,
-                Required::Store | Required::Fncache | Required::Dotencode | Required::ShareSafe
+                Required::Store
+                    | Required::Fncache
+                    | Required::Dotencode
+                    | Required::ShareSafe
+                    | Required::DirstateV2
             )
         })
         .map(ToString::to_string)
