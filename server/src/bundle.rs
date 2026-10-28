@@ -6,12 +6,12 @@
 
 //! Changegroup history for `getbundle`.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
-use futures::{Future, Stream};
+use futures::Future;
 use mercurial::revlog::{Chunk, RevIdx, Revlog};
 use mercurial::RevlogRepo;
 use mercurial_bundles::changegroup::{CgDeltaChunk, Part, Section};
@@ -23,42 +23,41 @@ use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, Path, NULL_HASH};
 
 use crate::errors::{Error, Result};
 
-pub fn missing_nodes(repo: &RevlogRepo, common: &[NodeHash]) -> Result<Vec<NodeHash>> {
-    let revs = revisions(repo)?;
-    let mut index = HashMap::with_capacity(revs.len());
-    for (idx, rev) in revs.iter().enumerate() {
-        index.insert(rev.node, idx);
+/// Changelog nodes in revision order, and for each whether the client lacks
+/// it: every changeset that is not an ancestor of a `common` node.
+///
+/// Parents come from the changelog index, so no changeset text is read.
+fn missing_revs(repo: &RevlogRepo, common: &[NodeHash]) -> Result<(Vec<NodeHash>, Vec<bool>)> {
+    let changelog = repo.changelog_revlog();
+    let len = changelog.len()? as usize;
+    let mut nodes = Vec::with_capacity(len);
+    let mut parents = Vec::with_capacity(len);
+    for idx in 0..len {
+        let entry = changelog.get_entry(RevIdx::from(idx))?;
+        nodes.push(entry.nodeid);
+        parents.push([entry.p1, entry.p2]);
     }
 
-    let mut excluded = vec![false; revs.len()];
+    let mut missing = vec![true; len];
     for node in common {
         // NULL_HASH is not a changelog node and does not exclude real revisions.
         if *node == NULL_HASH {
             continue;
         }
-        let Some(&start) = index.get(node) else {
+        // The client may have commits this server does not.
+        let Ok(start) = changelog.index_of(node) else {
             continue;
         };
-        let mut stack = vec![start];
+        let mut stack = vec![start as usize];
         while let Some(idx) = stack.pop() {
-            if excluded[idx] {
+            if !missing[idx] {
                 continue;
             }
-            excluded[idx] = true;
-            for parent in &revs[idx].parents {
-                if let Some(&parent_idx) = index.get(parent) {
-                    stack.push(parent_idx);
-                }
-            }
+            missing[idx] = false;
+            stack.extend(parents[idx].iter().flatten().map(|p| p.as_u32() as usize));
         }
     }
-
-    Ok(revs
-        .into_iter()
-        .enumerate()
-        .filter(|(idx, _)| !excluded[*idx])
-        .map(|(_, rev)| rev.node)
-        .collect())
+    Ok((nodes, missing))
 }
 
 /// Parts queued between the revlog reader and the bundle writer.
@@ -88,13 +87,7 @@ fn history_parts(
     common: &[NodeHash],
     emit: &mut dyn FnMut(Part) -> Result<()>,
 ) -> Result<()> {
-    let missing_set: HashSet<NodeHash> = missing_nodes(repo, common)?.into_iter().collect();
-    let nodes = changelog_nodes(repo)?;
-    // Indexed by changelog rev: is this changeset going to the client.
-    let missing: Vec<bool> = nodes
-        .iter()
-        .map(|node| missing_set.contains(node))
-        .collect();
+    let (nodes, missing) = missing_revs(repo, common)?;
 
     let mut files = BTreeSet::new();
     for (rev, node) in nodes.iter().enumerate() {
@@ -291,40 +284,6 @@ fn stored_revision(
                     delta: Delta::new(fragments).map_err(|err| Error::from(err.to_string()))?,
                 },
             ))
-        }
-    }
-}
-
-struct Revision {
-    node: NodeHash,
-    parents: Vec<NodeHash>,
-}
-
-fn revisions(repo: &RevlogRepo) -> Result<Vec<Revision>> {
-    let nodes = changelog_nodes(repo)?;
-    let mut revs = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let cs = ready(repo.get_changeset_by_nodeid(&node))??;
-        let parents = cs
-            .parents()
-            .into_iter()
-            .filter(|parent| *parent != NULL_HASH)
-            .collect();
-        revs.push(Revision { node, parents });
-    }
-    Ok(revs)
-}
-
-fn changelog_nodes(repo: &RevlogRepo) -> Result<Vec<NodeHash>> {
-    let mut stream = repo.changesets();
-    let waker = futures::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut nodes = Vec::new();
-    loop {
-        match Pin::new(&mut stream).poll_next(&mut cx) {
-            Poll::Ready(Some(item)) => nodes.push(item?),
-            Poll::Ready(None) => return Ok(nodes),
-            Poll::Pending => return Err("changelog walk would block".into()),
         }
     }
 }
@@ -689,6 +648,47 @@ mod tests {
 
     fn open_repo(repo: &std::path::Path) -> RevlogRepo {
         RevlogRepo::open(repo.join(".hg")).expect("open repo")
+    }
+
+    #[test]
+    fn missing_revs_skip_ancestors_of_common() {
+        // Revs 0 and 1 are linear. Rev 2 branches from rev 0.
+        let temp = init_share_safe_repo();
+        assert_hg(&hg(&temp.repo, &["update", "-r", "0"]), "hg update 0");
+        std::fs::write(temp.repo.join("b.txt"), b"branch\n").expect("write b.txt");
+        assert_hg(&hg(&temp.repo, &["add", "b.txt"]), "hg add b.txt");
+        assert_hg(
+            &hg(&temp.repo, &["commit", "-m", "branch", "-u", "test"]),
+            "hg commit branch",
+        );
+        let node = |rev: &str| {
+            let out = hg(&temp.repo, &["log", "-r", rev, "-T", "{node}"]);
+            assert_hg(&out, "hg log");
+            NodeHash::from_str(std::str::from_utf8(&out.stdout).expect("utf8").trim())
+                .expect("node")
+        };
+        let repo = open_repo(&temp.repo);
+
+        let (nodes, missing) = missing_revs(&repo, &[]).expect("no common");
+        assert_eq!(nodes, vec![node("0"), node("1"), node("2")]);
+        assert_eq!(missing, vec![true, true, true]);
+
+        let (_, missing) = missing_revs(&repo, &[NULL_HASH]).expect("null common");
+        assert_eq!(missing, vec![true, true, true]);
+
+        let (_, missing) = missing_revs(&repo, &[node("1")]).expect("common 1");
+        assert_eq!(missing, vec![false, false, true]);
+
+        let (_, missing) = missing_revs(&repo, &[node("0")]).expect("common 0");
+        assert_eq!(missing, vec![false, true, true]);
+
+        let (_, missing) = missing_revs(&repo, &[node("1"), node("2")]).expect("both heads");
+        assert_eq!(missing, vec![false, false, false]);
+
+        // A client may have commits this server never saw.
+        let unknown = NodeHash::from_bytes(&[0x42; 20]).expect("unknown node");
+        let (_, missing) = missing_revs(&repo, &[unknown, node("2")]).expect("unknown");
+        assert_eq!(missing, vec![false, true, false]);
     }
 
     #[test]
