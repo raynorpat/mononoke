@@ -16,8 +16,8 @@ use mercurial::revlog::{Chunk, RevIdx, Revlog};
 use mercurial::RevlogRepo;
 use mercurial_bundles::changegroup::{CgDeltaChunk, Part, Section};
 use mercurial_bundles::part_encode::PartEncodeBuilder;
-use mercurial_bundles::Error as BundleError;
 use mercurial_bundles::parts::changegroup_part;
+use mercurial_bundles::Error as BundleError;
 use mercurial_types::delta::{Delta, Fragment};
 use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, Path, NULL_HASH};
 

@@ -29,10 +29,14 @@ use tokio_util::io::ReaderStream;
 
 use crate::bundle::history_part;
 use crate::errors::Result;
+use crate::stream::{list_store, stream_part, stream_requirements};
 
 pub struct Repo {
     path: String,
     hgrepo: mercurial::RevlogRepo,
+    /// Held while a push writes and while a stream clone lists the store, so
+    /// the listed sizes are one snapshot.
+    push_lock: tokio::sync::Mutex<()>,
     #[allow(dead_code)]
     logger: Logger,
 }
@@ -49,12 +53,15 @@ fn wireprotocaps() -> Vec<String> {
     ]
 }
 
-fn bundle2caps() -> String {
-    let caps = [
+fn bundle2caps(stream: bool) -> String {
+    let mut caps = vec![
         ("HG20", Vec::<&str>::new()),
         ("listkeys", Vec::new()),
         ("changegroup", vec!["02"]),
     ];
+    if stream {
+        caps.push(("stream", vec!["v2"]));
+    }
 
     let mut encodedcaps = Vec::new();
     for (key, value) in &caps {
@@ -68,9 +75,15 @@ fn bundle2caps() -> String {
     percent_encode(&encodedcaps.join("\n"))
 }
 
-fn advertised_caps() -> Vec<String> {
+fn advertised_caps(repo: &mercurial::RevlogRepo) -> Vec<String> {
     let mut caps = wireprotocaps();
-    caps.push(format!("bundle2={}", bundle2caps()));
+    let streamreqs = stream_requirements(repo);
+    if let Some(reqs) = &streamreqs {
+        // Clients stream-clone by default; `hg clone --pull` still gets a changegroup.
+        caps.push("stream-preferred".to_string());
+        caps.push(format!("streamreqs={reqs}"));
+    }
+    caps.push(format!("bundle2={}", bundle2caps(streamreqs.is_some())));
     caps
 }
 
@@ -81,6 +94,7 @@ impl Repo {
         Ok(Repo {
             path: format!("{:?}", path),
             hgrepo: mercurial::RevlogRepo::open(path)?,
+            push_lock: tokio::sync::Mutex::new(()),
             logger: parent_logger.new(o!("repo" => format!("{:?}", path))),
         })
     }
@@ -153,16 +167,20 @@ async fn bookmark_pairs(repo: &Repo) -> hgproto::Result<Vec<(Vec<u8>, Vec<u8>)>>
 /// Bytes buffered between the bundle encoder and the connection writing them out.
 const BUNDLE_PIPE: usize = 1 << 20;
 
-async fn create_bundle(repo: &Repo, args: GetbundleArgs) -> hgproto::Result<BundleStream> {
+async fn create_bundle(repo: &Arc<Repo>, args: GetbundleArgs) -> hgproto::Result<BundleStream> {
     let (reader, writer) = tokio::io::duplex(BUNDLE_PIPE);
     let mut bundle = Bundle2EncodeBuilder::new(writer);
     // TODO: select an appropriate compressor. zstd appears to hang -- need to figure out
     // whether it's a framing issue or something else.
     bundle.set_compressor_type(CompressorType::Uncompressed);
 
-    let history = history_part(repo.hgrepo.clone(), args.common.clone())
-        .map_err(|err| hgproto::Error::from(err.to_string()))?;
-    bundle.add_part(history);
+    if args.stream {
+        bundle.add_part(stream_clone_part(repo).await?);
+    } else if args.cg {
+        let history = history_part(repo.hgrepo.clone(), args.common.clone())
+            .map_err(|err| hgproto::Error::from(err.to_string()))?;
+        bundle.add_part(history);
+    }
 
     if listkeys_requested(&args, b"phases") {
         bundle.add_part(empty_listkeys_part("phases")?);
@@ -190,6 +208,23 @@ async fn create_bundle(repo: &Repo, args: GetbundleArgs) -> hgproto::Result<Bund
     })
     .filter_map(future::ready);
     Ok(BundleStream(body.chain(done).boxed()))
+}
+
+async fn stream_clone_part(repo: &Arc<Repo>) -> hgproto::Result<PartEncodeBuilder> {
+    let requirements = stream_requirements(&repo.hgrepo).ok_or_else(|| {
+        hgproto::Error::from(
+            "stream clone requested, but this repo is not served as one".to_string(),
+        )
+    })?;
+    let lister = Arc::clone(repo);
+    let files = tokio::task::spawn_blocking(move || {
+        let _push = lister.push_lock.blocking_lock();
+        list_store(&lister.hgrepo)
+    })
+    .await
+    .map_err(|err| hgproto::Error::from(err.to_string()))?
+    .map_err(|err| hgproto::Error::from(err.to_string()))?;
+    stream_part(files, &requirements).map_err(|err| hgproto::Error::from(err.to_string()))
 }
 
 struct ParentStream {
@@ -349,7 +384,7 @@ impl HgCommands for RepoClient {
     // @wireprotocommand('capabilities')
     fn capabilities(&self) -> HgCommandRes<Vec<String>> {
         info!(self.logger, "capabilities");
-        future::ok(advertised_caps()).boxed()
+        future::ok(advertised_caps(&self.repo.hgrepo)).boxed()
     }
 
     // @wireprotocommand('hello')
@@ -357,7 +392,10 @@ impl HgCommands for RepoClient {
         info!(self.logger, "Hello -> capabilities");
 
         let mut res = HashMap::new();
-        res.insert("capabilities".to_string(), advertised_caps());
+        res.insert(
+            "capabilities".to_string(),
+            advertised_caps(&self.repo.hgrepo),
+        );
 
         future::ok(res).boxed()
     }
@@ -388,6 +426,7 @@ impl HgCommands for RepoClient {
         info!(self.logger, "unbundle heads {:?}", heads);
         let repo = Arc::clone(&self.repo);
         async move {
+            let _push = repo.push_lock.lock().await;
             let applied = crate::push::apply_repo(&repo.hgrepo, &heads, &bundle)
                 .map_err(|err| hgproto::Error::from(err.to_string()))?;
             crate::push::reply_bundle(&applied)

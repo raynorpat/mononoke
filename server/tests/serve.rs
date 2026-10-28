@@ -993,3 +993,67 @@ fn share_safe_sparse_repo_clones_over_ssh_http_and_https() {
     assert_cloned_tip("https", &https, &temp.0.join("https-dest"), &tip_node, &log);
     drop(server);
 }
+
+#[test]
+fn stream_clone_and_changegroup_clone_match() {
+    let temp = TempDir::new("st");
+    let repo = init_share_safe_repo(&temp.0);
+    // Long enough that its filelog is hashed under `store/dh`.
+    let long = format!("Long{}.txt", "x".repeat(130));
+    fs::write(repo.join(&long), b"long\n").expect("write long file");
+    assert_hg(&hg(&repo, &["add", &long]), "hg add long");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "long", "-u", "test"]),
+        "hg commit long",
+    );
+    assert!(
+        repo.join(".hg").join("store").join("dh").exists(),
+        "no store/dh"
+    );
+    let tip = hg(&repo, &["log", "-r", "tip", "-T", "{node}"]);
+    assert_hg(&tip, "source tip");
+    let tip_node = String::from_utf8_lossy(&tip.stdout).trim().to_owned();
+
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+
+    let clones = [
+        (
+            "ssh stream",
+            hg_ssh(
+                &temp.0,
+                &["clone", "ssh://user@dummy/repo", "ssh-stream"],
+                &shim,
+            ),
+            "ssh-stream",
+            "streaming all changes",
+        ),
+        (
+            "http stream",
+            hg(&temp.0, &["clone", &url, "http-stream"]),
+            "http-stream",
+            "streaming all changes",
+        ),
+        (
+            "http changegroup",
+            hg(&temp.0, &["clone", "--pull", &url, "http-cg"]),
+            "http-cg",
+            "adding changesets",
+        ),
+    ];
+    for (label, clone, dir, expect) in clones {
+        let dest = temp.0.join(dir);
+        assert_cloned_tip(label, &clone, &dest, &tip_node, &log);
+        let stdout = String::from_utf8_lossy(&clone.stdout);
+        assert!(
+            stdout.contains(expect),
+            "{label} stdout missing {expect:?}:\n{stdout}"
+        );
+        assert_hg(&hg(&dest, &["verify"]), &format!("{label} verify"));
+        let body = fs::read(dest.join(&long)).expect("long file");
+        assert_eq!(body, b"long\n", "{label} long file");
+    }
+    drop(server);
+}

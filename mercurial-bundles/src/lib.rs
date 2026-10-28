@@ -27,6 +27,7 @@ pub use errors::*;
 mod utils;
 
 pub use bundle2_encode::Bundle2EncodeBuilder;
+pub use chunk::Chunk;
 pub use part_header::PartHeader;
 pub use part_inner::InnerPart;
 pub use types::StreamHeader;

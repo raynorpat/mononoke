@@ -503,13 +503,15 @@ fn parse_request<'a>(input: &'a [u8], parse_params: ParamParser) -> ParseRes<'a,
         Ok(Request::Getbundle(GetbundleArgs {
             // Some params are currently ignored, like:
             // - obsmarkers
-            // - cg
             // - cbattempted
             // If those params are needed, they should be parsed here.
             heads: parseval_default(&kv, "heads", hashlist)?,
             common: parseval_default(&kv, "common", hashlist)?,
             bundlecaps: parseval_default(&kv, "bundlecaps", commavalues)?,
             listkeys: parseval_default(&kv, "listkeys", commavalues)?,
+            // Mercurial encodes boolean arguments as `1` and `0`.
+            stream: kv.get(&b"stream"[..]).is_some_and(|v| v.as_slice() == b"1"),
+            cg: kv.get(&b"cg"[..]).map_or(true, |v| v.as_slice() != b"0"),
         }))
     }))? {
         return Ok(val);
@@ -1246,6 +1248,8 @@ mod test_parse {
                 common: vec![],
                 bundlecaps: vec![],
                 listkeys: vec![],
+                stream: false,
+                cg: true,
             }),
         );
 
@@ -1268,6 +1272,26 @@ mod test_parse {
                 common: vec![hash_twos(), hash_threes()],
                 bundlecaps: vec![b"cap1".to_vec(), b"CAP2".to_vec(), b"cap3".to_vec()],
                 listkeys: vec![b"key1".to_vec(), b"key2".to_vec()],
+                stream: false,
+                cg: true,
+            }),
+        );
+
+        let inp = "getbundle\n\
+                   * 2\n\
+                   stream 1\n\
+                   1\
+                   cg 1\n\
+                   0";
+        test_parse(
+            inp,
+            Request::Getbundle(GetbundleArgs {
+                heads: vec![],
+                common: vec![],
+                bundlecaps: vec![],
+                listkeys: vec![],
+                stream: true,
+                cg: false,
             }),
         );
     }

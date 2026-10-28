@@ -104,6 +104,10 @@ pub struct GetbundleArgs {
     pub common: Vec<NodeHash>,
     pub bundlecaps: Vec<Vec<u8>>,
     pub listkeys: Vec<Vec<u8>>,
+    /// The client asks for a stream clone instead of a changegroup.
+    pub stream: bool,
+    /// The client wants a changegroup. Mercurial sends `cg=0` with `stream=1`.
+    pub cg: bool,
 }
 
 impl Debug for GetbundleArgs {
@@ -123,6 +127,8 @@ impl Debug for GetbundleArgs {
             .field("common", &self.common)
             .field("bundlecaps", &bcaps)
             .field("listkeys", &listkeys)
+            .field("stream", &self.stream)
+            .field("cg", &self.cg)
             .finish()
     }
 }

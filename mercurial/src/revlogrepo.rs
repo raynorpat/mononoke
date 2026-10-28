@@ -248,6 +248,11 @@ impl RevlogRepo {
         self.inner.lock().expect("poisoned lock").manifest.clone()
     }
 
+    /// The `.hg/store` directory.
+    pub fn store_path(&self) -> PathBuf {
+        self.basepath.join("store")
+    }
+
     fn file_store_path(&self, path: &Path, ext: &[u8]) -> PathBuf {
         let dotencode = self.requirements.contains(&Required::Dotencode);
         self.basepath

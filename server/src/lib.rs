@@ -12,6 +12,7 @@ pub mod http;
 pub mod listener;
 pub mod push;
 pub mod repo;
+pub mod stream;
 
 #[cfg(windows)]
 pub mod uds;
