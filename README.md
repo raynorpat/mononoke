@@ -1,24 +1,42 @@
 # Mononoke
 
-Mononoke is a next-generation server for the [Mercurial source control
-system](https://www.mercurial-scm.org/), meant to scale up to accepting
-thousands of commits every hour across millions of files. It is primarily
-written in the [Rust programming language](https://www.rust-lang.org/en-US/).
+A [Mercurial](https://www.mercurial-scm.org/) server written in
+[Rust](https://www.rust-lang.org/). It serves ordinary Mercurial repositories
+(revlogs in `.hg/store`) to stock Mercurial clients over ssh, HTTP and HTTPS,
+with stream clones and streamed changegroups for large repositories.
 
-## Serve
+This tree started from an early snapshot of Facebook's Mononoke. It now has its
+own revlog-backed server, and is not the blobstore-based Mononoke in
+[Sapling](https://github.com/meta/sapling/tree/main/eden/mononoke).
 
-`REPODIR` is the parent of `.hg`.
+## Quick start
 
+```sh
+cargo build --release
+
+# Serve a repository. REPODIR is the directory that contains .hg.
+target/release/mononoke --http-addr 0.0.0.0 /srv/hg/myrepo
+
+# From a client:
+hg clone http://server:8000/ myrepo
+hg clone --remotecmd /path/to/hgcli ssh://user@server//srv/hg/myrepo
 ```
-mononoke [--http-addr ADDR] [--http-port PORT] <REPODIR>
-```
 
-`--http-addr` defaults to `127.0.0.1` and `--http-port` defaults to `8000`.
+HTTPS is enabled when both `--tls-cert` and `--tls-key` are given, on
+`--https-port` (default `8443`). The server has no authentication. See
+[docs/running.md](docs/running.md) before exposing it.
 
-HTTPS is optional. Pass `--tls-cert` and `--tls-key` together. The same process then also serves HTTPS on `--https-port` (default `8443`).
+## Documentation
 
-```
-hgcli -R <REPODIR> serve --stdio
-```
+- [Differences from `hg serve`](docs/hg-serve-differences.md): what is
+  supported, what is not, and repository format requirements.
+- [Building](docs/building.md): toolchain, build and tests.
+- [Running](docs/running.md): starting the server, HTTP and HTTPS, ssh through
+  `hgcli`, several repositories, pushing.
+- [Source layout](docs/source-layout.md): what each crate and file does.
+- [GraphQL browser](docs/graphql.md): `hgqlserve` and its schema.
 
-`hgcli serve --stdio` relays to `<REPODIR>/.hg/mononoke.sock`.
+## License
+
+GPL-2.0-or-later. See [LICENSE](LICENSE). Contributions: see
+[CONTRIBUTING.md](CONTRIBUTING.md).
