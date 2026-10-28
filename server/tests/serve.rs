@@ -140,6 +140,119 @@ fn init_zstd_repo(root: &Path) -> PathBuf {
     repo
 }
 
+/// Share-safe sparse revlog v1 repo with two revisions of `a.txt`.
+///
+/// Leaves the revlog Mercurial wrote. A self-based filelog snapshot is not
+/// rewritten into a delta.
+fn init_share_safe_repo(root: &Path) -> PathBuf {
+    let repo = root.join("repo");
+    let mut init = Command::new("hg");
+    init.current_dir(root)
+        .args(["init", "repo"])
+        .args(["--config", "format.use-share-safe=true"])
+        .args(["--config", "format.generaldelta=true"])
+        .args(["--config", "format.revlog-compression=zstd"])
+        .args(["--config", "format.sparse-revlog=true"])
+        .args(["--config", "format.use-persistent-nodemap=false"])
+        .args(["--config", "format.use-dirstate-v2=false"])
+        .args([
+            "--config",
+            "format.exp-use-copies-side-data-changeset=false",
+        ])
+        .env("HGPLAIN", "1")
+        .env("HGRCPATH", "");
+    let init = output_timeout(&mut init, Duration::from_secs(120));
+    assert_hg(&init, "hg init");
+
+    fs::write(repo.join("a.txt"), b"alpha\n").expect("write a.txt");
+    assert_hg(&hg(&repo, &["add", "a.txt"]), "hg add");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "first", "-u", "test"]),
+        "hg commit",
+    );
+    fs::write(repo.join("a.txt"), b"beta\n").expect("rewrite a.txt");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "second", "-u", "test"]),
+        "hg commit",
+    );
+
+    let requires_path = repo.join(".hg").join("requires");
+    let requires = fs::read_to_string(&requires_path).unwrap_or_else(|err| {
+        panic!("read {}: {err}", requires_path.display());
+    });
+    assert!(
+        requires.lines().any(|line| line == "share-safe"),
+        "requires missing share-safe:\n{requires}"
+    );
+    let store_path = repo.join(".hg").join("store").join("requires");
+    let store_requires = fs::read_to_string(&store_path).unwrap_or_else(|err| {
+        panic!("read {}: {err}", store_path.display());
+    });
+    for line in [
+        "sparserevlog",
+        "generaldelta",
+        "revlogv1",
+        "revlog-compression-zstd",
+    ] {
+        assert!(
+            store_requires.lines().any(|got| got == line),
+            "store/requires missing {line}:\n{store_requires}"
+        );
+    }
+    repo
+}
+
+fn assert_cloned_tip(label: &str, clone: &Output, dest: &Path, tip_node: &str, log: &Path) {
+    assert!(
+        clone.status.success(),
+        "{label} clone failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        clone.status,
+        String::from_utf8_lossy(&clone.stdout),
+        String::from_utf8_lossy(&clone.stderr),
+        read_log(log)
+    );
+    let logged = hg(dest, &["log", "-r", "tip", "-T", "{node}"]);
+    assert!(
+        logged.status.success(),
+        "{label} tip failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        logged.status,
+        String::from_utf8_lossy(&logged.stdout),
+        String::from_utf8_lossy(&logged.stderr),
+        read_log(log)
+    );
+    let got = String::from_utf8_lossy(&logged.stdout);
+    assert_eq!(
+        got.trim(),
+        tip_node,
+        "{label} tip {got:?} != {tip_node}\nmononoke:\n{}",
+        read_log(log)
+    );
+    let status = hg(dest, &["status"]);
+    assert!(
+        status.status.success(),
+        "{label} status failed: status {:?}\nstdout:\n{}\nstderr:\n{}\nmononoke:\n{}",
+        status.status,
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+        read_log(log)
+    );
+    assert!(
+        status.stdout.is_empty(),
+        "{label} status stdout {:?}\nstderr:\n{}\nmononoke:\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr),
+        read_log(log)
+    );
+    let body = fs::read(dest.join("a.txt"))
+        .unwrap_or_else(|err| panic!("{label} read a.txt: {err}\nmononoke:\n{}", read_log(log)));
+    assert_eq!(
+        body,
+        b"beta\n",
+        "{label} a.txt {body:?}\nmononoke:\n{}",
+        read_log(log)
+    );
+}
+
 /// Self-signed PEM pair for `https://127.0.0.1/`.
 /// The IP is a subject alternative name. Mercurial ignores IP SANs and
 /// matches the common name, so the CN is the same address.
@@ -845,4 +958,38 @@ fn unbundle_rejects_mismatched_heads_without_writing() {
         mononoke::push::apply_unbundle(&repo.join(".hg"), &[head], b"").expect("apply_unbundle");
     assert_eq!(reply, b"0\n");
     assert_eq!(changelog_len(&repo), before, "changelog length changed");
+}
+
+#[test]
+fn share_safe_sparse_repo_clones_over_ssh_http_and_https() {
+    let temp = TempDir::new("ss");
+    let repo = init_share_safe_repo(&temp.0);
+    let tip = hg(&repo, &["log", "-r", "tip", "-T", "{node}"]);
+    assert_hg(&tip, "source tip");
+    let tip_node = String::from_utf8_lossy(&tip.stdout).trim().to_owned();
+
+    let log = temp.0.join("mononoke.log");
+    let (cert, key) = write_test_cert(&temp.0);
+    let (server, https_port) = Running::start_https(&repo, &log, &cert, &key);
+    let http_url = format!("http://127.0.0.1:{}/", server.port);
+    let https_url = format!("https://127.0.0.1:{https_port}/");
+    let cacerts = format!("web.cacerts={}", cfg_path(&cert));
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+
+    let ssh = hg_ssh(
+        &temp.0,
+        &["clone", "ssh://user@dummy/repo", "ssh-dest"],
+        &shim,
+    );
+    assert_cloned_tip("ssh", &ssh, &temp.0.join("ssh-dest"), &tip_node, &log);
+
+    let http = hg(&temp.0, &["clone", &http_url, "http-dest"]);
+    assert_cloned_tip("http", &http, &temp.0.join("http-dest"), &tip_node, &log);
+
+    let https = hg(
+        &temp.0,
+        &["clone", &https_url, "https-dest", "--config", &cacerts],
+    );
+    assert_cloned_tip("https", &https, &temp.0.join("https-dest"), &tip_node, &log);
+    drop(server);
 }
