@@ -47,8 +47,9 @@ pub enum Required {
     RevlogCompressionZstd,
     ShareSafe,
     SparseRevlog,
-    /// Working-copy format only. The server never reads a dirstate.
+    /// Working-copy formats only. The server never reads a dirstate.
     DirstateV2,
+    DirstateTrackedKeyV1,
 }
 
 impl Display for Required {
@@ -69,6 +70,7 @@ impl Display for Required {
             Required::ShareSafe => "share-safe",
             Required::SparseRevlog => "sparserevlog",
             Required::DirstateV2 => "dirstate-v2",
+            Required::DirstateTrackedKeyV1 => "dirstate-tracked-key-v1",
         };
         write!(fmt, "{}", s)
     }
@@ -94,6 +96,7 @@ impl FromStr for Required {
             "share-safe" => Ok(Required::ShareSafe),
             "sparserevlog" => Ok(Required::SparseRevlog),
             "dirstate-v2" => Ok(Required::DirstateV2),
+            "dirstate-tracked-key-v1" => Ok(Required::DirstateTrackedKeyV1),
             unk => Err(ErrorKind::UnknownReq(unk.into()).into()),
         }
     }
@@ -554,15 +557,18 @@ mod test {
     }
 
     #[test]
-    fn dirstate_v2_requirement_is_accepted() {
-        // A working-copy requirement, so Mercurial keeps it in `.hg/requires`.
+    fn dirstate_requirements_are_accepted() {
+        // Working-copy requirements, so Mercurial keeps them in `.hg/requires`.
         let repo = open_split(
             "dsv2",
-            &["dirstate-v2", "share-safe"],
+            &["dirstate-tracked-key-v1", "dirstate-v2", "share-safe"],
             Some(&["fncache", "generaldelta", "revlogv1", "store"]),
         )
-        .expect("dirstate-v2 repo opens");
+        .expect("dirstate repo opens");
         assert!(repo.get_requirements().contains(&Required::DirstateV2));
+        assert!(repo
+            .get_requirements()
+            .contains(&Required::DirstateTrackedKeyV1));
     }
 
     #[test]

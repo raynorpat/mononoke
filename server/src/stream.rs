@@ -61,6 +61,7 @@ pub fn stream_requirements(repo: &RevlogRepo) -> Option<String> {
                     | Required::Dotencode
                     | Required::ShareSafe
                     | Required::DirstateV2
+                    | Required::DirstateTrackedKeyV1
             )
         })
         .map(ToString::to_string)

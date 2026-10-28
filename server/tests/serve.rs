@@ -1187,7 +1187,7 @@ fn stream_clone_after_push_sees_the_push() {
 }
 
 #[test]
-fn dirstate_v2_repo_is_served_and_clients_keep_their_own_dirstate() {
+fn dirstate_v2_tracked_key_repo_is_served_and_clients_keep_their_own_dirstate() {
     // Without Mercurial's Rust extensions, hg refuses dirstate-v2 unless told the slow path is fine.
     const SLOW_DSV2: &str = "storage.dirstate-v2.slow-path=allow";
     let temp = TempDir::new("d2");
@@ -1195,6 +1195,7 @@ fn dirstate_v2_repo_is_served_and_clients_keep_their_own_dirstate() {
     init.current_dir(&temp.0)
         .args(["init", "repo"])
         .args(["--config", "format.use-dirstate-v2=true"])
+        .args(["--config", "format.use-dirstate-tracked-hint=true"])
         .args(["--config", SLOW_DSV2])
         .args(["--config", "format.use-persistent-nodemap=false"])
         .env("HGPLAIN", "1")
@@ -1205,10 +1206,12 @@ fn dirstate_v2_repo_is_served_and_clients_keep_their_own_dirstate() {
     );
     let repo = temp.0.join("repo");
     let requires = fs::read_to_string(repo.join(".hg").join("requires")).expect("requires");
-    assert!(
-        requires.lines().any(|line| line == "dirstate-v2"),
-        "requires missing dirstate-v2:\n{requires}"
-    );
+    for line in ["dirstate-v2", "dirstate-tracked-key-v1"] {
+        assert!(
+            requires.lines().any(|got| got == line),
+            "requires missing {line}:\n{requires}"
+        );
+    }
     fs::write(repo.join("a.txt"), b"alpha\n").expect("write a.txt");
     assert_hg(
         &hg(&repo, &["add", "a.txt", "--config", SLOW_DSV2]),
@@ -1239,10 +1242,12 @@ fn dirstate_v2_repo_is_served_and_clients_keep_their_own_dirstate() {
         assert_eq!(fs::read(dest.join("a.txt")).expect("a.txt"), b"alpha\n");
         // The working-copy format is the client's choice, not the server's.
         let cloned = fs::read_to_string(dest.join(".hg").join("requires")).expect("requires");
-        assert!(
-            !cloned.lines().any(|line| line == "dirstate-v2"),
-            "{label} clone took dirstate-v2:\n{cloned}"
-        );
+        for line in ["dirstate-v2", "dirstate-tracked-key-v1"] {
+            assert!(
+                !cloned.lines().any(|got| got == line),
+                "{label} clone took {line}:\n{cloned}"
+            );
+        }
     }
     drop(server);
 }
