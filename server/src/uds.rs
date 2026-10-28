@@ -192,12 +192,12 @@ fn io_loop(
     reads: SyncSender<io::Result<Bytes>>,
     shared: Arc<Shared>,
 ) {
-    // Blocking calls with a short timeout, on one thread. Nonblocking
-    // Winsock reads do not complete unless the socket is on an IOCP, and two
-    // threads blocked in recv and send on duplicated handles can stall.
+    // Nonblocking calls on one thread, parked for a tick when nothing moved.
+    // Two threads blocked in recv and send on duplicated handles can stall.
+    // Not timeouts: a timed-out Winsock call leaves the socket indeterminate,
+    // and later calls fail with WSAEINTR or WSA_IO_PENDING.
     let tick = Duration::from_millis(2);
-    if socket.set_read_timeout(Some(tick)).is_err() || socket.set_write_timeout(Some(tick)).is_err()
-    {
+    if socket.set_nonblocking(true).is_err() {
         return;
     }
     *shared.io.lock().expect("io thread") = Some(thread::current());

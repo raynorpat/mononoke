@@ -238,6 +238,73 @@ mod tests {
         let _ = fs::remove_dir(&dir);
     }
 
+    /// Echo bursts both ways with idle gaps between them, so reads and writes
+    /// keep finding the socket idle mid-transfer. Every byte must come back.
+    #[tokio::test]
+    async fn echo_with_idle_gaps_stays_intact() {
+        let dir = sock_dir("ec");
+        let path = dir.join("mononoke.sock");
+        let bound = listener(&path).await.expect("bind");
+
+        #[cfg(unix)]
+        let client = tokio::net::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        #[cfg(windows)]
+        let client = crate::uds::UnixStream::connect(&path)
+            .await
+            .expect("connect");
+        let (server, _) = bound.accept().await.unwrap();
+
+        let echo = tokio::spawn(async move {
+            let (mut read, mut write) = tokio::io::split(server);
+            tokio::io::copy(&mut read, &mut write).await.expect("echo");
+            write.shutdown().await.expect("echo shutdown");
+        });
+
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut sent = Vec::new();
+        for _ in 0..400 {
+            let len = (next() % 40_000) as usize + 1;
+            sent.extend((0..len).map(|_| next() as u8));
+        }
+
+        let (mut read, mut write) = tokio::io::split(client);
+        let payload = sent.clone();
+        let writer = tokio::spawn(async move {
+            let mut gap: u64 = 7;
+            for piece in payload.chunks(40_000) {
+                write.write_all(piece).await.expect("client write");
+                write.flush().await.expect("client flush");
+                gap = gap.wrapping_mul(31).wrapping_add(17);
+                if gap % 3 == 0 {
+                    tokio::time::sleep(Duration::from_millis(gap % 5)).await;
+                }
+            }
+            write.shutdown().await.expect("client shutdown");
+        });
+
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(60), read.read_to_end(&mut got))
+            .await
+            .expect("echo timed out")
+            .expect("client read");
+        writer.await.unwrap();
+        echo.await.unwrap();
+        assert_eq!(got.len(), sent.len());
+        assert!(got == sent, "echoed bytes differ");
+
+        drop(bound);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
     #[tokio::test]
     async fn stale_socket_file_is_replaced() {
         let dir = sock_dir("st");
