@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use futures::{Future, Stream};
@@ -18,7 +19,7 @@ use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::Error as BundleError;
 use mercurial_bundles::parts::changegroup_part;
 use mercurial_types::delta::{Delta, Fragment};
-use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, NULL_HASH};
+use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, Path, NULL_HASH};
 
 use crate::errors::{Error, Result};
 
@@ -126,19 +127,86 @@ fn history_parts(
     )?;
     emit(Part::SectionEnd(Section::Manifest))?;
 
-    for path in files {
-        let revlog = repo.read_file_revlog(&path)?;
-        if linked_revisions(
-            &revlog,
-            Section::Filelog(path.clone()),
-            &nodes,
-            &missing,
-            emit,
-        )? {
-            emit(Part::SectionEnd(Section::Filelog(path)))?;
+    let files: Vec<Path> = files.into_iter().collect();
+    read_in_order(
+        &files,
+        |path| file_parts(repo, path, &nodes, &missing),
+        &mut |parts: Vec<Part>| parts.into_iter().try_for_each(&mut *emit),
+    )?;
+    emit(Part::End)
+}
+
+/// Threads reading files at once. The first read of a file waits on the
+/// filesystem (about 6 ms on Windows) far longer than it uses the CPU or disk,
+/// so many reads in flight keep the disk busy.
+pub(crate) const READ_THREADS: usize = 16;
+/// Items read per batch. Only one batch of results is held at a time.
+const READ_BATCH: usize = 256;
+
+/// `read` every item on `READ_THREADS` threads and pass the results to `emit`
+/// in item order. Items are read a batch at a time, so a slow `emit` bounds memory.
+pub(crate) fn read_in_order<T, R>(
+    items: &[T],
+    read: impl Fn(&T) -> Result<R> + Sync,
+    emit: &mut dyn FnMut(R) -> Result<()>,
+) -> Result<()>
+where
+    T: Sync,
+    R: Send,
+{
+    for batch in items.chunks(READ_BATCH) {
+        let next = AtomicUsize::new(0);
+        let mut done: Vec<(usize, Result<R>)> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..READ_THREADS.min(batch.len()))
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut out = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(item) = batch.get(i) else {
+                                return out;
+                            };
+                            out.push((i, read(item)));
+                        }
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("read thread panicked"))
+                .collect()
+        });
+        done.sort_unstable_by_key(|(i, _)| *i);
+        for (_, result) in done {
+            emit(result?)?;
         }
     }
-    emit(Part::End)
+    Ok(())
+}
+
+/// The parts for one filelog's missing revisions, ending with its `SectionEnd`,
+/// or nothing when the client has every revision.
+fn file_parts(
+    repo: &RevlogRepo,
+    path: &Path,
+    nodes: &[NodeHash],
+    missing: &[bool],
+) -> Result<Vec<Part>> {
+    let revlog = repo.read_file_revlog(path)?;
+    let mut parts = Vec::new();
+    if linked_revisions(
+        &revlog,
+        Section::Filelog(path.clone()),
+        nodes,
+        missing,
+        &mut |part| {
+            parts.push(part);
+            Ok(())
+        },
+    )? {
+        parts.push(Part::SectionEnd(Section::Filelog(path.clone())));
+    }
+    Ok(parts)
 }
 
 /// Emit every revision of `revlog` whose linkrev is a missing changeset, in revision order.
@@ -327,7 +395,6 @@ mod tests {
     use std::str::FromStr;
 
     use mercurial::revlog::{RevIdx, Revlog};
-    use mercurial_types::Path;
 
     use super::*;
 
@@ -350,6 +417,37 @@ mod tests {
             Part::CgChunk(_, chunk) => chunk,
             Part::SectionEnd(_) | Part::End => panic!("expected a filelog chunk"),
         }
+    }
+
+    #[test]
+    fn read_in_order_keeps_order_and_stops_at_an_error() {
+        let items: Vec<usize> = (0..READ_BATCH * 2 + 7).collect();
+        let mut got = Vec::new();
+        read_in_order(&items, |i| Ok(*i * 2), &mut |r| {
+            got.push(r);
+            Ok(())
+        })
+        .expect("read");
+        assert_eq!(got, items.iter().map(|i| i * 2).collect::<Vec<_>>());
+
+        let mut got = Vec::new();
+        let err = read_in_order(
+            &items,
+            |i| {
+                if *i == READ_BATCH + 3 {
+                    Err(Error::from("bad item"))
+                } else {
+                    Ok(*i)
+                }
+            },
+            &mut |r| {
+                got.push(r);
+                Ok(())
+            },
+        )
+        .expect_err("error item");
+        assert_eq!(err.to_string(), "bad item");
+        assert_eq!(got, (0..READ_BATCH + 3).collect::<Vec<_>>());
     }
 
     #[test]

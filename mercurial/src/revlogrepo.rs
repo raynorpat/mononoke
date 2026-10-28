@@ -272,9 +272,16 @@ impl RevlogRepo {
 
     /// Filelog for one pass over many files. Uses the cached one if there is
     /// one, but does not cache what it opens, so its maps close when dropped.
+    ///
+    /// The open happens outside the repo lock so callers can open in parallel.
     pub fn read_file_revlog(&self, path: &Path) -> Result<Revlog> {
-        let inner = self.inner.lock().expect("poisoned lock");
-        if let Some(log) = inner.filelogcache.get(path) {
+        if let Some(log) = self
+            .inner
+            .lock()
+            .expect("poisoned lock")
+            .filelogcache
+            .get(path)
+        {
             return Ok(log.clone());
         }
         let index = self.file_store_path(path, b"i");
