@@ -13,6 +13,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::StreamExt;
@@ -184,7 +185,7 @@ fn walk(
 /// Each file is sent at its listed size. A file that has become shorter fails
 /// the clone, as in Mercurial: a push split or rewrote that revlog after the
 /// listing. Longer files are fine because revlogs only grow by appending.
-pub fn stream_part(files: Vec<StoreFile>, requirements: &str) -> Result<PartEncodeBuilder> {
+pub fn stream_part(files: Arc<Vec<StoreFile>>, requirements: &str) -> Result<PartEncodeBuilder> {
     let bytecount: u64 = files.iter().map(|file| file.size).sum();
     let mut builder = PartEncodeBuilder::mandatory("stream2").map_err(bundle_err)?;
     builder

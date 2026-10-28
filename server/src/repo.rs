@@ -29,14 +29,15 @@ use tokio_util::io::ReaderStream;
 
 use crate::bundle::history_part;
 use crate::errors::Result;
-use crate::stream::{list_store, stream_part, stream_requirements};
+use crate::stream::{list_store, stream_part, stream_requirements, StoreFile};
 
 pub struct Repo {
     path: String,
     hgrepo: mercurial::RevlogRepo,
     /// Held while a push writes and while a stream clone lists the store, so
-    /// the listed sizes are one snapshot.
-    push_lock: tokio::sync::Mutex<()>,
+    /// the listed sizes are one snapshot. Keeps the last listing for later
+    /// stream clones until a push clears it.
+    store_listing: tokio::sync::Mutex<Option<Arc<Vec<StoreFile>>>>,
     #[allow(dead_code)]
     logger: Logger,
 }
@@ -94,7 +95,7 @@ impl Repo {
         Ok(Repo {
             path: format!("{:?}", path),
             hgrepo: mercurial::RevlogRepo::open(path)?,
-            push_lock: tokio::sync::Mutex::new(()),
+            store_listing: tokio::sync::Mutex::new(None),
             logger: parent_logger.new(o!("repo" => format!("{:?}", path))),
         })
     }
@@ -217,9 +218,14 @@ async fn stream_clone_part(repo: &Arc<Repo>) -> hgproto::Result<PartEncodeBuilde
         )
     })?;
     let lister = Arc::clone(repo);
-    let files = tokio::task::spawn_blocking(move || {
-        let _push = lister.push_lock.blocking_lock();
-        list_store(&lister.hgrepo)
+    let files = tokio::task::spawn_blocking(move || -> Result<Arc<Vec<StoreFile>>> {
+        let mut listing = lister.store_listing.blocking_lock();
+        if let Some(files) = listing.as_ref() {
+            return Ok(Arc::clone(files));
+        }
+        let files = Arc::new(list_store(&lister.hgrepo)?);
+        *listing = Some(Arc::clone(&files));
+        Ok(files)
     })
     .await
     .map_err(|err| hgproto::Error::from(err.to_string()))?
@@ -426,7 +432,9 @@ impl HgCommands for RepoClient {
         info!(self.logger, "unbundle heads {:?}", heads);
         let repo = Arc::clone(&self.repo);
         async move {
-            let _push = repo.push_lock.lock().await;
+            let mut listing = repo.store_listing.lock().await;
+            // Cleared before writing, so even a failed push lists the store again.
+            *listing = None;
             let applied = crate::push::apply_repo(&repo.hgrepo, &heads, &bundle)
                 .map_err(|err| hgproto::Error::from(err.to_string()))?;
             crate::push::reply_bundle(&applied)

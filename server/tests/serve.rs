@@ -1144,3 +1144,40 @@ fn ssh_push_records_mercurial_fncache_names() {
     );
     drop(server);
 }
+
+#[test]
+fn stream_clone_after_push_sees_the_push() {
+    let temp = TempDir::new("sp");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+
+    // The first stream clone lists the store, and the server keeps that listing.
+    let first = hg(&temp.0, &["clone", &url, "first"]);
+    assert_hg(&first, "first stream clone");
+    let first_dir = temp.0.join("first");
+    fs::write(first_dir.join("pushed.txt"), b"pushed\n").expect("write pushed.txt");
+    assert_hg(&hg(&first_dir, &["add", "pushed.txt"]), "add pushed.txt");
+    assert_hg(
+        &hg(&first_dir, &["commit", "-m", "pushed", "-u", "test"]),
+        "commit pushed",
+    );
+    assert_hg(&hg_ssh(&first_dir, &["push"], &shim), "push");
+
+    let second = hg(&temp.0, &["clone", &url, "second"]);
+    assert_hg(&second, "second stream clone");
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains("streaming all changes"),
+        "not streamed:\n{stdout}"
+    );
+    let second_dir = temp.0.join("second");
+    assert_hg(&hg(&second_dir, &["verify"]), "second clone verify");
+    assert_eq!(
+        fs::read(second_dir.join("pushed.txt")).expect("pushed.txt in second clone"),
+        b"pushed\n"
+    );
+    drop(server);
+}
