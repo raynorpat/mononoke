@@ -1063,6 +1063,10 @@ fn stream_clone_and_changegroup_clone_match() {
         let note = fs::read(dest.join("changelog.d").join("note.txt")).expect("note");
         assert_eq!(note, b"note\n", "{label} changelog.d/note.txt");
     }
+    // Over HTTP the stream clone goes out uncompressed and the changegroup as zstd.
+    let served = read_log(&log);
+    assert!(served.contains("bytes streamed (none)"), "{served}");
+    assert!(served.contains("bytes streamed (zstd)"), "{served}");
     drop(server);
 }
 

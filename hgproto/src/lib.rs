@@ -28,7 +28,12 @@ pub use crate::errors::{Error, ErrorKind, Result, ResultExt};
 pub use crate::service::{HgCommandRes, HgCommands, HgService};
 
 /// `getbundle` bundle bytes, produced while they are sent.
-pub struct BundleStream(pub futures::stream::BoxStream<'static, Result<Bytes>>);
+pub struct BundleStream {
+    pub body: futures::stream::BoxStream<'static, Result<Bytes>>,
+    /// Stream clone data barely compresses, so HTTP sends it uncompressed
+    /// when the client allows, as Mercurial's server does.
+    pub prefer_uncompressed: bool,
+}
 
 impl Debug for BundleStream {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {

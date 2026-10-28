@@ -9,6 +9,7 @@ bookmarks = { path = "../bookmarks" }
 bytes = "1"
 clap = "4"
 flate2 = "1"
+zstd = "0.13"
 futures = "0.3"
 futures-ext = { path = "../futures-ext" }
 hgproto = { path = "../hgproto" }

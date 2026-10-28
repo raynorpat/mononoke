@@ -222,7 +222,10 @@ async fn create_bundle(repo: &Arc<Repo>, args: GetbundleArgs) -> hgproto::Result
         }
     })
     .filter_map(future::ready);
-    Ok(BundleStream(body.chain(done).boxed()))
+    Ok(BundleStream {
+        body: body.chain(done).boxed(),
+        prefer_uncompressed: args.stream,
+    })
 }
 
 async fn stream_clone_part(repo: &Arc<Repo>) -> hgproto::Result<PartEncodeBuilder> {

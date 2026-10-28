@@ -152,9 +152,16 @@ where
         let close = incoming.close;
         let body = match dispatch(&service, &incoming, &cmd).await {
             Ok(Response::Getbundle(bundle)) => {
+                let engine = bundle_engine(&incoming.protocaps, bundle.prefer_uncompressed);
                 // The 200 is already sent if the bundle fails, so the client sees a cut-off body.
-                match write_hg_stream(&mut sock, bundle, close).await {
-                    Ok(sent) => info!(log, "HTTP {} -> {} bytes streamed", cmd, sent),
+                match write_hg_stream(&mut sock, bundle, engine, close).await {
+                    Ok(sent) => info!(
+                        log,
+                        "HTTP {} -> {} bytes streamed ({})",
+                        cmd,
+                        sent,
+                        engine.unwrap_or("0.1 zlib")
+                    ),
                     Err(err) => {
                         error!(log, "HTTP {} failed while streaming: {}", cmd, err);
                         return Ok(());
@@ -200,6 +207,8 @@ struct Incoming {
     query: HashMap<String, Vec<u8>>,
     body: Vec<u8>,
     close: bool,
+    /// The `X-HgProto` value, such as `0.1 0.2 comp=zstd,zlib,none partial-pull`.
+    protocaps: String,
 }
 
 fn command_name(incoming: &Incoming) -> Result<String> {
@@ -299,12 +308,18 @@ where
         None => String::new(),
     };
     let close = connection_closes(version, headers.get("connection").map(String::as_str));
+    // Mercurial splits a long `X-HgProto` value across `X-HgProto-1`, `-2`, ...
+    let protocaps = (1..)
+        .map_while(|n| headers.get(&format!("x-hgproto-{n}")))
+        .map(String::as_str)
+        .collect();
     Ok(Some(Incoming {
         method,
         target,
         query: parse_query(&query_text)?,
         body,
         close,
+        protocaps,
     }))
 }
 
@@ -417,28 +432,115 @@ where
     Ok(())
 }
 
-/// Chunked `getbundle` body, zlib-compressed as the bundle is produced. Returns the bytes sent.
+/// Compression engines in server preference order, as Mercurial's server
+/// ranks them. Advertised to HTTP clients as `compression=`.
+const SERVER_ENGINES: [&str; 2] = ["zstd", "zlib"];
+/// zstd level, Mercurial's server default.
+const ZSTD_LEVEL: i32 = 3;
+
+/// The media type 0.2 compression engine for a `getbundle`, picked as
+/// Mercurial's `_httpresponsetype` does from the client's `X-HgProto` value.
+/// `None` means media type 0.1, which is always zlib.
+fn bundle_engine(protocaps: &str, prefer_uncompressed: bool) -> Option<&'static str> {
+    let caps: Vec<&str> = protocaps.split(' ').collect();
+    if !caps.contains(&"0.2") {
+        return None;
+    }
+    // Every 0.2 client accepts uncompressed data.
+    if prefer_uncompressed {
+        return Some("none");
+    }
+    let client: Vec<&str> = caps
+        .iter()
+        .find_map(|cap| cap.strip_prefix("comp="))
+        .map_or(vec!["zlib", "none"], |list| list.split(',').collect());
+    // No engine in common falls back to 0.1.
+    SERVER_ENGINES
+        .into_iter()
+        .find(|engine| client.contains(engine))
+}
+
+/// A `getbundle` body compressor writing into a buffer the caller drains.
+enum Compressor {
+    None,
+    Zlib(flate2::write::ZlibEncoder<Vec<u8>>),
+    Zstd(zstd::stream::write::Encoder<'static, Vec<u8>>),
+}
+
+impl Compressor {
+    fn new(engine: &str) -> Result<Self> {
+        Ok(match engine {
+            "none" => Compressor::None,
+            "zstd" => Compressor::Zstd(zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL)?),
+            _ => Compressor::Zlib(flate2::write::ZlibEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            )),
+        })
+    }
+
+    /// Compress `data` and move whatever output is ready onto `out`.
+    fn write(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        use std::io::Write;
+        match self {
+            Compressor::None => out.extend_from_slice(data),
+            Compressor::Zlib(enc) => {
+                enc.write_all(data)?;
+                out.append(enc.get_mut());
+            }
+            Compressor::Zstd(enc) => {
+                enc.write_all(data)?;
+                out.append(enc.get_mut());
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, out: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Compressor::None => {}
+            Compressor::Zlib(enc) => out.extend_from_slice(&enc.finish()?),
+            Compressor::Zstd(enc) => out.extend_from_slice(&enc.finish()?),
+        }
+        Ok(())
+    }
+}
+
+/// Chunked `getbundle` body, compressed as the bundle is produced. Returns the bytes sent.
 ///
-/// Mercurial's HTTP client zlib-decompresses `getbundle` responses
-/// (`httppeer._callcompressable`) even when the media type is 0.1.
-async fn write_hg_stream<S>(sock: &mut S, bundle: BundleStream, close: bool) -> Result<u64>
+/// With `engine`, the body is media type 0.2: a length byte and the engine
+/// name, then the compressed bundle. Without it, media type 0.1, which
+/// Mercurial's HTTP client zlib-decompresses for `getbundle`
+/// (`httppeer._callcompressable`).
+async fn write_hg_stream<S>(
+    sock: &mut S,
+    bundle: BundleStream,
+    engine: Option<&str>,
+    close: bool,
+) -> Result<u64>
 where
     S: AsyncWrite + Unpin,
 {
-    use std::io::Write;
     let connection = if close { "close" } else { "keep-alive" };
+    let media = if engine.is_some() { "0.2" } else { "0.1" };
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/mercurial-0.1\r\nTransfer-Encoding: chunked\r\nConnection: {connection}\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: application/mercurial-{media}\r\nTransfer-Encoding: chunked\r\nConnection: {connection}\r\n\r\n"
     );
     sock.write_all(header.as_bytes()).await?;
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    let mut body = bundle.0;
+    let mut out = Vec::new();
+    if let Some(name) = engine {
+        out.push(name.len() as u8);
+        out.extend_from_slice(name.as_bytes());
+    }
+    let mut compressor = Compressor::new(engine.unwrap_or("zlib"))?;
+    let mut body = bundle.body;
     let mut sent = 0;
     while let Some(bytes) = body.next().await {
-        enc.write_all(&bytes?)?;
-        sent += write_chunk(sock, enc.get_mut()).await?;
+        compressor.write(&bytes?, &mut out)?;
+        sent += write_chunk(sock, &mut out).await?;
     }
-    sent += write_chunk(sock, &mut enc.finish()?).await?;
+    compressor.finish(&mut out)?;
+    sent += write_chunk(sock, &mut out).await?;
     sock.write_all(b"0\r\n\r\n").await?;
     Ok(sent)
 }
@@ -554,7 +656,13 @@ fn frame_preview(buf: &[u8]) -> String {
 
 fn response_body(response: &Response) -> Result<Bytes> {
     match response {
-        Response::Capabilities(caps) => Ok(Bytes::from(caps.join(" "))),
+        Response::Capabilities(caps) => {
+            // HTTP only: getbundle can answer as media type 0.2 in a negotiated compression.
+            let mut caps = caps.clone();
+            caps.push("httpmediatype=0.1rx,0.1tx,0.2tx".to_string());
+            caps.push(format!("compression={}", SERVER_ENGINES.join(",")));
+            Ok(Bytes::from(caps.join(" ")))
+        }
         Response::Getbundle(_) => Err("getbundle is streamed by the connection".into()),
         Response::Lookup(node) => Ok(Bytes::from(format!("1 {node}\n"))),
         Response::Batch(_)
@@ -572,5 +680,51 @@ fn response_body(response: &Response) -> Result<Bytes> {
         | Response::Changegroup
         | Response::Changegroupsubset
         | Response::Streamout => Err("HTTP response is not implemented for this command".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_engine_follows_mercurial() {
+        let hg7 = "0.1 0.2 comp=zstd,zlib,bz2,none partial-pull";
+        assert_eq!(bundle_engine(hg7, false), Some("zstd"));
+        assert_eq!(bundle_engine(hg7, true), Some("none"));
+        // Server preference wins over the client's order.
+        assert_eq!(bundle_engine("0.2 comp=zlib,zstd", false), Some("zstd"));
+        assert_eq!(bundle_engine("0.2 comp=zlib,none", false), Some("zlib"));
+        // 0.2 without `comp=` means zlib and none.
+        assert_eq!(bundle_engine("0.1 0.2", false), Some("zlib"));
+        // Nothing in common, or no 0.2: media type 0.1 with zlib.
+        assert_eq!(bundle_engine("0.2 comp=bz2", false), None);
+        assert_eq!(bundle_engine("0.1 partial-pull", false), None);
+        assert_eq!(bundle_engine("", true), None);
+    }
+
+    #[test]
+    fn compressors_round_trip() {
+        use std::io::Read;
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        for engine in ["none", "zlib", "zstd"] {
+            let mut compressor = Compressor::new(engine).expect("compressor");
+            let mut out = Vec::new();
+            for piece in data.chunks(7_000) {
+                compressor.write(piece, &mut out).expect("write");
+            }
+            compressor.finish(&mut out).expect("finish");
+            let mut got = Vec::new();
+            match engine {
+                "none" => got = out,
+                "zlib" => {
+                    flate2::read::ZlibDecoder::new(&out[..])
+                        .read_to_end(&mut got)
+                        .expect("zlib");
+                }
+                _ => got = zstd::decode_all(&out[..]).expect("zstd"),
+            }
+            assert!(got == data, "{engine} round trip differs");
+        }
     }
 }
