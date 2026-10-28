@@ -100,6 +100,20 @@ impl Repo {
         })
     }
 
+    /// Load what the first requests would otherwise wait for: the changelog
+    /// node map that discovery's `known` lookups use, and the stream clone
+    /// store listing. Blocks; run it off the runtime thread.
+    pub fn warm_up(&self) -> Result<()> {
+        self.hgrepo.changelog_revlog().load_node_map()?;
+        if stream_requirements(&self.hgrepo).is_some() {
+            let mut listing = self.store_listing.blocking_lock();
+            if listing.is_none() {
+                *listing = Some(Arc::new(list_store(&self.hgrepo)?));
+            }
+        }
+        Ok(())
+    }
+
     pub fn heads_match(&self, heads: &[NodeHash]) -> Result<bool> {
         crate::push::heads_match(&self.hgrepo, heads)
     }

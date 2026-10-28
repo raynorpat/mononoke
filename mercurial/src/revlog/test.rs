@@ -257,7 +257,8 @@ fn unknown_node_lookups_stay_misses_after_the_map_is_full() {
         nodes.push(node);
     }
     let unknown = node_with_tail(0x42);
-    // The first miss scans, the second answers from the full map.
+    revlog.load_node_map().expect("load node map");
+    // With the map full, a miss answers without a scan.
     assert!(revlog.index_of(&unknown).is_err());
     assert!(revlog.index_of(&unknown).is_err());
     for (idx, node) in nodes.iter().enumerate() {

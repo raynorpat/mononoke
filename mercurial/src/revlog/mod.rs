@@ -318,6 +318,15 @@ impl Revlog {
     pub fn index_of(&self, node: &NodeHash) -> Result<u32> {
         self.get_idx_by_nodeid(node).map(|idx| idx.as_u32())
     }
+
+    /// Parse every index entry so later node lookups, hits and misses, need no scan.
+    pub fn load_node_map(&self) -> Result<()> {
+        let mut inner = self.inner.lock().expect("lock poisoned");
+        for idx in 0..inner.revision_count()? {
+            inner.get_entry(RevIdx::from(idx))?;
+        }
+        Ok(())
+    }
 }
 
 impl RevlogInner {

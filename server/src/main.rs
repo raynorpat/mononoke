@@ -310,6 +310,12 @@ async fn repo_listen(
     https: Option<(String, u16, PathBuf, PathBuf)>,
 ) -> Result<()> {
     let repo = Arc::new(repo);
+    let warm_repo = Arc::clone(&repo);
+    let warm_log = listen_log.clone();
+    tokio::task::spawn_blocking(move || match warm_repo.warm_up() {
+        Ok(()) => info!(warm_log, "Warmed up"),
+        Err(err) => error!(warm_log, "Warm-up failed: {}", err),
+    });
     // Bind HTTP and HTTPS before the unix socket so a client that waits for
     // the socket file knows the TCP ports are already accepting.
     if let Some((addr, port)) = http {
