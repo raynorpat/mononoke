@@ -307,7 +307,7 @@ fn wait_for_lock(path: &Path) -> Result<RepoLock> {
         if started.elapsed() >= LOCK_TIMEOUT {
             let holder = RepoLock::holder(path).unwrap_or_else(|| "someone".to_owned());
             return Err(format!(
-                "{} is held by {holder}; if neither hg nor this server holds it, remove it with `hg debuglocks --force-lock`",
+                "{} is held by {holder}; if neither hg nor this server holds it, free it with `hg debuglocks --force-free-lock` or `--force-free-wlock`",
                 path.display()
             )
             .into());
