@@ -1444,3 +1444,61 @@ fn push_waits_while_hg_holds_the_store_lock() {
     );
     drop(server);
 }
+
+#[test]
+fn commit_made_with_hg_while_serving_is_served() {
+    let temp = TempDir::new("oc");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    // The first clones warm the server's revlogs and stream listing.
+    assert_hg(
+        &hg(&temp.0, &["clone", &url, "before"]),
+        "stream clone before",
+    );
+    assert_hg(
+        &hg(&temp.0, &["clone", "--pull", &url, "before-pull"]),
+        "pull clone before",
+    );
+
+    // A commit made by hg itself, not pushed through the server.
+    fs::write(repo.join("outside.txt"), b"outside\n").expect("write outside.txt");
+    assert_hg(&hg(&repo, &["add", "outside.txt"]), "hg add");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "outside", "-u", "test"]),
+        "hg commit",
+    );
+    let tip = hg(&repo, &["log", "-r", "tip", "-T", "{node}"]);
+    assert_hg(&tip, "source tip");
+    let tip_node = String::from_utf8_lossy(&tip.stdout).trim().to_owned();
+
+    for (label, args) in [
+        ("stream", vec!["clone", url.as_str(), "after"]),
+        (
+            "changegroup",
+            vec!["clone", "--pull", url.as_str(), "after-pull"],
+        ),
+    ] {
+        let clone = hg(&temp.0, &args);
+        let dest = temp.0.join(args[args.len() - 1]);
+        assert_hg(&clone, &format!("{label} clone after"));
+        let got = hg(&dest, &["log", "-r", "tip", "-T", "{node}"]);
+        assert_hg(&got, "clone tip");
+        assert_eq!(
+            String::from_utf8_lossy(&got.stdout).trim(),
+            tip_node,
+            "{label} clone missed the outside commit\nmononoke:\n{}",
+            read_log(&log)
+        );
+        assert_hg(&hg(&dest, &["verify"]), &format!("{label} verify"));
+    }
+    let pulled = hg(&temp.0.join("before-pull"), &["pull", &url]);
+    assert_hg(&pulled, "pull into the earlier clone");
+    let got = hg(
+        &temp.0.join("before-pull"),
+        &["log", "-r", "tip", "-T", "{node}"],
+    );
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), tip_node);
+    drop(server);
+}

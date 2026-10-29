@@ -402,6 +402,49 @@ fn append_revision_starts_a_snapshot_at_the_chain_limit() {
 }
 
 #[test]
+fn reload_sees_another_writers_append() {
+    let dir = std::env::temp_dir().join(format!("mononoke-revlog-{}-reload", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let idx_path = dir.join("log.i");
+    std::fs::write(&idx_path, b"").expect("empty index");
+    let append = |revlog: &mut Revlog, tail: u8, p1: Option<NodeHash>| {
+        revlog
+            .append_snapshot(
+                RevlogAppend {
+                    node: node_with_tail(tail),
+                    p1,
+                    p2: None,
+                    linkrev: None,
+                    text: vec![tail; 16],
+                },
+                RevlogCompression::Zstd,
+            )
+            .expect("append");
+    };
+    let mut writer = Revlog::from_idx(&idx_path).expect("writer");
+    append(&mut writer, 1, None);
+
+    let reader = Revlog::from_idx(&idx_path).expect("reader");
+    let shared = reader.clone();
+    assert_eq!(reader.len().expect("len"), 1);
+    append(&mut writer, 2, Some(node_with_tail(1)));
+    assert!(
+        reader.index_of(&node_with_tail(2)).is_err(),
+        "seen before reload"
+    );
+
+    reader.reload().expect("reload");
+    // Clones share the reloaded state.
+    assert_eq!(shared.len().expect("len after reload"), 2);
+    assert_eq!(shared.index_of(&node_with_tail(2)).expect("node 2"), 1);
+    let got = shared.get_rev(RevIdx::from(1u32)).expect("rev 1");
+    assert_eq!(got.as_blob().as_slice(), Some(&[2u8; 16][..]));
+    drop((writer, reader, shared));
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
 fn append_snapshot_round_trips_zlib() {
     let mut revlog = Revlog::new(Vec::new(), None).expect("empty revlog");
     let idx = revlog

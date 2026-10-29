@@ -8,12 +8,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
+use std::fs;
 use std::mem;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_compression::CompressorType;
 use bookmarks::{Bookmarks, ListBookmarks};
@@ -27,7 +28,7 @@ use mercurial::revlog::RevIdx;
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{parts, Bundle2EncodeBuilder};
 use mercurial_types::{percent_encode, Changeset, NodeHash, Parents, NULL_HASH};
-use slog::{info, o, Logger};
+use slog::{info, o, warn, Logger};
 use tokio_util::io::ReaderStream;
 
 use crate::bundle::history_part;
@@ -36,13 +37,26 @@ use crate::stream::{list_store, stream_part, stream_requirements, StoreFile};
 
 pub struct Repo {
     path: String,
-    hgrepo: mercurial::RevlogRepo,
-    /// Held while a push writes and while a stream clone lists the store, so
-    /// the listed sizes are one snapshot. Keeps the last listing for later
-    /// stream clones until a push clears it.
-    store_listing: tokio::sync::Mutex<Option<Arc<Vec<StoreFile>>>>,
-    #[allow(dead_code)]
+    /// Use `hgrepo()`, which reloads it after an outside change.
+    revlogs: mercurial::RevlogRepo,
+    /// The changelog as the server last saw it.
+    changelog_seen: std::sync::Mutex<ChangelogStamp>,
+    /// Held while a push writes and while a stream clone lists the store.
+    /// Keeps the last listing, with the changelog it was made against, for
+    /// later stream clones. A push clears it.
+    store_listing: tokio::sync::Mutex<Option<(ChangelogStamp, Arc<Vec<StoreFile>>)>>,
     logger: Logger,
+}
+
+/// Size and modification time of `00changelog.i` and `00changelog.d`. Every
+/// commit, push or strip changes one of them.
+type ChangelogStamp = [Option<(u64, SystemTime)>; 2];
+
+fn changelog_stamp(store: &Path) -> ChangelogStamp {
+    ["00changelog.i", "00changelog.d"].map(|name| {
+        let meta = fs::metadata(store.join(name)).ok()?;
+        Some((meta.len(), meta.modified().ok()?))
+    })
 }
 
 fn wireprotocaps() -> Vec<String> {
@@ -94,10 +108,13 @@ fn advertised_caps(repo: &mercurial::RevlogRepo) -> Vec<String> {
 impl Repo {
     pub fn new<P: AsRef<Path>>(parent_logger: &Logger, path: P) -> Result<Self> {
         let path = path.as_ref();
+        // Stamp before opening: a change in between only causes one extra reload.
+        let changelog_seen = std::sync::Mutex::new(changelog_stamp(&path.join("store")));
 
         Ok(Repo {
             path: format!("{:?}", path),
-            hgrepo: mercurial::RevlogRepo::open(path)?,
+            revlogs: mercurial::RevlogRepo::open(path)?,
+            changelog_seen,
             store_listing: tokio::sync::Mutex::new(None),
             logger: parent_logger.new(o!("repo" => format!("{:?}", path))),
         })
@@ -107,19 +124,58 @@ impl Repo {
     /// node map that discovery's `known` lookups use, and the stream clone
     /// store listing. Blocks; run it off the runtime thread.
     pub fn warm_up(&self) -> Result<()> {
-        self.hgrepo.changelog_revlog().load_node_map()?;
-        if stream_requirements(&self.hgrepo).is_some() {
-            let mut listing = self.store_listing.blocking_lock();
-            if listing.is_none() {
-                let _lock = store_lock(&self.hgrepo)?;
-                *listing = Some(Arc::new(list_store(&self.hgrepo)?));
-            }
+        self.hgrepo().changelog_revlog().load_node_map()?;
+        if stream_requirements(self.hgrepo()).is_some() {
+            self.stream_listing()?;
         }
         Ok(())
     }
 
+    /// The repository, reloaded first if something other than this server
+    /// changed its changelog since it last looked, such as `hg commit` or
+    /// `hg strip`, so its cached revlogs are not stale.
+    pub fn hgrepo(&self) -> &mercurial::RevlogRepo {
+        let now = changelog_stamp(&self.revlogs.store_path());
+        let mut seen = self.changelog_seen.lock().expect("changelog stamp lock");
+        if *seen != now {
+            match self.revlogs.reload() {
+                Ok(()) => *seen = now,
+                Err(err) => warn!(
+                    self.logger,
+                    "reload after an outside change failed: {}", err
+                ),
+            }
+        }
+        &self.revlogs
+    }
+
+    /// Record the changelog as this server's own push left it, so the push
+    /// does not look like an outside change. Call with the write locks held.
+    fn note_own_write(&self) {
+        *self.changelog_seen.lock().expect("changelog stamp lock") =
+            changelog_stamp(&self.revlogs.store_path());
+    }
+
+    /// The stream clone file listing. Reused while the changelog is as it was
+    /// when the store was listed. Lists under the store lock so the sizes are
+    /// one snapshot. Blocks.
+    fn stream_listing(&self) -> Result<Arc<Vec<StoreFile>>> {
+        let mut listing = self.store_listing.blocking_lock();
+        let repo = self.hgrepo();
+        let _lock = store_lock(repo)?;
+        let stamp = changelog_stamp(&repo.store_path());
+        if let Some((seen, files)) = listing.as_ref() {
+            if *seen == stamp {
+                return Ok(Arc::clone(files));
+            }
+        }
+        let files = Arc::new(list_store(repo)?);
+        *listing = Some((stamp, Arc::clone(&files)));
+        Ok(files)
+    }
+
     pub fn heads_match(&self, heads: &[NodeHash]) -> Result<bool> {
-        crate::push::heads_match(&self.hgrepo, heads)
+        crate::push::heads_match(self.hgrepo(), heads)
     }
 }
 
@@ -162,7 +218,7 @@ fn empty_listkeys_part(namespace: &str) -> hgproto::Result<PartEncodeBuilder> {
 }
 
 async fn bookmark_pairs(repo: &Repo) -> hgproto::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let bookmarks = repo.hgrepo.bookmarks()?;
+    let bookmarks = repo.hgrepo().bookmarks()?;
     let names: Vec<Vec<u8>> = bookmarks
         .keys()
         .map_err(|err| hgproto::Error::from(mercurial::Error::from(err)))
@@ -196,8 +252,12 @@ async fn create_bundle(repo: &Arc<Repo>, args: GetbundleArgs) -> hgproto::Result
     if args.stream {
         bundle.add_part(stream_clone_part(repo).await?);
     } else if args.cg {
-        let history = history_part(repo.hgrepo.clone(), args.common.clone(), args.heads.clone())
-            .map_err(|err| hgproto::Error::from(err.to_string()))?;
+        let history = history_part(
+            repo.hgrepo().clone(),
+            args.common.clone(),
+            args.heads.clone(),
+        )
+        .map_err(|err| hgproto::Error::from(err.to_string()))?;
         bundle.add_part(history);
     }
 
@@ -277,25 +337,16 @@ async fn write_locks(repo: &mercurial::RevlogRepo) -> hgproto::Result<(RepoLock,
 }
 
 async fn stream_clone_part(repo: &Arc<Repo>) -> hgproto::Result<PartEncodeBuilder> {
-    let requirements = stream_requirements(&repo.hgrepo).ok_or_else(|| {
+    let requirements = stream_requirements(repo.hgrepo()).ok_or_else(|| {
         hgproto::Error::from(
             "stream clone requested, but this repo is not served as one".to_string(),
         )
     })?;
     let lister = Arc::clone(repo);
-    let files = tokio::task::spawn_blocking(move || -> Result<Arc<Vec<StoreFile>>> {
-        let mut listing = lister.store_listing.blocking_lock();
-        if let Some(files) = listing.as_ref() {
-            return Ok(Arc::clone(files));
-        }
-        let _lock = store_lock(&lister.hgrepo)?;
-        let files = Arc::new(list_store(&lister.hgrepo)?);
-        *listing = Some(Arc::clone(&files));
-        Ok(files)
-    })
-    .await
-    .map_err(|err| hgproto::Error::from(err.to_string()))?
-    .map_err(|err| hgproto::Error::from(err.to_string()))?;
+    let files = tokio::task::spawn_blocking(move || lister.stream_listing())
+        .await
+        .map_err(|err| hgproto::Error::from(err.to_string()))?
+        .map_err(|err| hgproto::Error::from(err.to_string()))?;
     stream_part(files, &requirements).map_err(|err| hgproto::Error::from(err.to_string()))
 }
 
@@ -390,7 +441,7 @@ impl Stream for ParentStream {
         }
 
         if this.wait_cs.is_none() {
-            this.wait_cs = Some(this.repo.hgrepo.get_changeset_by_nodeid(&this.n));
+            this.wait_cs = Some(this.repo.hgrepo().get_changeset_by_nodeid(&this.n));
         }
         let cs = match this.wait_cs.as_mut().unwrap().as_mut().poll(cx) {
             Poll::Ready(Ok(cs)) => {
@@ -421,7 +472,7 @@ impl HgCommands for RepoClient {
         let repo = Arc::clone(&self.repo);
         async move {
             let heads = repo
-                .hgrepo
+                .hgrepo()
                 .get_heads()
                 .map_err(hgproto::Error::from)
                 .try_collect::<HashSet<_>>()
@@ -469,7 +520,7 @@ impl HgCommands for RepoClient {
         let repo = Arc::clone(&self.repo);
         async move {
             let heads = repo
-                .hgrepo
+                .hgrepo()
                 .get_heads()
                 .map_err(hgproto::Error::from)
                 .try_collect::<Vec<_>>()
@@ -500,7 +551,7 @@ impl HgCommands for RepoClient {
         async move {
             let bookmarks = bookmark_pairs(&repo).await?;
             // A hash prefix scans the changelog.
-            tokio::task::spawn_blocking(move || resolve_key(&repo.hgrepo, &bookmarks, &key))
+            tokio::task::spawn_blocking(move || resolve_key(repo.hgrepo(), &bookmarks, &key))
                 .await
                 .map_err(|err| hgproto::Error::from(err.to_string()))?
                 .map_err(hgproto::Error::from)
@@ -515,7 +566,7 @@ impl HgCommands for RepoClient {
         async move {
             let checks: Vec<_> = nodes
                 .iter()
-                .map(|node| repo.hgrepo.changeset_exists(node))
+                .map(|node| repo.hgrepo().changeset_exists(node))
                 .collect();
             future::try_join_all(checks)
                 .await
@@ -534,7 +585,7 @@ impl HgCommands for RepoClient {
     // @wireprotocommand('capabilities')
     fn capabilities(&self) -> HgCommandRes<Vec<String>> {
         info!(self.logger, "capabilities");
-        future::ok(advertised_caps(&self.repo.hgrepo)).boxed()
+        future::ok(advertised_caps(self.repo.hgrepo())).boxed()
     }
 
     // @wireprotocommand('hello')
@@ -544,7 +595,7 @@ impl HgCommands for RepoClient {
         let mut res = HashMap::new();
         res.insert(
             "capabilities".to_string(),
-            advertised_caps(&self.repo.hgrepo),
+            advertised_caps(self.repo.hgrepo()),
         );
 
         future::ok(res).boxed()
@@ -565,8 +616,8 @@ impl HgCommands for RepoClient {
         let repo = Arc::clone(&self.repo);
         let key = key.into_bytes();
         async move {
-            let _locks = write_locks(&repo.hgrepo).await?;
-            crate::push::pushkey_bookmark(&repo.hgrepo, &key, old, new)
+            let _locks = write_locks(repo.hgrepo()).await?;
+            crate::push::pushkey_bookmark(repo.hgrepo(), &key, old, new)
                 .map_err(|err| hgproto::Error::from(err.to_string()))
         }
         .boxed()
@@ -580,9 +631,11 @@ impl HgCommands for RepoClient {
             let mut listing = repo.store_listing.lock().await;
             // Cleared before writing, so even a failed push lists the store again.
             *listing = None;
-            let _locks = write_locks(&repo.hgrepo).await?;
-            let applied = crate::push::apply_repo(&repo.hgrepo, &heads, &bundle)
-                .map_err(|err| hgproto::Error::from(err.to_string()))?;
+            let _locks = write_locks(repo.hgrepo()).await?;
+            // `hgrepo()` again under the locks, to see anything hg wrote while we waited.
+            let applied = crate::push::apply_repo(repo.hgrepo(), &heads, &bundle);
+            repo.note_own_write();
+            let applied = applied.map_err(|err| hgproto::Error::from(err.to_string()))?;
             crate::push::reply_bundle(&applied)
                 .await
                 .map_err(|err| hgproto::Error::from(err.to_string()))

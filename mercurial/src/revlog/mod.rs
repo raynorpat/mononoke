@@ -338,6 +338,23 @@ impl Revlog {
         self.get_idx_by_nodeid(node).map(|idx| idx.as_u32())
     }
 
+    /// Re-read the index and data from disk, for a revlog that something else
+    /// changed. Every clone shares the reloaded state, and cached offsets, nodes
+    /// and text are dropped. An in-memory revlog is left as it is.
+    pub fn reload(&self) -> Result<()> {
+        let mut inner = self.inner.lock().expect("lock poisoned");
+        let Some(idx_path) = inner.idx_path.clone() else {
+            return Ok(());
+        };
+        let fresh = Revlog::from_idx_data(&idx_path, inner.data_path.clone())?;
+        let fresh = Arc::try_unwrap(fresh.inner)
+            .expect("a just-opened revlog has no other clones")
+            .into_inner()
+            .expect("lock poisoned");
+        *inner = fresh;
+        Ok(())
+    }
+
     /// Parse every index entry so later node lookups, hits and misses, need no scan.
     pub fn load_node_map(&self) -> Result<()> {
         let mut inner = self.inner.lock().expect("lock poisoned");

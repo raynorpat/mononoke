@@ -249,6 +249,17 @@ impl RevlogRepo {
         self.inner.lock().expect("poisoned lock").manifest.clone()
     }
 
+    /// Re-read the changelog and manifest from disk and forget cached filelogs,
+    /// after something other than this process changed the repository.
+    /// Clones of this repo, and of its revlogs, see the reloaded state.
+    pub fn reload(&self) -> Result<()> {
+        let mut inner = self.inner.lock().expect("poisoned lock");
+        inner.changelog.reload()?;
+        inner.manifest.reload()?;
+        inner.filelogcache.clear();
+        Ok(())
+    }
+
     /// The `.hg/store` directory.
     pub fn store_path(&self) -> PathBuf {
         self.basepath.join("store")
