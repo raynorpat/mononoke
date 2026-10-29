@@ -257,8 +257,10 @@ fn append_group(
                 linknode: _,
                 delta,
             } = chunk;
+            // Keep the client's delta when it is against a revision we have.
+            let stored_delta = (base != NULL_HASH).then(|| (base, delta.clone()));
             let text = full_text(&revlog, base, delta)?;
-            revlog.append_snapshot(
+            revlog.append_revision(
                 RevlogAppend {
                     node,
                     p1: parent_opt(p1),
@@ -266,6 +268,7 @@ fn append_group(
                     linkrev: Some(linkrev),
                     text,
                 },
+                stored_delta,
                 compression,
             )?;
             progress = true;

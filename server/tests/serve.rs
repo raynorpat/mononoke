@@ -1341,3 +1341,61 @@ fn lookup_resolves_names_and_clone_r_gets_only_ancestors() {
     assert_eq!(got, want, "clone -r feature");
     drop(server);
 }
+
+#[test]
+fn pushed_revision_is_stored_as_a_delta() {
+    let temp = TempDir::new("pd");
+    let repo = init_zstd_repo(&temp.0);
+    // Incompressible, so a full-text snapshot would cost about its whole size.
+    let mut seed: u64 = 0x5851_f42d_4c95_7f2d;
+    let mut big: Vec<u8> = (0..60_000)
+        .map(|_| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 56) as u8
+        })
+        .collect();
+    fs::write(repo.join("big.bin"), &big).expect("write big.bin");
+    assert_hg(&hg(&repo, &["add", "big.bin"]), "hg add");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "big", "-u", "test"]),
+        "hg commit",
+    );
+
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let clone = hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "dest"], &shim);
+    assert_hg(&clone, "clone");
+    let dest = temp.0.join("dest");
+    big[1000..1004].copy_from_slice(b"EDIT");
+    fs::write(dest.join("big.bin"), &big).expect("edit big.bin");
+    assert_hg(
+        &hg(&dest, &["commit", "-m", "edit", "-u", "test"]),
+        "commit edit",
+    );
+    assert_hg(&hg_ssh(&dest, &["push"], &shim), "push");
+    drop(server);
+
+    let served = mercurial::RevlogRepo::open(repo.join(".hg")).expect("open served repo");
+    let filelog = served
+        .get_file_revlog(&mercurial_types::Path::new(b"big.bin").expect("path"))
+        .expect("big.bin filelog");
+    let entry = filelog
+        .get_entry(mercurial::revlog::RevIdx::from(1u32))
+        .expect("pushed revision");
+    assert_eq!(
+        entry.baserev,
+        Some(mercurial::revlog::RevIdx::from(0u32)),
+        "pushed revision is not a delta against rev 0"
+    );
+    assert!(
+        entry.compressed_len < 1_000,
+        "pushed revision takes {} bytes",
+        entry.compressed_len
+    );
+    assert_hg(&hg(&repo, &["verify"]), "served verify");
+    assert_hg(&hg(&repo, &["update", "-C"]), "update served repo");
+    assert_eq!(fs::read(repo.join("big.bin")).expect("served big.bin"), big);
+}

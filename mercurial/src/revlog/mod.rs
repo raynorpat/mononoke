@@ -103,6 +103,12 @@ impl Eq for Revlog {}
 
 /// Inline index-plus-data larger than this is rewritten as a separate `.d` file.
 pub const INLINE_LIMIT: usize = 131072;
+/// Longest delta chain an append extends, `sparse-revlog`'s default maximum.
+const MAX_DELTA_CHAIN: usize = 1000;
+/// An append does not extend a chain whose compressed size, base snapshot
+/// included, would pass this many times the text, so reading stays cheap.
+/// Mercurial's `LIMIT_DELTA2TEXT`.
+const DELTA_CHAIN_TO_TEXT: usize = 2;
 
 /// Compression for a full-text snapshot chunk. Neither variant adds a prefix byte.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,7 +314,20 @@ impl Revlog {
         compression: RevlogCompression,
     ) -> Result<u32> {
         let mut inner = self.inner.lock().expect("lock poisoned");
-        inner.append_snapshot(rev, compression)
+        inner.append_revision(rev, None, compression)
+    }
+
+    /// Append a revision stored as `delta` against the `base` node when that
+    /// pays off, otherwise as a snapshot. A changegroup carries such a delta.
+    /// See `RevlogInner::delta_to_store` for when a delta is kept.
+    pub fn append_revision(
+        &mut self,
+        rev: RevlogAppend,
+        delta: Option<(NodeHash, delta::Delta)>,
+        compression: RevlogCompression,
+    ) -> Result<u32> {
+        let mut inner = self.inner.lock().expect("lock poisoned");
+        inner.append_revision(rev, delta, compression)
     }
 
     pub fn len(&self) -> Result<u32> {
@@ -749,9 +768,10 @@ impl RevlogInner {
         Ok(heads.values().map(|n| n.nodeid).collect())
     }
 
-    fn append_snapshot(
+    fn append_revision(
         &mut self,
         rev: RevlogAppend,
+        delta: Option<(NodeHash, delta::Delta)>,
         compression: RevlogCompression,
     ) -> Result<u32> {
         if self.header.version != Version::RevlogNG {
@@ -760,7 +780,17 @@ impl RevlogInner {
         if rev.text.len() > u32::MAX as usize {
             return Err(ErrorKind::Revlog("revision text exceeds u32 length".into()).into());
         }
-        let compressed = compress_snapshot(&rev.text, compression)?;
+        let snapshot = compress_snapshot(&rev.text, compression)?;
+        let stored = match delta {
+            Some((base, delta)) => {
+                self.delta_to_store(&base, &delta, rev.text.len(), snapshot.len(), compression)?
+            }
+            None => None,
+        };
+        let (baserev, compressed) = match stored {
+            Some((base_idx, bytes)) => (Some(base_idx), bytes),
+            None => (None, snapshot),
+        };
         if compressed.len() > u32::MAX as usize {
             return Err(ErrorKind::Revlog("compressed revision exceeds u32 length".into()).into());
         }
@@ -783,8 +813,9 @@ impl RevlogInner {
                 return Err("Can't append without data".into());
             }
 
-            self.write_snapshot(
+            self.write_revision(
                 rev_idx,
+                baserev.unwrap_or(rev_idx),
                 &rev.node,
                 p1,
                 p2,
@@ -799,6 +830,52 @@ impl RevlogInner {
             self.restore(saved);
         }
         appended
+    }
+
+    /// The base index and compressed bytes to store `delta` with, or `None` when
+    /// a snapshot is better: the revlog is not generaldelta, the base is not in
+    /// it, the delta does not compress smaller than the snapshot, or the chain
+    /// would pass `MAX_DELTA_CHAIN` deltas or `DELTA_CHAIN_TO_TEXT` times the text.
+    fn delta_to_store(
+        &mut self,
+        base: &NodeHash,
+        delta: &delta::Delta,
+        text_len: usize,
+        snapshot_len: usize,
+        compression: RevlogCompression,
+    ) -> Result<Option<(u32, Vec<u8>)>> {
+        if !self.header.features.contains(parser::GENERAL_DELTA) {
+            return Ok(None);
+        }
+        let Ok(base_idx) = self.get_idx_by_nodeid(base) else {
+            return Ok(None);
+        };
+        let compressed = compress_snapshot(&encode_delta(delta), compression)?;
+        if compressed.len() >= snapshot_len {
+            return Ok(None);
+        }
+        // Walk from the base down to its snapshot, counting the new delta too.
+        let mut chain_len = 1;
+        let mut chain_bytes = compressed.len();
+        let mut idx = base_idx;
+        loop {
+            let entry = self.get_entry(idx)?;
+            chain_bytes += entry.compressed_len as usize;
+            match entry.baserev {
+                Some(next) if next != idx => {
+                    idx = next;
+                    chain_len += 1;
+                    if chain_len > MAX_DELTA_CHAIN {
+                        return Ok(None);
+                    }
+                }
+                _ => break,
+            }
+        }
+        if chain_bytes > DELTA_CHAIN_TO_TEXT * text_len {
+            return Ok(None);
+        }
+        Ok(Some((base_idx.as_u32(), compressed)))
     }
 
     /// `None` is a null parent (`u32::MAX`). `Some` must already be in this revlog.
@@ -911,9 +988,11 @@ impl RevlogInner {
         Ok(())
     }
 
-    fn write_snapshot(
+    /// Write one index entry and its stored bytes. `baserev` is `rev_idx` for a snapshot.
+    fn write_revision(
         &mut self,
         rev_idx: u32,
+        baserev: u32,
         node: &NodeHash,
         p1: u32,
         p2: u32,
@@ -947,7 +1026,7 @@ impl RevlogInner {
             0,
             compressed.len() as u32,
             uncompressed_len,
-            rev_idx,
+            baserev,
             linkrev,
             p1,
             p2,
@@ -1118,6 +1197,19 @@ fn pack_indexng(
 fn overlay_header(entry: &mut [u8], features: parser::Features, version: Version) {
     entry[0..2].copy_from_slice(&features.bits().to_be_bytes());
     entry[2..4].copy_from_slice(&(version as u16).to_be_bytes());
+}
+
+/// The revlog encoding of `delta`: per fragment, the start, end and content
+/// length as big-endian `u32`s, then the content.
+fn encode_delta(delta: &delta::Delta) -> Vec<u8> {
+    let mut out = Vec::new();
+    for frag in delta.fragments() {
+        out.extend_from_slice(&(frag.start as u32).to_be_bytes());
+        out.extend_from_slice(&(frag.end as u32).to_be_bytes());
+        out.extend_from_slice(&(frag.content.len() as u32).to_be_bytes());
+        out.extend_from_slice(&frag.content);
+    }
+    out
 }
 
 fn compress_snapshot(text: &[u8], compression: RevlogCompression) -> Result<Vec<u8>> {

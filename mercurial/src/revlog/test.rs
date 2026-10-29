@@ -283,6 +283,124 @@ fn unknown_node_lookups_stay_misses_after_the_map_is_full() {
     assert!(revlog.index_of(&unknown).is_err());
 }
 
+fn replace_delta(start: usize, end: usize, content: &[u8]) -> delta::Delta {
+    delta::Delta::new(vec![delta::Fragment {
+        start,
+        end,
+        content: content.to_vec(),
+    }])
+    .expect("delta")
+}
+
+fn append_on(
+    revlog: &mut Revlog,
+    tail: u8,
+    base: Option<(NodeHash, delta::Delta)>,
+    text: Vec<u8>,
+) -> u32 {
+    let p1 = base.as_ref().map(|(node, _)| *node);
+    revlog
+        .append_revision(
+            RevlogAppend {
+                node: node_with_tail(tail),
+                p1,
+                p2: None,
+                linkrev: None,
+                text,
+            },
+            base,
+            RevlogCompression::Zstd,
+        )
+        .expect("append")
+}
+
+#[test]
+fn append_revision_stores_a_small_delta() {
+    let mut revlog = Revlog::new(Vec::new(), None).expect("empty revlog");
+    let text0 = incompressible(50_000);
+    append_on(&mut revlog, 1, None, text0.clone());
+
+    let mut text1 = text0.clone();
+    text1[100..105].copy_from_slice(b"HELLO");
+    let idx = append_on(
+        &mut revlog,
+        2,
+        Some((node_with_tail(1), replace_delta(100, 105, b"HELLO"))),
+        text1.clone(),
+    );
+    let entry = revlog.get_entry(RevIdx::from(idx)).expect("entry");
+    assert_eq!(entry.baserev, Some(RevIdx::from(0u32)), "stored as a delta");
+    assert!(
+        entry.compressed_len < 1_000,
+        "delta is {} bytes",
+        entry.compressed_len
+    );
+    assert_eq!(entry.len, Some(text1.len() as u32));
+    let got = revlog.get_rev(RevIdx::from(idx)).expect("rev 1");
+    assert_eq!(got.as_blob().as_slice(), Some(text1.as_slice()));
+
+    // A delta larger than the text it makes is stored as a snapshot.
+    let idx = append_on(
+        &mut revlog,
+        3,
+        Some((node_with_tail(2), replace_delta(0, text1.len(), b"tiny"))),
+        b"tiny".to_vec(),
+    );
+    let entry = revlog.get_entry(RevIdx::from(idx)).expect("tiny entry");
+    assert_eq!(entry.baserev, Some(RevIdx::from(idx)), "tiny is a snapshot");
+    let got = revlog.get_rev(RevIdx::from(idx)).expect("tiny");
+    assert_eq!(got.as_blob().as_slice(), Some(&b"tiny"[..]));
+}
+
+#[test]
+fn append_revision_starts_a_snapshot_at_the_chain_limit() {
+    let mut revlog = Revlog::new(Vec::new(), None).expect("empty revlog");
+    let mut text = incompressible(200_000);
+    append_on(&mut revlog, 0, None, text.clone());
+    let mut base = node_with_tail(0);
+    let mut last = 0;
+    for rev in 1..=(MAX_DELTA_CHAIN as u32 + 1) {
+        let mark = (rev % 251) as u8;
+        text[10] = mark;
+        let mut bytes = [0u8; 20];
+        bytes[..4].copy_from_slice(&rev.to_be_bytes());
+        bytes[19] = 0xee;
+        let node = NodeHash::from_bytes(&bytes).expect("node");
+        last = revlog
+            .append_revision(
+                RevlogAppend {
+                    node,
+                    p1: Some(base),
+                    p2: None,
+                    linkrev: None,
+                    text: text.clone(),
+                },
+                Some((base, replace_delta(10, 11, &[mark]))),
+                RevlogCompression::Zstd,
+            )
+            .expect("append");
+        base = node;
+    }
+    let deltas = (1..=MAX_DELTA_CHAIN as u32)
+        .filter(|rev| {
+            let entry = revlog.get_entry(RevIdx::from(*rev)).expect("entry");
+            entry.baserev == Some(RevIdx::from(*rev - 1))
+        })
+        .count();
+    assert_eq!(
+        deltas, MAX_DELTA_CHAIN,
+        "every revision up to the limit is a delta"
+    );
+    let entry = revlog.get_entry(RevIdx::from(last)).expect("last");
+    assert_eq!(
+        entry.baserev,
+        Some(RevIdx::from(last)),
+        "past the limit is a snapshot"
+    );
+    let got = revlog.get_rev(RevIdx::from(last)).expect("last rev");
+    assert_eq!(got.as_blob().as_slice(), Some(text.as_slice()));
+}
+
 #[test]
 fn append_snapshot_round_trips_zlib() {
     let mut revlog = Revlog::new(Vec::new(), None).expect("empty revlog");
