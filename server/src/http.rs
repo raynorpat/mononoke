@@ -151,7 +151,11 @@ where
         info!(log, "HTTP {} {}", incoming.method, cmd);
         let close = incoming.close;
         let body = match dispatch(&service, &incoming, &cmd).await {
-            Ok(Response::Getbundle(bundle)) => {
+            Ok(
+                Response::Getbundle(bundle)
+                | Response::Changegroup(bundle)
+                | Response::Changegroupsubset(bundle),
+            ) => {
                 let engine = bundle_engine(&incoming.protocaps, bundle.prefer_uncompressed);
                 // The 200 is already sent if the bundle fails, so the client sees a cut-off body.
                 match write_hg_stream(&mut sock, bundle, engine, close).await {
@@ -576,6 +580,11 @@ fn frame_request(cmd: &str, query: &HashMap<String, Vec<u8>>, body: &[u8]) -> Re
     match cmd {
         "capabilities" | "hello" | "branchmap" | "heads" => {}
         "getbundle" => write_star(&mut buf, &args),
+        "changegroup" => write_kv(&mut buf, "roots", require(&args, "roots")?),
+        "changegroupsubset" => {
+            write_kv(&mut buf, "bases", require(&args, "bases")?);
+            write_kv(&mut buf, "heads", require(&args, "heads")?);
+        }
         "known" => {
             write_kv(&mut buf, "nodes", arg_or_empty(&args, "nodes"));
             args.remove("nodes");
@@ -663,7 +672,9 @@ fn response_body(response: &Response) -> Result<Bytes> {
             caps.push(format!("compression={}", SERVER_ENGINES.join(",")));
             Ok(Bytes::from(caps.join(" ")))
         }
-        Response::Getbundle(_) => Err("getbundle is streamed by the connection".into()),
+        Response::Getbundle(_) | Response::Changegroup(_) | Response::Changegroupsubset(_) => {
+            Err("changegroups are streamed by the connection".into())
+        }
         Response::Batch(_)
         | Response::Lookup(_)
         | Response::Between(_)
@@ -675,11 +686,9 @@ fn response_body(response: &Response) -> Result<Bytes> {
         | Response::Pushkey(_)
         | Response::Listkeys(_)
         | Response::Unbundle(_) => Ok(hgproto::sshproto::response::encode_cmd(response)),
-        Response::Branches(_)
-        | Response::Clonebundles(_)
-        | Response::Changegroup
-        | Response::Changegroupsubset
-        | Response::Streamout => Err("HTTP response is not implemented for this command".into()),
+        Response::Branches(_) | Response::Clonebundles(_) | Response::Streamout => {
+            Err("HTTP response is not implemented for this command".into())
+        }
     }
 }
 

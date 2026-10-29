@@ -6,19 +6,22 @@
 
 //! Changegroup history for `getbundle`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use futures::Future;
+use futures::{StreamExt, TryStreamExt};
 use mercurial::revlog::{Chunk, RevIdx, Revlog};
 use mercurial::RevlogRepo;
+use mercurial_bundles::changegroup::packer::Cg2Packer;
 use mercurial_bundles::changegroup::{CgDeltaChunk, CgVersion, Part, Section};
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::parts::changegroup_part_version;
 use mercurial_bundles::Error as BundleError;
 use mercurial_types::delta::{Delta, Fragment};
+use mercurial_types::textdiff::textdiff;
 use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, Path, NULL_HASH};
 
 use crate::errors::{Error, Result};
@@ -55,9 +58,8 @@ fn missing_revs(
     };
 
     // NULL_HASH is not a changelog node, so it neither adds nor excludes revisions.
-    let heads: Vec<&NodeHash> = heads.iter().filter(|node| **node != NULL_HASH).collect();
     let mut missing = vec![heads.is_empty(); len];
-    for node in heads {
+    for node in heads.iter().filter(|node| **node != NULL_HASH) {
         let start = changelog
             .index_of(node)
             .map_err(|_| Error::from(format!("unknown revision '{node}'")))?;
@@ -76,6 +78,48 @@ fn missing_revs(
     Ok((nodes, missing))
 }
 
+pub enum Selection {
+    Common {
+        common: Vec<NodeHash>,
+        heads: Vec<NodeHash>,
+    },
+    Roots {
+        roots: Vec<NodeHash>,
+        heads: Vec<NodeHash>,
+    },
+}
+
+/// Descendants of roots that are also ancestors of heads, including the roots.
+fn missing_from_roots(
+    repo: &RevlogRepo,
+    roots: &[NodeHash],
+    heads: &[NodeHash],
+) -> Result<(Vec<NodeHash>, Vec<bool>)> {
+    let (nodes, mut missing) = missing_revs(repo, &[], heads)?;
+    // A subset with no heads selects nothing, unlike omitted getbundle heads.
+    if heads.is_empty() {
+        missing.fill(false);
+        return Ok((nodes, missing));
+    }
+    if roots.contains(&NULL_HASH) {
+        return Ok((nodes, missing));
+    }
+    let changelog = repo.changelog_revlog();
+    let mut descendants = vec![false; nodes.len()];
+    for root in roots {
+        descendants[changelog.index_of(root)? as usize] = true;
+    }
+    for rev in 0..nodes.len() {
+        let entry = changelog.get_entry(RevIdx::from(rev))?;
+        descendants[rev] |= [entry.p1, entry.p2]
+            .iter()
+            .flatten()
+            .any(|p| descendants[p.as_u32() as usize]);
+        missing[rev] &= descendants[rev];
+    }
+    Ok((nodes, missing))
+}
+
 /// Parts queued between the revlog reader and the bundle writer.
 const PART_QUEUE: usize = 1024;
 
@@ -85,22 +129,11 @@ const PART_QUEUE: usize = 1024;
 /// connection's runtime thread. A dropped part stops the reader at its next send.
 pub fn history_part(
     repo: RevlogRepo,
-    common: Vec<NodeHash>,
-    heads: Vec<NodeHash>,
+    selection: Selection,
     version: CgVersion,
 ) -> Result<PartEncodeBuilder> {
     let treemanifest = repo.is_treemanifest();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(PART_QUEUE);
-    tokio::task::spawn_blocking(move || {
-        let sent = history_parts(&repo, &common, &heads, version, &mut |part| {
-            tx.blocking_send(Ok(part))
-                .map_err(|_| Error::from("getbundle writer went away"))
-        });
-        if let Err(err) = sent {
-            let _ = tx.blocking_send(Err(BundleError::from(err.to_string())));
-        }
-    });
-    let parts = futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
+    let parts = history_stream(repo, selection, version);
     let mut part =
         changegroup_part_version(parts, version).map_err(|err| Error::from(err.to_string()))?;
     if treemanifest {
@@ -110,14 +143,63 @@ pub fn history_part(
     Ok(part)
 }
 
+fn history_stream(
+    repo: RevlogRepo,
+    selection: Selection,
+    version: CgVersion,
+) -> futures::stream::BoxStream<'static, std::result::Result<Part, BundleError>> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(PART_QUEUE);
+    tokio::task::spawn_blocking(move || {
+        let sent = history_parts(&repo, &selection, version, &mut |part| {
+            tx.blocking_send(Ok(part))
+                .map_err(|_| Error::from("getbundle writer went away"))
+        });
+        if let Err(err) = sent {
+            let _ = tx.blocking_send(Err(BundleError::from(err.to_string())));
+        }
+    });
+    futures::stream::poll_fn(move |cx| rx.poll_recv(cx)).boxed()
+}
+
+/// Raw changegroup 01, without a bundle header or bundle2 framing.
+pub fn legacy_changegroup(repo: RevlogRepo, selection: Selection) -> Result<hgproto::BundleStream> {
+    if repo.is_treemanifest() {
+        return Err("cannot produce changegroup 01 for a treemanifest repository".into());
+    }
+    let parts = history_stream(repo, selection, CgVersion::V1);
+    let body = Cg2Packer::with_version(parts, CgVersion::V1)
+        .and_then(|chunk| futures::future::ready(chunk.into_bytes()))
+        .map_err(hgproto::Error::from)
+        .boxed();
+    Ok(hgproto::BundleStream {
+        body,
+        prefer_uncompressed: false,
+    })
+}
+
 fn history_parts(
     repo: &RevlogRepo,
-    common: &[NodeHash],
-    heads: &[NodeHash],
+    selection: &Selection,
     version: CgVersion,
     emit: &mut dyn FnMut(Part) -> Result<()>,
 ) -> Result<()> {
-    let (nodes, missing) = missing_revs(repo, common, heads)?;
+    let (nodes, missing) = match selection {
+        Selection::Common { common, heads } => missing_revs(repo, common, heads)?,
+        Selection::Roots { roots, heads } => missing_from_roots(repo, roots, heads)?,
+    };
+
+    // A restricted pull may refer to nodes first stored on an unselected sibling.
+    // In that case use the requested changesets' manifests, as Mercurial's
+    // non-fastpath packer does, rather than selecting by stored linkrev alone.
+    let heads = match selection {
+        Selection::Common { heads, .. } | Selection::Roots { heads, .. } => heads,
+    };
+    let restricted = !repo.is_treemanifest()
+        && missing_revs(repo, &[], heads)?
+            .1
+            .iter()
+            .any(|selected| !selected);
+    let mut manifest_links = HashMap::new();
 
     let mut files = BTreeSet::new();
     for (rev, node) in nodes.iter().enumerate() {
@@ -126,6 +208,12 @@ fn history_parts(
         }
         let cs = ready(repo.get_changeset_by_nodeid(node))??;
         files.extend(cs.files().iter().cloned());
+        if restricted {
+            manifest_links.entry(*cs.manifestid()).or_insert(*node);
+        }
+        if version == CgVersion::V1 {
+            continue;
+        }
         let blob = ready(repo.get_changeset_blob_by_nodeid(node))??;
         let renamed = blob.maybe_renamed();
         let parents = *blob.parents();
@@ -139,15 +227,95 @@ fn history_parts(
             text,
         )?)?;
     }
+    if version == CgVersion::V1 {
+        linked_revisions(
+            &repo.changelog_revlog(),
+            Section::Changeset,
+            &nodes,
+            &missing,
+            version,
+            emit,
+        )?;
+    }
     emit(Part::SectionEnd(Section::Changeset))?;
 
-    linked_revisions(
-        &repo.manifest_revlog(),
-        Section::Manifest,
-        &nodes,
-        &missing,
-        emit,
-    )?;
+    let mut file_links: HashMap<Path, HashMap<NodeHash, NodeHash>> = HashMap::new();
+    let common = if restricted {
+        let common_heads = match selection {
+            Selection::Common { common, .. } => common.clone(),
+            Selection::Roots { .. } => {
+                let mut common = Vec::new();
+                let changelog = repo.changelog_revlog();
+                for (rev, selected) in missing.iter().enumerate() {
+                    if *selected {
+                        let entry = changelog.get_entry(RevIdx::from(rev))?;
+                        for parent in [entry.p1, entry.p2].into_iter().flatten() {
+                            let parent = parent.as_u32() as usize;
+                            if !missing[parent] {
+                                common.push(nodes[parent]);
+                            }
+                        }
+                    }
+                }
+                common
+            }
+        };
+        let common: Vec<bool> = missing_revs(repo, &common_heads, &[])?
+            .1
+            .into_iter()
+            .map(|missing| !missing)
+            .collect();
+        // Iterate manifests in changeset order so each filenode gets its first
+        // outgoing changeset as linknode.
+        for (rev, selected) in missing.iter().enumerate() {
+            if !selected {
+                continue;
+            }
+            let cs = ready(repo.get_changeset_by_nodeid(&nodes[rev]))??;
+            let manifest = repo.manifest_revlog();
+            let idx = manifest.get_idx_by_nodeid(cs.manifestid())?;
+            let entry = manifest.get_entry(idx)?;
+            // read_delta_parents(exact=False): when storage deltas against a
+            // parent, only its inserted/replaced manifest lines supply files.
+            let text = match manifest.get_chunk(idx)? {
+                Chunk::Deltas(base, deltas) if [entry.p1, entry.p2].contains(&Some(base)) => {
+                    deltas.into_iter().flat_map(|delta| delta.content).collect()
+                }
+                _ => full_text(&manifest.get_rev(idx)?)?,
+            };
+            for (path, details) in mercurial::manifest::revlog::parse(&text)? {
+                if files.contains(&path) {
+                    file_links
+                        .entry(path)
+                        .or_default()
+                        .entry(*details.nodeid())
+                        .or_insert(nodes[rev]);
+                }
+            }
+        }
+        Some(common)
+    } else {
+        None
+    };
+    if restricted {
+        referenced_revisions(
+            &repo.manifest_revlog(),
+            Section::Manifest,
+            &manifest_links,
+            None,
+            version,
+            emit,
+        )?;
+    } else {
+        linked_revisions(
+            &repo.manifest_revlog(),
+            Section::Manifest,
+            &nodes,
+            &missing,
+            version,
+            emit,
+        )?;
+    }
     emit(Part::SectionEnd(Section::Manifest))?;
 
     if version == CgVersion::V3 && repo.is_treemanifest() {
@@ -159,6 +327,7 @@ fn history_parts(
                     Section::Treemanifest(dir.clone()),
                     &nodes,
                     &missing,
+                    version,
                 )
             },
             &mut |parts: Vec<Part>| parts.into_iter().try_for_each(&mut *emit),
@@ -169,16 +338,85 @@ fn history_parts(
     read_in_order(
         &files,
         |path| {
+            if restricted {
+                let mut parts = Vec::new();
+                if let Some(links) = file_links.get(path) {
+                    if referenced_revisions(
+                        &repo.read_file_revlog(path)?,
+                        Section::Filelog(path.clone()),
+                        links,
+                        common.as_deref(),
+                        version,
+                        &mut |part| {
+                            parts.push(part);
+                            Ok(())
+                        },
+                    )? {
+                        parts.push(Part::SectionEnd(Section::Filelog(path.clone())));
+                    }
+                }
+                return Ok(parts);
+            }
             revlog_parts(
                 &repo.read_file_revlog(path)?,
                 Section::Filelog(path.clone()),
                 &nodes,
                 &missing,
+                version,
             )
         },
         &mut |parts: Vec<Part>| parts.into_iter().try_for_each(&mut *emit),
     )?;
     emit(Part::End)
+}
+
+fn referenced_revisions(
+    revlog: &Revlog,
+    section: Section,
+    links: &HashMap<NodeHash, NodeHash>,
+    common: Option<&[bool]>,
+    version: CgVersion,
+    emit: &mut dyn FnMut(Part) -> Result<()>,
+) -> Result<bool> {
+    let mut revisions: Vec<_> = links
+        .iter()
+        .map(|(node, link)| Ok((revlog.get_idx_by_nodeid(node)?, *link)))
+        .collect::<Result<_>>()?;
+    revisions.sort_unstable_by_key(|(idx, _)| *idx);
+    let mut previous = None;
+    for (idx, linknode) in revisions {
+        let entry = revlog.get_entry(idx)?;
+        if common.is_some_and(|common| {
+            entry
+                .linkrev
+                .is_some_and(|link| common.get(link.as_u32() as usize).copied().unwrap_or(false))
+        }) {
+            continue;
+        }
+        let part = if version == CgVersion::V1 {
+            v1_revision(
+                revlog,
+                section.clone(),
+                idx,
+                previous.or(entry.p1),
+                linknode,
+            )?
+        } else {
+            // A stored base may itself belong to the unselected sibling.
+            let (parents, renamed) = indexed_parents(revlog, idx)?;
+            fulltext_chunk(
+                section.clone(),
+                entry.nodeid,
+                &parents,
+                renamed,
+                linknode,
+                full_text(&revlog.get_rev(idx)?)?,
+            )?
+        };
+        emit(part)?;
+        previous = Some(idx);
+    }
+    Ok(previous.is_some())
 }
 
 /// Threads reading files at once. The first read of a file waits on the
@@ -236,12 +474,20 @@ fn revlog_parts(
     section: Section,
     nodes: &[NodeHash],
     missing: &[bool],
+    version: CgVersion,
 ) -> Result<Vec<Part>> {
     let mut parts = Vec::new();
-    if linked_revisions(revlog, section.clone(), nodes, missing, &mut |part| {
-        parts.push(part);
-        Ok(())
-    })? {
+    if linked_revisions(
+        revlog,
+        section.clone(),
+        nodes,
+        missing,
+        version,
+        &mut |part| {
+            parts.push(part);
+            Ok(())
+        },
+    )? {
         parts.push(Part::SectionEnd(section));
     }
     Ok(parts)
@@ -257,9 +503,11 @@ fn linked_revisions(
     section: Section,
     nodes: &[NodeHash],
     missing: &[bool],
+    version: CgVersion,
     emit: &mut dyn FnMut(Part) -> Result<()>,
 ) -> Result<bool> {
     let mut any = false;
+    let mut previous = None;
     for idx in 0..revlog.len()? {
         let idx = RevIdx::from(idx);
         let entry = revlog.get_entry(idx)?;
@@ -271,16 +519,59 @@ fn linked_revisions(
         if !missing.get(linkrev).copied().unwrap_or(false) {
             continue;
         }
-        emit(stored_revision(
-            revlog,
-            section.clone(),
-            idx,
-            entry.nodeid,
-            nodes[linkrev],
-        )?)?;
+        let part = if version == CgVersion::V1 {
+            let base = previous.or(entry.p1);
+            v1_revision(revlog, section.clone(), idx, base, nodes[linkrev])?
+        } else {
+            stored_revision(revlog, section.clone(), idx, entry.nodeid, nodes[linkrev])?
+        };
+        emit(part)?;
+        previous = Some(idx);
         any = true;
     }
     Ok(any)
+}
+
+fn v1_revision(
+    revlog: &Revlog,
+    section: Section,
+    idx: RevIdx,
+    base_idx: Option<RevIdx>,
+    linknode: NodeHash,
+) -> Result<Part> {
+    if let Chunk::Deltas(stored_base, _) = revlog.get_chunk(idx)? {
+        if Some(stored_base) == base_idx {
+            return stored_revision(
+                revlog,
+                section,
+                idx,
+                revlog.get_entry(idx)?.nodeid,
+                linknode,
+            );
+        }
+    }
+    let (parents, renamed) = indexed_parents(revlog, idx)?;
+    let (p1, p2) = parent_nodes(&parents, renamed);
+    let (base, base_text) = match base_idx {
+        Some(base) => (
+            revlog.get_entry(base)?.nodeid,
+            full_text(&revlog.get_rev(base)?)?,
+        ),
+        None => (NULL_HASH, Vec::new()),
+    };
+    let text = full_text(&revlog.get_rev(idx)?)?;
+    Ok(Part::CgChunk(
+        section,
+        CgDeltaChunk {
+            node: revlog.get_entry(idx)?.nodeid,
+            p1,
+            p2,
+            base,
+            linknode,
+            flags: 0,
+            delta: textdiff(&base_text, &text),
+        },
+    ))
 }
 
 fn indexed_parents(revlog: &Revlog, idx: RevIdx) -> Result<(Parents, bool)> {
@@ -688,8 +979,12 @@ mod tests {
     }
 
     fn collect_version(repo: &RevlogRepo, common: &[NodeHash], version: CgVersion) -> Vec<Part> {
+        let selection = Selection::Common {
+            common: common.to_vec(),
+            heads: Vec::new(),
+        };
         let mut parts = Vec::new();
-        history_parts(repo, common, &[], version, &mut |part| {
+        history_parts(repo, &selection, version, &mut |part| {
             parts.push(part);
             Ok(())
         })
@@ -800,6 +1095,73 @@ mod tests {
             Part::CgChunk(_, chunk) => chunk.node != base,
             _ => true,
         }));
+    }
+
+    #[test]
+    fn v1_deltas_reuse_stored_prev_delta() {
+        let temp = init_share_safe_repo();
+        std::fs::write(temp.repo.join("a.txt"), b"beta\ngamma\n").expect("rewrite a.txt");
+        assert_hg(
+            &hg(&temp.repo, &["commit", "-m", "third", "-u", "test"]),
+            "hg commit",
+        );
+        // Store rev 2 as a delta against rev 1 that replaces all of it, which
+        // `textdiff` would not produce, so only a reused delta matches.
+        let index_path = temp
+            .repo
+            .join(".hg")
+            .join("store")
+            .join("data")
+            .join("a.txt.i");
+        let original = std::fs::read(&index_path).expect("filelog index");
+        let rev0_clen = read_u32(&original[8..12]) as usize;
+        let rev1_off = 64 + rev0_clen;
+        let rev1_clen = read_u32(&original[rev1_off + 8..rev1_off + 12]) as usize;
+        let rev2_off = rev1_off + 64 + rev1_clen;
+        let node = &original[rev2_off + 32..rev2_off + 52];
+        let text = b"beta\ngamma\n";
+        let chunk = uncompressed_replace(5, text);
+        let entry = pack_index_entry(
+            (rev0_clen + rev1_clen) as u64,
+            chunk.len() as u32,
+            text.len() as u32,
+            1,
+            2,
+            1,
+            u32::MAX,
+            node,
+        );
+        let mut rebuilt = original[..rev2_off].to_vec();
+        rebuilt.extend_from_slice(&entry);
+        rebuilt.extend_from_slice(&chunk);
+        std::fs::write(&index_path, rebuilt).expect("rewrite filelog");
+
+        let repo = open_repo(&temp.repo);
+        let parts = collect_version(&repo, &[], CgVersion::V1);
+        let chunks = filelog_chunks(&parts);
+        assert_eq!(chunks.len(), 3, "filelog chunks");
+        assert_eq!(chunks[0].base, NULL_HASH);
+        assert_eq!(chunks[2].base, chunks[1].node);
+        assert_eq!(
+            chunks[2].delta.fragments(),
+            &[Fragment {
+                start: 0,
+                end: 5,
+                content: text.to_vec(),
+            }]
+        );
+        // Every chunk is against the one before it in its group.
+        let mut prev: Option<(Section, NodeHash)> = None;
+        for part in &parts {
+            if let Part::CgChunk(section, chunk) = part {
+                if let Some((prev_section, prev_node)) = &prev {
+                    if prev_section == section {
+                        assert_eq!(chunk.base, *prev_node, "{section:?}");
+                    }
+                }
+                prev = Some((section.clone(), chunk.node));
+            }
+        }
     }
 
     #[test]

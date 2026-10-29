@@ -62,13 +62,12 @@ impl<H: HgCommands> HgService<H> {
             Request::Clonebundles => map_cmd(hgcmds.clonebundles(), Response::Clonebundles),
             Request::Capabilities => map_cmd(hgcmds.capabilities(), Response::Capabilities),
             Request::Changegroup { roots } => {
-                map_cmd(hgcmds.changegroup(roots), |_| Response::Changegroup)
+                map_cmd(hgcmds.changegroup(roots), Response::Changegroup)
             }
-            Request::Changegroupsubset { bases, heads } => {
-                map_cmd(hgcmds.changegroupsubset(bases, heads), |_| {
-                    Response::Changegroupsubset
-                })
-            }
+            Request::Changegroupsubset { bases, heads } => map_cmd(
+                hgcmds.changegroupsubset(bases, heads),
+                Response::Changegroupsubset,
+            ),
             Request::Debugwireargs { one, two, all_args } => map_cmd(
                 self.debugwireargs(one, two, all_args),
                 Response::Debugwireargs,
@@ -126,6 +125,9 @@ impl<H: HgCommands> HgService<H> {
                 // Mercurial does not batch getbundle, and its stream has no batch encoding.
                 Ok(Some(Request::Getbundle(_))) => {
                     return box_ready(Err(Error::BatchInvalid("getbundle".into())));
+                }
+                Ok(Some(Request::Changegroup { .. } | Request::Changegroupsubset { .. })) => {
+                    return box_ready(Err(Error::BatchInvalid("changegroup".into())));
                 }
                 Ok(Some(cmd)) => cmd,
             };
@@ -245,13 +247,16 @@ pub trait HgCommands {
     }
 
     // @wireprotocommand('changegroup', 'roots')
-    fn changegroup(&self, _roots: Vec<NodeHash>) -> HgCommandRes<()> {
-        // TODO: streaming something
+    fn changegroup(&self, _roots: Vec<NodeHash>) -> HgCommandRes<BundleStream> {
         unimplemented("changegroup")
     }
 
     // @wireprotocommand('changegroupsubset', 'bases heads')
-    fn changegroupsubset(&self, _bases: Vec<NodeHash>, _heads: Vec<NodeHash>) -> HgCommandRes<()> {
+    fn changegroupsubset(
+        &self,
+        _bases: Vec<NodeHash>,
+        _heads: Vec<NodeHash>,
+    ) -> HgCommandRes<BundleStream> {
         unimplemented("changegroupsubset")
     }
 

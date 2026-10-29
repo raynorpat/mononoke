@@ -73,8 +73,10 @@ pub fn encode_cmd(response: &Response) -> Bytes {
 
         Response::Debugwireargs(res) | Response::Unbundle(res) => res.clone(),
 
-        // Callers write the stream themselves, and batch rejects getbundle.
-        Response::Getbundle(_) => unreachable!("getbundle is streamed, not encoded"),
+        // Callers write the stream themselves, and batch rejects these commands.
+        Response::Getbundle(_) | Response::Changegroup(_) | Response::Changegroupsubset(_) => {
+            unreachable!("changegroups are streamed, not encoded")
+        }
 
         Response::Heads(set) => {
             let mut out = Vec::new();

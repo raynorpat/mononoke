@@ -337,10 +337,10 @@ git commit -m "push: accept directory manifests and treemanifest pushes"
   - `pub enum Selection { Common { common: Vec<NodeHash>, heads: Vec<NodeHash> }, Roots { roots: Vec<NodeHash>, heads: Vec<NodeHash> } }`; `history_part(repo, selection: Selection, version: CgVersion)` replaces Task 5's `(repo, common, heads, version)` (update its callers). `Common` uses `missing_revs`, `Roots` uses `missing_from_roots`.
   - `history_part` with `V1` produces, per group, each revision as a delta against the previous revision sent in that group (p1 of the first, as `storageutil.emitrevisions` with `CG_DELTAMODE_PREV`): the stored delta when its stored base is exactly that previous revision (`revlog.revdiff`), otherwise `textdiff(prev_text, text)`; an empty text for a null base.
   - `changegroup` returns the raw `01` stream (no bundle header) for `roots` against `heads()`; `changegroupsubset` for `bases`/`heads`. A treemanifest repository answers both with an error.
-  - `getbundle` without `HG20` in `bundlecaps` returns `HG10UN` followed by the `01` changegroup (bundle1), as `exchange.getbundlechunks` does.
+  - `getbundle` without `HG20` in `bundlecaps` returns the raw `01` changegroup, as `exchange.getbundlechunks` / `changegroup.makestream` do. It has no `HG10UN` header (verified against Mercurial 7.0.3 during Task 7).
   - `wireprotocaps` adds `changegroupsubset`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `serve.rs` a helper `HgServe::start(repo) -> HgServe { port }` (runs `hg -R <repo> serve -p <port> --config web.push_ssl=false --config "web.allow-push=*"`, waits for the port, kills on drop) and `fn raw_command(port, query: &str) -> Vec<u8>` (HTTP/1.1 `GET /?<query>` with `Connection: close`, handles `Content-Length` and chunked bodies, zlib-inflates an `application/mercurial-0.1` body when the command is a stream response).
 
@@ -352,19 +352,19 @@ Add to `serve.rs` a helper `HgServe::start(repo) -> HgServe { port }` (runs `hg 
 
 `ssh_legacy_pull_works` (serve.rs): `hg pull --config devel.legacy.exchange=bundle1` over ssh into an empty repo succeeds and verifies.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p mononoke --lib bundle:: && cargo test -p mononoke --test serve legacy -- --test-threads=1`
 Expected: failures.
 
-- [ ] **Step 3: Implement** as in Interfaces. Read `wireprotov1server.py` (`changegroup`, `changegroupsubset`, `getbundle`), `discovery.py` `outgoing`, `utils/storageutil.py` `emitrevisions`, `revlog.py` `revdiff`, `exchange.py` `getbundlechunks` first.
+- [x] **Step 3: Implement** as in Interfaces. Read `wireprotov1server.py` (`changegroup`, `changegroupsubset`, `getbundle`), `discovery.py` `outgoing`, `utils/storageutil.py` `emitrevisions`, `revlog.py` `revdiff`, `exchange.py` `getbundlechunks` first.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test --workspace && cargo test -p mononoke --test serve -- --test-threads=1`
 Expected: pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add hgproto server

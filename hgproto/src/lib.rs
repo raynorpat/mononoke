@@ -27,7 +27,7 @@ pub mod sshproto;
 pub use crate::errors::{Error, ErrorKind, Result, ResultExt};
 pub use crate::service::{HgCommandRes, HgCommands, HgService};
 
-/// `getbundle` bundle bytes, produced while they are sent.
+/// `getbundle`, `changegroup` or `changegroupsubset` bytes, produced while they are sent.
 pub struct BundleStream {
     pub body: futures::stream::BoxStream<'static, Result<Bytes>>,
     /// Stream clone data barely compresses, so HTTP sends it uncompressed
@@ -146,8 +146,8 @@ pub enum Response {
     Branches(Vec<BranchRes>),
     Clonebundles(String),
     Capabilities(Vec<String>),
-    Changegroup,
-    Changegroupsubset,
+    Changegroup(BundleStream),
+    Changegroupsubset(BundleStream),
     Debugwireargs(Bytes),
     Getbundle(BundleStream),
     Heads(HashSet<NodeHash>),
@@ -165,7 +165,10 @@ impl Response {
     /// Whether this represents a streaming response. Streaming responses don't have any framing.
     pub fn is_stream(&self) -> bool {
         match self {
-            Response::Getbundle(_) | Response::Unbundle(_) => true,
+            Response::Getbundle(_)
+            | Response::Changegroup(_)
+            | Response::Changegroupsubset(_)
+            | Response::Unbundle(_) => true,
             _ => false,
         }
     }

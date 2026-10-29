@@ -270,8 +270,12 @@ where
         };
 
         match service.command(req).await {
-            // Getbundle has no ssh framing, so each piece goes out as it is produced.
-            Ok(hgproto::Response::Getbundle(bundle)) => {
+            // Changegroups have no ssh framing, so each piece goes out as it is produced.
+            Ok(
+                hgproto::Response::Getbundle(bundle)
+                | hgproto::Response::Changegroup(bundle)
+                | hgproto::Response::Changegroupsubset(bundle),
+            ) => {
                 let mut body = bundle.body;
                 while let Some(bytes) = body.next().await {
                     let bytes = match bytes {

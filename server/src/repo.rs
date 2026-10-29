@@ -32,7 +32,7 @@ use mercurial_types::{percent_decode, percent_encode, Changeset, NodeHash, Paren
 use slog::{info, o, warn, Logger};
 use tokio_util::io::ReaderStream;
 
-use crate::bundle::history_part;
+use crate::bundle::{history_part, legacy_changegroup, Selection};
 use crate::errors::Result;
 use crate::stream::{list_store, stream_part, stream_requirements, StoreFile};
 
@@ -65,6 +65,7 @@ fn wireprotocaps() -> Vec<String> {
         "lookup".to_string(),
         "known".to_string(),
         "getbundle".to_string(),
+        "changegroupsubset".to_string(),
         "unbundle".to_string(),
         "pushkey".to_string(),
         "branchmap".to_string(),
@@ -94,24 +95,30 @@ fn bundle2caps(stream: bool) -> String {
     percent_encode(&encodedcaps.join("\n"))
 }
 
-/// The changegroup versions in the client's `bundle2=` bundlecap, unknown ones left out.
+/// Client changegroup versions, defaulting to 01 when no versions are listed.
 fn client_cg_versions(bundlecaps: &[Vec<u8>]) -> Vec<CgVersion> {
     let Some(caps) = bundlecaps
         .iter()
         .find_map(|cap| cap.strip_prefix(b"bundle2="))
     else {
-        return Vec::new();
+        return vec![CgVersion::V1];
     };
     let caps = percent_decode(&String::from_utf8_lossy(caps));
-    caps.lines()
-        .filter_map(|line| line.strip_prefix("changegroup="))
-        .flat_map(|values| values.split(','))
+    let Some(versions) = caps
+        .lines()
+        .find_map(|line| line.strip_prefix("changegroup="))
+        .filter(|versions| !versions.is_empty())
+    else {
+        return vec![CgVersion::V1];
+    };
+    versions
+        .split(',')
         .filter_map(|value| CgVersion::from_param(value.as_bytes()))
         .collect()
 }
 
 /// The changegroup version `getbundle` sends: 03 when the client takes it,
-/// else 02. A treemanifest repository can only be sent as 03.
+/// else 02 or 01. A treemanifest repository can only be sent as 03.
 fn send_cg_version(
     repo: &mercurial::RevlogRepo,
     args: &GetbundleArgs,
@@ -123,8 +130,14 @@ fn send_cg_version(
         Err(hgproto::Error::from(
             "no common changegroup version".to_string(),
         ))
-    } else {
+    } else if client.contains(&CgVersion::V2) {
         Ok(CgVersion::V2)
+    } else if client.contains(&CgVersion::V1) {
+        Ok(CgVersion::V1)
+    } else {
+        Err(hgproto::Error::from(
+            "no common changegroup version".to_string(),
+        ))
     }
 }
 
@@ -278,6 +291,16 @@ async fn bookmark_pairs(repo: &Repo) -> hgproto::Result<Vec<(Vec<u8>, Vec<u8>)>>
 const BUNDLE_PIPE: usize = 1 << 20;
 
 async fn create_bundle(repo: &Arc<Repo>, args: GetbundleArgs) -> hgproto::Result<BundleStream> {
+    if !args.bundlecaps.iter().any(|cap| cap == b"HG20") {
+        return legacy_changegroup(
+            repo.hgrepo().clone(),
+            Selection::Common {
+                common: args.common,
+                heads: args.heads,
+            },
+        )
+        .map_err(|err| hgproto::Error::from(err.to_string()));
+    }
     let (reader, writer) = tokio::io::duplex(BUNDLE_PIPE);
     let mut bundle = Bundle2EncodeBuilder::new(writer);
     // TODO: select an appropriate compressor. zstd appears to hang -- need to figure out
@@ -289,8 +312,10 @@ async fn create_bundle(repo: &Arc<Repo>, args: GetbundleArgs) -> hgproto::Result
     } else if args.cg {
         let history = history_part(
             repo.hgrepo().clone(),
-            args.common.clone(),
-            args.heads.clone(),
+            Selection::Common {
+                common: args.common.clone(),
+                heads: args.heads.clone(),
+            },
             send_cg_version(repo.hgrepo(), &args)?,
         )
         .map_err(|err| hgproto::Error::from(err.to_string()))?;
@@ -549,10 +574,34 @@ impl HgCommands for RepoClient {
     }
 
     // @wireprotocommand('changegroup', 'roots')
-    fn changegroup(&self, roots: Vec<NodeHash>) -> HgCommandRes<()> {
-        // TODO: streaming something
+    fn changegroup(&self, roots: Vec<NodeHash>) -> HgCommandRes<BundleStream> {
         info!(self.logger, "changegroup roots {:?}", roots);
-        future::ok(()).boxed()
+        let repo = Arc::clone(&self.repo);
+        async move {
+            let heads = repo.hgrepo().get_heads().try_collect().await?;
+            legacy_changegroup(repo.hgrepo().clone(), Selection::Roots { roots, heads })
+                .map_err(|err| hgproto::Error::from(err.to_string()))
+        }
+        .boxed()
+    }
+
+    fn changegroupsubset(
+        &self,
+        bases: Vec<NodeHash>,
+        heads: Vec<NodeHash>,
+    ) -> HgCommandRes<BundleStream> {
+        let repo = Arc::clone(&self.repo);
+        async move {
+            legacy_changegroup(
+                repo.hgrepo().clone(),
+                Selection::Roots {
+                    roots: bases,
+                    heads,
+                },
+            )
+            .map_err(|err| hgproto::Error::from(err.to_string()))
+        }
+        .boxed()
     }
 
     // @wireprotocommand('heads')
@@ -694,6 +743,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn send_cg_version_negotiates_legacy_and_modern_versions() {
+        let root = std::env::temp_dir().join(format!("cgversions-{}", std::process::id()));
+        fs::create_dir_all(root.join("store")).unwrap();
+        fs::write(root.join("requires"), b"store\nrevlogv1\n").unwrap();
+        let repo = mercurial::RevlogRepo::open(&root).unwrap();
+        for (versions, expected) in [
+            ("", Some(CgVersion::V1)),
+            ("01", Some(CgVersion::V1)),
+            ("01,02", Some(CgVersion::V2)),
+            ("01,02,03", Some(CgVersion::V3)),
+            ("04", None),
+        ] {
+            let args = GetbundleArgs {
+                heads: Vec::new(),
+                common: Vec::new(),
+                listkeys: Vec::new(),
+                stream: false,
+                cg: true,
+                bundlecaps: vec![
+                    b"HG20".to_vec(),
+                    format!("bundle2=HG20%0Achangegroup%3D{versions}").into_bytes(),
+                ],
+            };
+            assert_eq!(send_cg_version(&repo, &args).ok(), expected, "{versions}");
+        }
+        drop(repo);
+        fs::write(root.join("requires"), b"store\nrevlogv1\ntreemanifest\n").unwrap();
+        let tree = mercurial::RevlogRepo::open(&root).unwrap();
+        assert!(legacy_changegroup(
+            tree,
+            Selection::Common {
+                common: Vec::new(),
+                heads: Vec::new(),
+            }
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn client_cg_versions_reads_the_bundle2_cap() {
         let caps = vec![
             b"HG20".to_vec(),
@@ -703,6 +792,6 @@ mod tests {
             client_cg_versions(&caps),
             vec![CgVersion::V1, CgVersion::V2, CgVersion::V3]
         );
-        assert!(client_cg_versions(&[b"HG20".to_vec()]).is_empty());
+        assert_eq!(client_cg_versions(&[b"HG20".to_vec()]), vec![CgVersion::V1]);
     }
 }

@@ -1986,3 +1986,254 @@ fn flat_client_push_into_tree_repo_matches_hg() {
     }
     assert_eq!(outputs[0], outputs[1]);
 }
+
+/// Flat repo with a merge and a rename across `a.txt`, `b.txt` and `c.txt`.
+///
+/// 0 adds a and b, 1 edits a, 2 (from 0) edits b, 3 merges, 4 renames a to c and edits b.
+fn init_merge_rename_repo(root: &Path) -> PathBuf {
+    init_merge_rename_repo_with_files(root, 0)
+}
+
+fn init_merge_rename_repo_with_files(root: &Path, unchanged_files: usize) -> PathBuf {
+    let repo = root.join("repo");
+    let mut init = Command::new("hg");
+    init.current_dir(root)
+        .args(["init", "repo"])
+        .args(["--config", "format.use-persistent-nodemap=false"])
+        .env("HGPLAIN", "1")
+        .env("HGRCPATH", "");
+    assert_hg(
+        &output_timeout(&mut init, Duration::from_secs(120)),
+        "hg init",
+    );
+    let lines = |tag: &str| -> String { (0..40).map(|i| format!("{tag} line {i}\n")).collect() };
+    let commit = |msg: &str| {
+        assert_hg(
+            &hg(&repo, &["commit", "-Aqm", msg, "-u", "test", "-d", "0 0"]),
+            msg,
+        )
+    };
+    fs::write(repo.join("a.txt"), lines("a")).expect("write a");
+    fs::write(repo.join("b.txt"), lines("b")).expect("write b");
+    for i in 0..unchanged_files {
+        fs::write(repo.join(format!("unchanged-{i}.txt")), b"unchanged\n").expect("unchanged file");
+    }
+    commit("zero");
+    fs::write(repo.join("a.txt"), lines("a") + "a more\n").expect("edit a");
+    commit("one");
+    assert_hg(&hg(&repo, &["update", "-q", "0"]), "update 0");
+    fs::write(repo.join("b.txt"), lines("b") + "b more\n").expect("edit b");
+    commit("two");
+    assert_hg(&hg(&repo, &["merge", "-q", "1"]), "merge");
+    commit("three");
+    assert_hg(&hg(&repo, &["mv", "a.txt", "c.txt"]), "mv");
+    fs::write(repo.join("b.txt"), "b changed\n".to_string() + &lines("b")).expect("edit b");
+    commit("four");
+    repo
+}
+
+fn node_of(repo: &Path, rev: &str) -> String {
+    let out = hg(repo, &["log", "-r", rev, "-T", "{node}"]);
+    assert_hg(&out, "hg log");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// `GET /?<query>` with `Connection: close`. Returns the body, zlib-inflated
+/// when it is a stream response (`application/mercurial-0.1`).
+fn raw_command(port: u16, query: &str) -> Vec<u8> {
+    use std::io::{Read, Write};
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    sock.set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("read timeout");
+    write!(
+        sock,
+        "GET /?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/mercurial-0.1\r\nConnection: close\r\n\r\n"
+    )
+    .expect("send request");
+    let mut raw = Vec::new();
+    sock.read_to_end(&mut raw).expect("read response");
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("end of headers");
+    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+    let mut rest = &raw[split + 4..];
+    assert!(
+        head.starts_with("http/1.1 200") || head.starts_with("http/1.0 200"),
+        "{query}: {head}"
+    );
+    let header = |name: &str| {
+        head.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:")))
+            .map(|value| value.trim().to_string())
+    };
+    let body = if header("transfer-encoding").as_deref() == Some("chunked") {
+        let mut body = Vec::new();
+        loop {
+            let end = rest
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .expect("chunk size");
+            let size_text = String::from_utf8_lossy(&rest[..end]).into_owned();
+            let size = usize::from_str_radix(size_text.split(';').next().unwrap().trim(), 16)
+                .expect("chunk size hex");
+            rest = &rest[end + 2..];
+            if size == 0 {
+                break body;
+            }
+            body.extend_from_slice(&rest[..size]);
+            rest = &rest[size + 2..];
+        }
+    } else if let Some(len) = header("content-length") {
+        rest[..len.parse::<usize>().expect("content-length")].to_vec()
+    } else {
+        rest.to_vec()
+    };
+    let cmd = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("cmd="))
+        .unwrap_or("");
+    let stream = matches!(cmd, "changegroup" | "changegroupsubset" | "getbundle");
+    if stream && header("content-type").as_deref() == Some("application/mercurial-0.1") {
+        let mut out = Vec::new();
+        flate2::read::ZlibDecoder::new(&body[..])
+            .read_to_end(&mut out)
+            .expect("inflate");
+        out
+    } else {
+        body
+    }
+}
+
+/// Each query's bytes from Mononoke and from stock `hg serve` on the same repo.
+fn assert_same_as_hg_serve(repo: &Path, temp: &TempDir, queries: &[String]) {
+    let log = temp.0.join("mononoke.log");
+    let mono = Running::start(repo, &log);
+    let stock = HgServe::start(repo);
+    for query in queries {
+        let want = raw_command(stock.port, query);
+        let got = raw_command(mono.port, query);
+        assert!(want.len() >= 12, "{query}: hg sent {} bytes", want.len());
+        let first_difference = got
+            .iter()
+            .zip(&want)
+            .position(|(a, b)| a != b)
+            .unwrap_or(got.len().min(want.len()));
+        assert!(
+            got == want,
+            "{query}: {} bytes from mononoke, {} from hg, first difference at {first_difference}\nlog:\n{}",
+            got.len(),
+            want.len(),
+            read_log(&log)
+        );
+    }
+}
+
+#[test]
+fn changegroup_matches_hg_serve() {
+    let temp = TempDir::new("cg1");
+    let repo = init_merge_rename_repo(&temp.0);
+    let queries = [
+        format!("cmd=changegroup&roots={}", "0".repeat(40)),
+        format!("cmd=changegroup&roots={}", node_of(&repo, "2")),
+        format!(
+            "cmd=changegroupsubset&bases={}&heads={}",
+            node_of(&repo, "1"),
+            node_of(&repo, "4")
+        ),
+    ];
+    assert_same_as_hg_serve(&repo, &temp, &queries);
+}
+
+#[test]
+fn bundle1_getbundle_matches_hg_serve() {
+    let temp = TempDir::new("gb1");
+    let repo = init_merge_rename_repo(&temp.0);
+    let queries = [format!(
+        "cmd=getbundle&heads={}&common={}",
+        node_of(&repo, "tip"),
+        node_of(&repo, "1")
+    )];
+    assert_same_as_hg_serve(&repo, &temp, &queries);
+}
+
+#[test]
+fn changegroup_empty_and_null_selections_match_hg_serve() {
+    let temp = TempDir::new("cg1empty");
+    let repo = init_merge_rename_repo(&temp.0);
+    let null = "0".repeat(40);
+    let queries = [
+        format!("cmd=changegroupsubset&bases={null}&heads="),
+        format!("cmd=changegroupsubset&bases={null}&heads={null}"),
+        format!("cmd=getbundle&heads={null}"),
+    ];
+    assert_same_as_hg_serve(&repo, &temp, &queries);
+}
+
+#[test]
+fn restricted_legacy_pull_sends_nodes_reused_from_a_sibling() {
+    let temp = TempDir::new("cg1reuse");
+    let repo = init_merge_rename_repo_with_files(&temp.0, 40);
+    assert_hg(&hg(&repo, &["update", "-q", "0"]), "update base");
+    let lines: String = (0..40).map(|i| format!("a line {i}\n")).collect();
+    fs::write(repo.join("a.txt"), lines + "a more\n").expect("same edit as rev1");
+    assert_hg(
+        &hg(
+            &repo,
+            &["commit", "-qm", "sibling", "-u", "test", "-d", "0 0"],
+        ),
+        "commit sibling",
+    );
+    let tip = node_of(&repo, "tip");
+    fs::write(repo.join("b.txt"), b"child b\n").expect("edit b");
+    assert_hg(
+        &hg(
+            &repo,
+            &["commit", "-qm", "child b", "-u", "test", "-d", "0 0"],
+        ),
+        "commit child b",
+    );
+    fs::write(repo.join("a.txt"), b"child a\n").expect("edit a");
+    assert_hg(
+        &hg(
+            &repo,
+            &["commit", "-qm", "child a", "-u", "test", "-d", "0 0"],
+        ),
+        "commit child a",
+    );
+    let descendant = node_of(&repo, "tip");
+    let queries = [
+        format!("cmd=changegroupsubset&bases={}&heads={tip}", "0".repeat(40)),
+        format!("cmd=getbundle&heads={tip}"),
+        format!("cmd=getbundle&heads={descendant}&common={tip}"),
+    ];
+    assert_same_as_hg_serve(&repo, &temp, &queries);
+}
+
+#[test]
+fn ssh_legacy_pull_works() {
+    let temp = TempDir::new("lp");
+    let repo = init_merge_rename_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    assert_hg(&hg(&temp.0, &["init", "dest"]), "hg init dest");
+    let dest = temp.0.join("dest");
+    // `-r` keeps the client from a legacy `stream_out` clone into the empty repo.
+    let pull = hg_ssh(
+        &dest,
+        &[
+            "pull",
+            "-r",
+            "tip",
+            "ssh://user@dummy/repo",
+            "--config",
+            "devel.legacy.exchange=bundle1",
+        ],
+        &shim,
+    );
+    assert_ok_with_log(&pull, "legacy pull", &log);
+    assert_hg(&hg(&dest, &["verify"]), "verify");
+    assert_eq!(node_of(&dest, "tip"), node_of(&repo, "tip"));
+    drop(server);
+}
