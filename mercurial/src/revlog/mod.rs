@@ -23,6 +23,7 @@ pub use mercurial_types::delta;
 mod parser;
 mod revidx;
 mod lz4;
+mod nodemap;
 
 #[cfg(test)]
 mod test;
@@ -92,6 +93,8 @@ struct RevlogInner {
     text_cache: Option<(RevIdx, Vec<u8>)>, // last reconstructed text
     idx_path: Option<PathBuf>,
     data_path: Option<PathBuf>,
+    nodemap: Option<nodemap::PersistentNodeMap>,
+    want_nodemap: bool, // `reload` re-reads the nodemap
 }
 
 impl PartialEq<Self> for Revlog {
@@ -168,6 +171,8 @@ impl Revlog {
             text_cache: None,
             idx_path: None,
             data_path: None,
+            nodemap: None,
+            want_nodemap: false,
         };
 
         Ok(Revlog { inner: Arc::new(Mutex::new(inner)) })
@@ -351,14 +356,25 @@ impl Revlog {
             .expect("a just-opened revlog has no other clones")
             .into_inner()
             .expect("lock poisoned");
+        let want_nodemap = inner.want_nodemap;
         *inner = fresh;
+        if want_nodemap {
+            inner.attach_nodemap()?;
+        }
         Ok(())
+    }
+
+    /// Use Mercurial's persistent nodemap for node lookups, if this revlog has
+    /// a valid one. Returns whether it is in use. A later `reload` looks again.
+    pub fn use_persistent_nodemap(&self) -> Result<bool> {
+        self.inner.lock().expect("lock poisoned").attach_nodemap()
     }
 
     /// Parse every index entry so later node lookups, hits and misses, need no scan.
     pub fn load_node_map(&self) -> Result<()> {
         let mut inner = self.inner.lock().expect("lock poisoned");
-        for idx in 0..inner.revision_count()? {
+        let first = inner.nodemap.as_ref().map_or(0, |nm| nm.tip_rev + 1);
+        for idx in first..inner.revision_count()? {
             inner.get_entry(RevIdx::from(idx))?;
         }
         Ok(())
@@ -472,6 +488,22 @@ impl RevlogInner {
                 if self.nodeidx.len() == self.revision_count()? as usize {
                     return Err(ErrorKind::Revlog(format!("nodeid {} not found", nodeid)).into());
                 }
+                if let Some(nm) = &self.nodemap {
+                    let (tip_rev, candidate) = (nm.tip_rev, nm.candidate(nodeid));
+                    let count = self.revision_count()?;
+                    if let Some(rev) = candidate.filter(|&rev| rev < count) {
+                        if self.get_entry(RevIdx::from(rev))?.nodeid == *nodeid {
+                            return Ok(RevIdx::from(rev));
+                        }
+                    }
+                    // Revisions added after the nodemap was written are not in it.
+                    for rev in tip_rev + 1..count {
+                        if self.get_entry(RevIdx::from(rev))?.nodeid == *nodeid {
+                            return Ok(RevIdx::from(rev));
+                        }
+                    }
+                    return Err(ErrorKind::Revlog(format!("nodeid {} not found", nodeid)).into());
+                }
                 // search the hard way
                 let mut posidx = None;
                 let res = self.into_iter().position(|(i, entry)| {
@@ -492,6 +524,36 @@ impl RevlogInner {
                 }
             }
         }
+    }
+
+    fn attach_nodemap(&mut self) -> Result<bool> {
+        self.want_nodemap = true;
+        self.nodemap = None;
+        let Some(idx_path) = self.idx_path.clone() else {
+            return Ok(false);
+        };
+        if self.header.features.contains(parser::INLINE) {
+            return Ok(false);
+        }
+        let Some((docket, trie)) = nodemap::load(&idx_path)? else {
+            return Ok(false);
+        };
+        let valid = docket.tip_rev < self.revision_count()? as u64
+            && trie.as_slice().len() as u64 >= docket.data_length
+            && NodeHash::from_bytes(&docket.tip_node)
+                .ok()
+                .map_or(false, |tip| {
+                    self.get_entry(RevIdx::from(docket.tip_rev as u32))
+                        .map_or(false, |entry| entry.nodeid == tip)
+                });
+        if valid {
+            self.nodemap = Some(nodemap::PersistentNodeMap {
+                trie,
+                data_length: docket.data_length as usize,
+                tip_rev: docket.tip_rev as u32,
+            });
+        }
+        Ok(valid)
     }
 
     fn get_entry_by_nodeid(&mut self, nodeid: &NodeHash) -> Result<Entry> {

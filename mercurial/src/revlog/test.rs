@@ -761,3 +761,153 @@ fn reconstruction_ignores_cache_when_base_is_not_cached_rev() {
     let skipped = revlog.get_rev(RevIdx::from(2u32)).expect("rev 2");
     assert_eq!(skipped.as_blob().as_slice(), Some(&b"hello?"[..]));
 }
+
+fn hg_in(repo: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("hg")
+        .current_dir(repo)
+        .args(["--config", "storage.revlog.persistent-nodemap.slow-path=allow"])
+        .args(args)
+        .env("HGPLAIN", "1")
+        .env("HGRCPATH", "")
+        .output()
+        .unwrap_or_else(|err| panic!("spawn hg {args:?}: {err}"));
+    assert!(
+        out.status.success(),
+        "hg {args:?} failed\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A repo whose changelog is non-inline and has a persistent nodemap.
+fn nodemap_repo(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("mononoke-nodemap-{}-{}", std::process::id(), name));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    hg_in(&dir, &["init", "--config", "format.use-persistent-nodemap=true", "."]);
+    hg_in(&dir, &["debugbuilddag", "+3000"]);
+    assert!(hg_in(&dir, &["debugnodemap", "--metadata"]).contains("tip-rev"));
+    dir
+}
+
+fn changelog_path(repo: &std::path::Path) -> std::path::PathBuf {
+    repo.join(".hg/store/00changelog.i")
+}
+
+fn repo_nodes(repo: &std::path::Path) -> Vec<NodeHash> {
+    hg_in(repo, &["log", "-T", "{node}\n"])
+        .lines()
+        .map(|hex| hex.parse().expect("node"))
+        .collect()
+}
+
+#[test]
+fn nodemap_resolves_every_node() {
+    let repo = nodemap_repo("every");
+    let revlog = Revlog::from_idx(changelog_path(&repo)).expect("open");
+    assert!(revlog.use_persistent_nodemap().expect("nodemap"));
+    let nodes = repo_nodes(&repo);
+    assert_eq!(nodes.len(), 3000);
+    // `hg log` lists newest first.
+    for (i, node) in nodes.iter().rev().enumerate() {
+        assert_eq!(revlog.index_of(node).expect("resolve"), i as u32);
+    }
+    drop(revlog);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn unknown_node_sharing_prefix_is_not_found() {
+    let repo = nodemap_repo("prefix");
+    let revlog = Revlog::from_idx(changelog_path(&repo)).expect("open");
+    assert!(revlog.use_persistent_nodemap().expect("nodemap"));
+    let mut bytes = revlog.get_entry(RevIdx::from(5u32)).expect("entry").nodeid.sha1().as_ref().to_vec();
+    bytes[19] ^= 0x01;
+    let unknown = NodeHash::from_bytes(&bytes).expect("node");
+    assert!(revlog.index_of(&unknown).is_err());
+    drop(revlog);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn nodemap_load_parses_only_the_tail() {
+    let repo = nodemap_repo("tail");
+    let revlog = Revlog::from_idx(changelog_path(&repo)).expect("open");
+    assert!(revlog.use_persistent_nodemap().expect("nodemap"));
+    revlog.load_node_map().expect("load");
+    let cached = revlog.inner.lock().expect("lock").nodeidx.len();
+    assert!(cached < 10, "{cached} entries parsed");
+    drop(revlog);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn revisions_after_docket_tip_resolve() {
+    let repo = nodemap_repo("append");
+    let mut revlog = Revlog::from_idx_data(changelog_path(&repo), None::<&std::path::Path>).expect("open");
+    assert!(revlog.use_persistent_nodemap().expect("nodemap"));
+    revlog.load_node_map().expect("load");
+    let tip = revlog.get_entry(RevIdx::from(2999u32)).expect("tip");
+    let manifest = hg_in(&repo, &["log", "--debug", "-r", "tip", "-T", "{manifest}"]);
+    let manifest = manifest.split(':').nth(1).expect("manifest node").to_string();
+    let mut parent = tip.nodeid;
+    let mut added = Vec::new();
+    for n in 0..2u32 {
+        let text = format!("{manifest}\nuser\n{} 0\n\nextra {n}", 1_700_000_000 + n).into_bytes();
+        let node = BlobNode::new(text.clone(), Some(&parent), None)
+            .nodeid()
+            .expect("node hash");
+        revlog
+            .append_snapshot(
+                RevlogAppend { node, p1: Some(parent), p2: None, linkrev: Some(3000 + n), text },
+                RevlogCompression::Zlib,
+            )
+            .expect("append");
+        added.push(node);
+        parent = node;
+    }
+    for (i, node) in added.iter().enumerate() {
+        assert_eq!(revlog.index_of(node).expect("resolve"), 3000 + i as u32);
+    }
+    // A fresh handle finds them by scanning past the docket's tip.
+    let reopened = Revlog::from_idx_data(changelog_path(&repo), None::<&std::path::Path>).expect("reopen");
+    assert!(reopened.use_persistent_nodemap().expect("nodemap"));
+    assert_eq!(reopened.index_of(&added[1]).expect("resolve"), 3001);
+    // The server never rewrites the nodemap, so let hg catch it up.
+    hg_in(&repo, &["debugupdatecaches"]);
+    hg_in(&repo, &["debugnodemap", "--check"]);
+    hg_in(&repo, &["verify"]);
+    drop((revlog, reopened));
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn stale_docket_after_strip_falls_back() {
+    let repo = nodemap_repo("stale");
+    let docket_path = repo.join(".hg/store/00changelog.n");
+    let mut docket = std::fs::read(&docket_path).expect("docket");
+    let parsed = nodemap::parse_docket(&docket).expect("parse");
+    let at = docket.len() - parsed.tip_node.len();
+    docket[at..].fill(0);
+    std::fs::write(&docket_path, &docket).expect("write docket");
+    let revlog = Revlog::from_idx(changelog_path(&repo)).expect("open");
+    assert!(!revlog.use_persistent_nodemap().expect("nodemap"));
+    for (i, node) in repo_nodes(&repo).iter().rev().enumerate().step_by(97) {
+        assert_eq!(revlog.index_of(node).expect("resolve"), i as u32);
+    }
+    drop(revlog);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn docket_parses_mercurial_bytes() {
+    let repo = nodemap_repo("docket");
+    let bytes = std::fs::read(repo.join(".hg/store/00changelog.n")).expect("docket");
+    let docket = nodemap::parse_docket(&bytes).expect("parse");
+    let uid = String::from_utf8(docket.uid).expect("uid");
+    assert!(repo.join(format!(".hg/store/00changelog-{uid}.nd")).exists());
+    assert_eq!(docket.tip_rev, 2999);
+    assert!(nodemap::parse_docket(&bytes[..5]).is_none());
+    let _ = std::fs::remove_dir_all(&repo);
+}
