@@ -457,6 +457,35 @@ fn parse_request<'a>(input: &'a [u8], parse_params: ParamParser) -> ParseRes<'a,
     }))? {
         return Ok(val);
     }
+    if let Some(val) = attempt(parse_named(
+        input,
+        b"clonebundles_manifest",
+        parse_params,
+        1,
+        |_| Ok(Request::ClonebundlesManifest),
+    ))? {
+        return Ok(val);
+    }
+    if let Some(val) = attempt(parse_named(input, b"protocaps", parse_params, 1, |kv| {
+        Ok(Request::Protocaps {
+            caps: parseval(&kv, "caps", value_string)?.into_bytes(),
+        })
+    }))? {
+        return Ok(val);
+    }
+    if let Some(val) = attempt(parse_named(
+        input,
+        b"get_cached_bundle_inline",
+        parse_params,
+        1,
+        |kv| {
+            Ok(Request::GetCachedBundleInline {
+                path: parseval(&kv, "path", value_string)?,
+            })
+        },
+    ))? {
+        return Ok(val);
+    }
     if let Some(val) = attempt(parse_named(input, b"capabilities", parse_params, 0, |_| {
         Ok(Request::Capabilities)
     }))? {
@@ -559,7 +588,7 @@ fn parse_request<'a>(input: &'a [u8], parse_params: ParamParser) -> ParseRes<'a,
     }))? {
         return Ok(val);
     }
-    if let Some(val) = attempt(parse_named(input, b"streamout", parse_params, 0, |_| {
+    if let Some(val) = attempt(parse_named(input, b"stream_out", parse_params, 0, |_| {
         Ok(Request::Streamout)
     }))? {
         return Ok(val);
@@ -1423,9 +1452,21 @@ mod test_parse {
 
     #[test]
     fn test_parse_streamout() {
-        let inp = "streamout\n";
+        let inp = "stream_out\n";
 
         test_parse(inp, Request::Streamout {});
+    }
+
+    #[test]
+    fn parses_new_commands() {
+        for (frame, expected) in [
+            ("stream_out\n", Request::Streamout),
+            ("protocaps\ncaps 5\nfoo b", Request::Protocaps { caps: b"foo b".to_vec() }),
+            ("clonebundles_manifest\n* 0\n", Request::ClonebundlesManifest),
+            ("get_cached_bundle_inline\npath 3\na.b", Request::GetCachedBundleInline { path: "a.b".into() }),
+        ] {
+            test_parse(frame, expected);
+        }
     }
 
     #[test]

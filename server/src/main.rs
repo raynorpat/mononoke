@@ -277,7 +277,9 @@ where
             Ok(
                 hgproto::Response::Getbundle(bundle)
                 | hgproto::Response::Changegroup(bundle)
-                | hgproto::Response::Changegroupsubset(bundle),
+                | hgproto::Response::Changegroupsubset(bundle)
+                | hgproto::Response::Streamout(bundle)
+                | hgproto::Response::GetCachedBundleInline(bundle),
             ) => {
                 let mut body = bundle.body;
                 while let Some(bytes) = body.next().await {
@@ -293,7 +295,16 @@ where
                     }
                 }
             }
-            Ok(response) => {
+            Ok(mut response) => {
+                match &mut response {
+                    hgproto::Response::Capabilities(caps) => caps.push("protocaps".into()),
+                    hgproto::Response::Hello(map) => {
+                        if let Some(caps) = map.get_mut("capabilities") {
+                            caps.push("protocaps".into());
+                        }
+                    }
+                    _ => {}
+                }
                 let mut out = BytesMut::new();
                 hgproto::sshproto::response::encode(&response, &mut out);
                 if stdout.send(out.freeze()).await.is_err() {

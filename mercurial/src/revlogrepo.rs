@@ -290,6 +290,47 @@ impl RevlogRepo {
         Ok(())
     }
 
+    /// Read a repository-local config value afresh, including continuation lines.
+    /// User/system config and `%include` directives are deliberately not read.
+    pub fn hgrc_value(&self, section: &str, key: &str) -> Result<Option<String>> {
+        let text = match fs::read_to_string(self.basepath.join("hgrc")) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let mut current_section = "";
+        let mut selected = false;
+        let mut value: Option<String> = None;
+        let mut continuation = false;
+        for line in text.trim_start_matches('\u{feff}').lines() {
+            if line.starts_with(['#', ';']) {
+                continue;
+            }
+            if continuation && line.starts_with(char::is_whitespace) && !line.trim().is_empty() {
+                if selected {
+                    let value = value.as_mut().expect("selected assignment");
+                    value.push('\n');
+                    value.push_str(line.trim());
+                }
+                continue;
+            }
+            selected = false;
+            continuation = false;
+            if let Some(header) = line.strip_prefix('[').and_then(|s| s.split_once(']')) {
+                current_section = header.0;
+            } else if !line.starts_with(char::is_whitespace) {
+                if let Some((name, text)) = line.split_once('=') {
+                    selected = current_section == section && name.trim_end() == key;
+                    continuation = true;
+                    if selected {
+                        value = Some(text.trim().to_owned());
+                    }
+                }
+            }
+        }
+        Ok(value)
+    }
+
     /// The `.hg/store` directory.
     pub fn store_path(&self) -> PathBuf {
         self.basepath.join("store")
@@ -585,6 +626,33 @@ mod test {
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    #[test]
+    fn hgrc_value_reads_sections() {
+        let dir = make_split("hgrc", &["store", "revlogv1"], None);
+        let repo = RevlogRepo::open(&dir).unwrap();
+        assert_eq!(
+            repo.hgrc_value("server", "peer-bundle-cache-root").unwrap(),
+            None
+        );
+        fs::write(dir.join("hgrc"), "# comment\n; comment\n[other]\nroot = wrong\n[server]\nroot = old\nroot = bundles # literal\n  second line  \n; skipped comment\n\tthird\n\nmissing = other\n").unwrap();
+        assert_eq!(
+            repo.hgrc_value("server", "root").unwrap().as_deref(),
+            Some("bundles # literal\nsecond line\nthird")
+        );
+        assert_eq!(
+            repo.hgrc_value("other", "root").unwrap().as_deref(),
+            Some("wrong")
+        );
+        assert_eq!(repo.hgrc_value("server", "absent").unwrap(), None);
+        fs::write(dir.join("hgrc"), "[server]\nroot = changed\n").unwrap();
+        assert_eq!(
+            repo.hgrc_value("server", "root").unwrap().as_deref(),
+            Some("changed")
+        );
+        drop(repo);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

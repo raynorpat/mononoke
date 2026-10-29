@@ -81,10 +81,17 @@ pub fn encode_cmd(response: &Response) -> Bytes {
             res.clone()
         }
 
+        Response::Capabilities(caps) => Bytes::from(caps.join(" ")),
+        Response::Clonebundles(manifest) => Bytes::copy_from_slice(manifest.as_bytes()),
+        Response::Protocaps => Bytes::from_static(b"OK"),
         Response::Pushres { .. } => unreachable!("push results use two SSH frames"),
 
         // Callers write the stream themselves, and batch rejects these commands.
-        Response::Getbundle(_) | Response::Changegroup(_) | Response::Changegroupsubset(_) => {
+        Response::Getbundle(_)
+        | Response::Changegroup(_)
+        | Response::Changegroupsubset(_)
+        | Response::Streamout(_)
+        | Response::GetCachedBundleInline(_) => {
             unreachable!("changegroups are streamed, not encoded")
         }
 
@@ -166,13 +173,20 @@ pub fn encode_cmd(response: &Response) -> Bytes {
             Bytes::from(out)
         }
 
-        other => panic!("Response for {:?} unimplemented", other),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_have_a_length_frame_and_space_delimited_body() {
+        let response = Response::Capabilities(vec!["stream".into(), "protocaps".into()]);
+        let mut out = BytesMut::new();
+        encode(&response, &mut out);
+        assert_eq!(&out[..], b"16\nstream protocaps");
+    }
 
     #[test]
     fn pushres_has_empty_frame_then_decimal_result() {

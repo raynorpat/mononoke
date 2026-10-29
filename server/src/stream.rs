@@ -22,7 +22,7 @@ use mercurial::revlogrepo::Required;
 use mercurial::RevlogRepo;
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{Chunk, Error as BundleError};
-use mercurial_types::path::decodedir;
+use mercurial_types::path::{decodedir, encodedir};
 use mercurial_types::{percent_encode, Path};
 
 use crate::bundle::read_in_order;
@@ -120,7 +120,7 @@ pub fn list_store(repo: &RevlogRepo) -> Result<Vec<StoreFile>> {
             .and_then(|rest| rest.strip_suffix(b"/00manifest"));
         let path = Path::new(dir.unwrap_or(&revlog[b"data/".len()..]))
             .map_err(|err| Error::from(err.to_string()))?;
-        for ext in [&b"i"[..], b"d"] {
+        for ext in [&b"d"[..], b"i"] {
             let rel = if dir.is_some() {
                 path.store_dirlog(dotencode, ext)
             } else {
@@ -182,6 +182,7 @@ pub fn list_store(repo: &RevlogRepo) -> Result<Vec<StoreFile>> {
             }
         }
     }
+    files.retain(|file| file.size != 0);
     Ok(files)
 }
 
@@ -235,7 +236,7 @@ pub fn stream_part(files: Arc<Vec<StoreFile>>, requirements: &str) -> Result<Par
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(PIECE_QUEUE);
     tokio::task::spawn_blocking(move || {
-        let sent = send_files(&files, &mut |bytes| {
+        let sent = send_files(&files, false, &mut |bytes| {
             tx.blocking_send(Ok(bytes))
                 .map_err(|_| Error::from("getbundle writer went away"))
         });
@@ -248,13 +249,77 @@ pub fn stream_part(files: Arc<Vec<StoreFile>>, requirements: &str) -> Result<Par
     Ok(builder)
 }
 
+/// Stream v1 has raw file headers and no bundle2 framing.
+pub fn stream_v1(files: Arc<Vec<StoreFile>>) -> hgproto::BundleStream {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(PIECE_QUEUE);
+    tokio::task::spawn_blocking(move || {
+        let mut send = |bytes| {
+            tx.blocking_send(Ok(bytes))
+                .map_err(|_| Error::from("stream_out writer went away"))
+        };
+        let result = (|| {
+            let bytecount: u64 = files.iter().map(|file| file.size).sum();
+            send(Bytes::from(format!("0\n{} {bytecount}\n", files.len())))?;
+            send_files(&files, true, &mut send)
+        })();
+        if let Err(err) = result {
+            let _ = tx.blocking_send(Err(hgproto::Error::from(err.to_string())));
+        }
+    });
+    hgproto::BundleStream {
+        body: futures::stream::poll_fn(move |cx| rx.poll_recv(cx)).boxed(),
+        prefer_uncompressed: true,
+    }
+}
+
+/// Inline clone bundles are already compressed. Bound the reads and frame by length.
+pub fn inline_bundle(mut file: File) -> Result<hgproto::BundleStream> {
+    let size = file.metadata()?.len();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(PIECE_QUEUE);
+    tokio::task::spawn_blocking(move || {
+        let result = (|| -> Result<()> {
+            let mut header = BytesMut::new();
+            put_uvarint(&mut header, size);
+            let send = |bytes| {
+                tx.blocking_send(Ok(bytes))
+                    .map_err(|_| Error::from("inline bundle writer went away"))
+            };
+            send(header.freeze())?;
+            let mut left = size;
+            while left != 0 {
+                let mut bytes = Vec::with_capacity(PIECE);
+                let read = (&mut file)
+                    .take(left.min(PIECE as u64))
+                    .read_to_end(&mut bytes)?;
+                if read == 0 {
+                    return Err("inline clone bundle became shorter while reading".into());
+                }
+                left -= read as u64;
+                send(Bytes::from(bytes))?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            let _ = tx.blocking_send(Err(hgproto::Error::from(err.to_string())));
+        }
+    });
+    Ok(hgproto::BundleStream {
+        body: futures::stream::poll_fn(move |cx| rx.poll_recv(cx)).boxed(),
+        prefer_uncompressed: true,
+    })
+}
+
 fn bundle_err(err: BundleError) -> Error {
     Error::from(err.to_string())
 }
 
 /// Send each file as Mercurial's stream v2 entry: `s` (the store), the name
 /// length and data length as uvarints, the name, then the data.
-fn send_files(files: &[StoreFile], send: &mut dyn FnMut(Bytes) -> Result<()>) -> Result<()> {
+fn send_files(
+    files: &[StoreFile],
+    legacy: bool,
+    send: &mut dyn FnMut(Bytes) -> Result<()>,
+) -> Result<()> {
     let mut listed = files.iter();
     read_in_order(
         files,
@@ -269,7 +334,13 @@ fn send_files(files: &[StoreFile], send: &mut dyn FnMut(Bytes) -> Result<()>) ->
         },
         &mut |data: Option<Vec<u8>>| {
             let file = listed.next().expect("one result per file");
-            let mut entry = entry_header(file);
+            let mut entry = if legacy {
+                let mut entry = BytesMut::from(encodedir(&file.name).as_slice());
+                entry.extend_from_slice(format!("\0{}\n", file.size).as_bytes());
+                entry
+            } else {
+                entry_header(file)
+            };
             match data {
                 Some(data) => {
                     entry.extend_from_slice(&data);
@@ -341,6 +412,23 @@ fn put_uvarint(out: &mut BytesMut, mut value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stream_v1_uses_snapshots_and_encoded_names() {
+        let files = Arc::new(vec![StoreFile {
+            name: b"data/dir.i/file.n".to_vec(),
+            // A cached nodemap must survive deletion of its old on-disk file.
+            path: PathBuf::from("missing-old-nodemap"),
+            size: 8,
+            data: Some(Bytes::from_static(b"snapshot")),
+        }]);
+        let mut body = stream_v1(files).body;
+        let mut bytes = Vec::new();
+        while let Some(piece) = body.next().await {
+            bytes.extend_from_slice(&piece.unwrap());
+        }
+        assert_eq!(bytes, b"0\n1 8\ndata/dir.i.hg/file.n\x008\nsnapshot");
+    }
 
     fn uvarint(value: u64) -> Vec<u8> {
         let mut out = BytesMut::new();

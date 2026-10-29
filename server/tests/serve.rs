@@ -1878,6 +1878,10 @@ struct HgServe {
 
 impl HgServe {
     fn start(repo: &Path) -> Self {
+        Self::start_with_config(repo, &[])
+    }
+
+    fn start_with_config(repo: &Path, config: &[&str]) -> Self {
         let _guard = lock_ports();
         let port = free_port();
         let mut child = Command::new("hg")
@@ -1885,6 +1889,7 @@ impl HgServe {
             .args(["serve", "-a", "127.0.0.1", "-p", &port.to_string()])
             .args(["--config", "web.push_ssl=false"])
             .args(["--config", "web.allow-push=*"])
+            .args(config.iter().flat_map(|value| ["--config", *value]))
             .env("HGPLAIN", "1")
             .env("HGRCPATH", "")
             .stdout(Stdio::null())
@@ -2229,11 +2234,28 @@ fn lookup_matches_hg_serve() {
         &hg(&repo, &["tag", "--local", "fresh", "-r", "2"]),
         "local while serving",
     );
+    let parent = node_of(&repo, ".");
+    assert_eq!(parent, node_of(&repo, "0"));
+    assert_eq!(
+        raw_command(mono.port, "cmd=lookup&key=."),
+        format!("1 {parent}\n").as_bytes(),
+        "live working-copy parent"
+    );
+    assert_eq!(
+        raw_command(mono.port, "cmd=lookup&key=fresh"),
+        format!("1 {}\n", node_of(&repo, "2")).as_bytes(),
+        "live local tag"
+    );
+    // cachedlocalrepo does not watch dirstate/localtags. Refresh only the
+    // reference server before comparing current working-copy metadata.
+    drop(stock);
+    let stock = HgServe::start(&repo);
     for key in [".", "fresh"] {
         let query = format!("cmd=lookup&key={key}");
         assert_eq!(
             raw_command(mono.port, &query),
-            raw_command(stock.port, &query)
+            raw_command(stock.port, &query),
+            "live lookup {key}"
         );
     }
     assert_hg(
@@ -2757,4 +2779,195 @@ fn ssh_legacy_pull_works() {
     assert_hg(&hg(&dest, &["verify"]), "verify");
     assert_eq!(node_of(&dest, "tip"), node_of(&repo, "tip"));
     drop(server);
+}
+
+#[test]
+fn stream_out_matches_hg_serve() {
+    let temp = TempDir::new("stream-v1");
+    let repo = init_merge_rename_repo(&temp.0);
+    let dir = repo.join("odd.i").join("nested.d").join("deep.hg");
+    fs::create_dir_all(&dir).unwrap();
+    // Incompressible data splits the filelog into .d and .i files.
+    let mut value = 42u32;
+    let large: Vec<u8> = (0..2_100_000)
+        .map(|_| {
+            value ^= value << 13;
+            value ^= value >> 17;
+            value ^= value << 5;
+            value as u8
+        })
+        .collect();
+    fs::write(dir.join("large"), large).unwrap();
+    assert_hg(
+        &hg(&repo, &["commit", "-Aqm", "large", "-u", "test"]),
+        "large commit",
+    );
+    fs::write(repo.join(".hg/store/00manifest.d"), b"").unwrap();
+    let log = temp.0.join("mono.log");
+    let mono = Running::start(&repo, &log);
+    let stock = HgServe::start(&repo);
+    let want = raw_command(stock.port, "cmd=stream_out");
+    assert!(want.starts_with(b"0\n"));
+    let got = raw_command(mono.port, "cmd=stream_out");
+    assert!(
+        got == want,
+        "stream bytes differ: got {}, expected {}; first difference {:?}",
+        got.len(),
+        want.len(),
+        got.iter().zip(&want).position(|(a, b)| a != b)
+    );
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let clone = hg_ssh(
+        &temp.0,
+        &[
+            "clone",
+            "--stream",
+            "--config",
+            "devel.legacy.exchange=bundle1",
+            "ssh://dummy/repo",
+            "dest",
+        ],
+        &shim,
+    );
+    assert_ok_with_log(&clone, "legacy stream clone", &log);
+    assert_hg(
+        &hg(&temp.0.join("dest"), &["verify"]),
+        "verify legacy stream",
+    );
+    assert_eq!(node_of(&temp.0.join("dest"), "tip"), node_of(&repo, "tip"));
+    assert_eq!(
+        fs::read(temp.0.join("dest/odd.i/nested.d/deep.hg/large")).unwrap(),
+        fs::read(dir.join("large")).unwrap()
+    );
+}
+
+#[test]
+fn clonebundles_match_hg_serve() {
+    let temp = TempDir::new("clone-manifest");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mono.log");
+    let mono = Running::start(&repo, &log);
+    let stock = HgServe::start_with_config(&repo, &["extensions.clonebundles="]);
+    let manifest = repo.join(".hg/clonebundles.manifest");
+    for contents in [
+        None,
+        Some(&b""[..]),
+        Some(
+            &b"https://example/a BUNDLESPEC=zstd-v2\r\npeer-bundle-cache://b.hg BUNDLESPEC=zstd-v2"
+                [..],
+        ),
+        Some(&b"https://example/a BUNDLESPEC=zstd-v2\rpeer-bundle-cache://b.hg BUNDLESPEC=zstd-v2\r"[..]),
+    ] {
+        if let Some(contents) = contents {
+            fs::write(&manifest, contents).unwrap();
+        }
+        for cmd in ["clonebundles", "clonebundles_manifest"] {
+            let query = format!("cmd={cmd}");
+            assert_eq!(
+                raw_command(mono.port, &query),
+                raw_command(stock.port, &query),
+                "{cmd} {contents:?}"
+            );
+        }
+        let caps = String::from_utf8(raw_command(mono.port, "cmd=capabilities")).unwrap();
+        assert_eq!(
+            caps.split(' ').any(|c| c == "clonebundles"),
+            contents.is_some()
+        );
+        assert_eq!(
+            caps.split(' ').any(|c| c == "clonebundles_manifest"),
+            contents.is_some()
+        );
+        assert!(!caps.split(' ').any(|c| c == "protocaps"));
+    }
+    assert_eq!(raw_command(mono.port, "cmd=protocaps&caps=foo%20b"), b"OK");
+}
+
+#[test]
+fn inline_clone_bundle_clones() {
+    let temp = TempDir::new("inline-clonebundle");
+    let repo = init_zstd_repo(&temp.0);
+    fs::create_dir_all(repo.join(".hg/bundle-cache")).unwrap();
+    assert_hg(
+        &hg(
+            &repo,
+            &[
+                "bundle",
+                "--all",
+                "-t",
+                "zstd-v2",
+                ".hg/bundle-cache/full.hg",
+            ],
+        ),
+        "bundle",
+    );
+    fs::write(
+        repo.join(".hg/clonebundles.manifest"),
+        "peer-bundle-cache://full.hg BUNDLESPEC=zstd-v2\n",
+    )
+    .unwrap();
+    let log = temp.0.join("mono.log");
+    let mono = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let url = format!("http://127.0.0.1:{}/", mono.port);
+    for (name, source) in [
+        ("default", "ssh://dummy/repo"),
+        ("http", url.as_str()),
+        ("override", "ssh://dummy/repo"),
+    ] {
+        if name == "override" {
+            fs::create_dir_all(repo.join(".hg/bundles")).unwrap();
+            fs::copy(
+                repo.join(".hg/bundle-cache/full.hg"),
+                repo.join(".hg/bundles/full.hg"),
+            )
+            .unwrap();
+            fs::write(
+                repo.join(".hg/hgrc"),
+                "[server]\npeer-bundle-cache-root = bundles\n[extensions]\nclonebundles =\n",
+            )
+            .unwrap();
+            fs::remove_file(repo.join(".hg/bundle-cache/full.hg")).unwrap();
+        }
+        let clone = hg_ssh(&temp.0, &["clone", source, name], &shim);
+        assert_ok_with_log(&clone, "inline clone", &log);
+        let output = String::from_utf8_lossy(&clone.stdout);
+        assert!(output.contains("applying clone bundle"), "{output}");
+        assert_hg(&hg(&temp.0.join(name), &["verify"]), "verify inline clone");
+    }
+    fs::write(
+        repo.join(".hg/clonebundles.manifest"),
+        "peer-bundle-cache://../requires BUNDLESPEC=zstd-v2\n",
+    )
+    .unwrap();
+    let clone = hg_ssh(
+        &temp.0,
+        &[
+            "clone",
+            "--config",
+            "ui.clonebundlefallback=false",
+            "ssh://dummy/repo",
+            "illegal",
+        ],
+        &shim,
+    );
+    assert!(!clone.status.success());
+    let stock_dir = temp.0.join("stock-shim");
+    fs::create_dir(&stock_dir).unwrap();
+    let stock_shim = write_ssh_shim(&stock_dir, &PathBuf::from("hg"), &repo);
+    let stock = hg_ssh(&temp.0, &["clone", "--config", "ui.clonebundlefallback=false", "ssh://dummy/repo", "illegal-stock"], &stock_shim);
+    assert!(!stock.status.success());
+    // Stock's unframed client reports EOF here; the precise server diagnostic
+    // is visible in its error channel/log and in an HTTP error response.
+    assert_eq!(clone.stderr, stock.stderr);
+    let illegal = raw_command(mono.port, "cmd=get_cached_bundle_inline&path=../requires");
+    assert!(String::from_utf8_lossy(&illegal).contains("clonebundle ../requires is using an illegal path"));
+    assert!(
+        read_log(&log).contains("clonebundle ../requires is using an illegal path"),
+        "{}\n{}",
+        String::from_utf8_lossy(&clone.stderr),
+        read_log(&log)
+    );
+    let missing = raw_command(mono.port, "cmd=get_cached_bundle_inline&path=absent.hg");
+    assert!(String::from_utf8_lossy(&missing).contains("clonebundle absent.hg does not exist"));
 }

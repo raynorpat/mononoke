@@ -69,6 +69,13 @@ pub enum Request {
         nodes: Vec<NodeHash>,
     },
     Clonebundles,
+    ClonebundlesManifest,
+    Protocaps {
+        caps: Vec<u8>,
+    },
+    GetCachedBundleInline {
+        path: String,
+    },
     Capabilities,
     Changegroup {
         roots: Vec<NodeHash>,
@@ -168,7 +175,9 @@ pub enum Response {
         output: Bytes,
     },
     Pusherr(Bytes),
-    Streamout,
+    Protocaps,
+    GetCachedBundleInline(BundleStream),
+    Streamout(BundleStream),
     Unbundle(Bytes),
 }
 
@@ -179,6 +188,8 @@ impl Response {
             Response::Getbundle(_)
             | Response::Changegroup(_)
             | Response::Changegroupsubset(_)
+            | Response::GetCachedBundleInline(_)
+            | Response::Streamout(_)
             | Response::Unbundle(_) => true,
             _ => false,
         }

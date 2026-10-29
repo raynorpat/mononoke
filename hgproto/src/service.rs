@@ -60,6 +60,14 @@ impl<H: HgCommands> HgService<H> {
             Request::Branchmap => map_cmd(hgcmds.branchmap(), Response::Branchmap),
             Request::Branches { nodes } => map_cmd(hgcmds.branches(nodes), Response::Branches),
             Request::Clonebundles => map_cmd(hgcmds.clonebundles(), Response::Clonebundles),
+            Request::ClonebundlesManifest => {
+                map_cmd(hgcmds.clonebundles_manifest(), Response::Clonebundles)
+            }
+            Request::Protocaps { caps: _ } => box_ready(Ok(Response::Protocaps)),
+            Request::GetCachedBundleInline { path } => map_cmd(
+                hgcmds.get_cached_bundle_inline(path),
+                Response::GetCachedBundleInline,
+            ),
             Request::Capabilities => map_cmd(hgcmds.capabilities(), Response::Capabilities),
             Request::Changegroup { roots } => {
                 map_cmd(hgcmds.changegroup(roots), Response::Changegroup)
@@ -90,7 +98,7 @@ impl<H: HgCommands> HgService<H> {
                 old,
                 new,
             } => map_cmd(hgcmds.pushkey(namespace, key, old, new), Response::Pushkey),
-            Request::Streamout => map_cmd(hgcmds.stream_out(), |_| Response::Streamout),
+            Request::Streamout => map_cmd(hgcmds.stream_out(), Response::Streamout),
             Request::Unbundle { heads, bundle } => hgcmds.unbundle(heads, bundle),
         }
     }
@@ -126,6 +134,9 @@ impl<H: HgCommands> HgService<H> {
                 }
                 Ok(Some(Request::Changegroup { .. } | Request::Changegroupsubset { .. })) => {
                     return box_ready(Err(Error::BatchInvalid("changegroup".into())));
+                }
+                Ok(Some(Request::Streamout | Request::GetCachedBundleInline { .. })) => {
+                    return box_ready(Err(Error::BatchInvalid("streaming command".into())));
                 }
                 Ok(Some(cmd)) => cmd,
             };
@@ -239,6 +250,14 @@ pub trait HgCommands {
         unimplemented("clonebundles")
     }
 
+    fn clonebundles_manifest(&self) -> HgCommandRes<String> {
+        unimplemented("clonebundles_manifest")
+    }
+
+    fn get_cached_bundle_inline(&self, _path: String) -> HgCommandRes<BundleStream> {
+        unimplemented("get_cached_bundle_inline")
+    }
+
     // @wireprotocommand('capabilities')
     fn capabilities(&self) -> HgCommandRes<Vec<String>> {
         unimplemented("capabilities")
@@ -300,11 +319,7 @@ pub trait HgCommands {
     }
 
     // @wireprotocommand('stream_out')
-    fn stream_out(
-        &self,
-    ) -> HgCommandRes<futures::stream::BoxStream<'static, std::result::Result<Vec<u8>, Error>>>
-    {
-        // XXX raw streaming?
+    fn stream_out(&self) -> HgCommandRes<BundleStream> {
         unimplemented("stream_out")
     }
 
@@ -379,6 +394,20 @@ mod test {
             Err(Error::BatchInvalid(cmd)) => assert_eq!(cmd, "getbundle"),
             bad => panic!("Bad result {:?}", bad),
         }
+    }
+
+    #[test]
+    fn batch_rejects_raw_streams() {
+        let service = HgService::new(Dummy);
+        for (cmd, args) in [(b"stream_out".as_slice(), b"".as_slice()), (b"get_cached_bundle_inline", b"path=a.b")] {
+            assert!(matches!(block_on(service.call(Request::Batch { cmds: vec![(cmd.to_vec(), args.to_vec())] })), Err(Error::BatchInvalid(_))));
+        }
+    }
+
+    #[test]
+    fn protocaps_answers_ok() {
+        let response = block_on(HgService::new(Dummy).call(Request::Protocaps { caps: b"foo b".to_vec() })).unwrap();
+        assert_eq!(sshproto::response::encode_cmd(&response), b"OK".as_slice());
     }
 
     #[test]

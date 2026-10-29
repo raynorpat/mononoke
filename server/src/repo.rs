@@ -149,10 +149,43 @@ fn advertised_caps(repo: &mercurial::RevlogRepo) -> Vec<String> {
     if let Some(reqs) = &streamreqs {
         // Clients stream-clone by default; `hg clone --pull` still gets a changegroup.
         caps.push("stream-preferred".to_string());
-        caps.push(format!("streamreqs={reqs}"));
+        caps.push(if reqs == "revlogv1" || reqs.is_empty() {
+            "stream".to_string()
+        } else {
+            format!("streamreqs={reqs}")
+        });
+    }
+    if repo
+        .store_path()
+        .parent()
+        .expect(".hg directory")
+        .join("clonebundles.manifest")
+        .exists()
+    {
+        caps.extend(["clonebundles".into(), "clonebundles_manifest".into()]);
     }
     caps.push(format!("bundle2={}", bundle2caps(streamreqs.is_some())));
     caps
+}
+
+/// Mercurial normalizes manifest line endings and filters inline URLs for old clients.
+fn clone_manifest(repo: &mercurial::RevlogRepo, legacy: bool) -> Result<String> {
+    let path = repo
+        .store_path()
+        .parent()
+        .expect(".hg directory")
+        .join("clonebundles.manifest");
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    Ok(text
+        .lines()
+        .filter(|line| !legacy || !line.starts_with("peer-bundle-cache://"))
+        .map(|line| format!("{line}\n"))
+        .collect())
 }
 
 impl Repo {
@@ -605,6 +638,60 @@ impl HgCommands for RepoClient {
         .boxed()
     }
 
+    fn clonebundles(&self) -> HgCommandRes<String> {
+        let repo = Arc::clone(&self.repo);
+        async move {
+            clone_manifest(repo.hgrepo(), true).map_err(|err| hgproto::Error::from(err.to_string()))
+        }
+        .boxed()
+    }
+
+    fn clonebundles_manifest(&self) -> HgCommandRes<String> {
+        let repo = Arc::clone(&self.repo);
+        async move {
+            clone_manifest(repo.hgrepo(), false)
+                .map_err(|err| hgproto::Error::from(err.to_string()))
+        }
+        .boxed()
+    }
+
+    fn get_cached_bundle_inline(&self, path: String) -> HgCommandRes<BundleStream> {
+        let repo = Arc::clone(&self.repo);
+        async move {
+            tokio::task::spawn_blocking(move || -> Result<BundleStream> {
+                let hg = repo.hgrepo();
+                let root = hg
+                    .hgrc_value("server", "peer-bundle-cache-root")?
+                    .unwrap_or_else(|| "bundle-cache".into());
+                let root = hg.store_path().parent().expect(".hg directory").join(root);
+                let file = root.join(&path);
+                if !file.exists() {
+                    return Err(format!("clonebundle {path} does not exist").into());
+                }
+                if !file.canonicalize()?.starts_with(root.canonicalize()?) {
+                    return Err(format!("clonebundle {path} is using an illegal path").into());
+                }
+                crate::stream::inline_bundle(fs::File::open(file)?)
+            })
+            .await
+            .map_err(|err| hgproto::Error::from(err.to_string()))?
+            .map_err(|err| hgproto::Error::from(err.to_string()))
+        }
+        .boxed()
+    }
+
+    fn stream_out(&self) -> HgCommandRes<BundleStream> {
+        let repo = Arc::clone(&self.repo);
+        async move {
+            let files = tokio::task::spawn_blocking(move || repo.stream_listing())
+                .await
+                .map_err(|err| hgproto::Error::from(err.to_string()))?
+                .map_err(|err| hgproto::Error::from(err.to_string()))?;
+            Ok(crate::stream::stream_v1(files))
+        }
+        .boxed()
+    }
+
     // @wireprotocommand('heads')
     fn heads(&self) -> HgCommandRes<HashSet<NodeHash>> {
         let repo = Arc::clone(&self.repo);
@@ -755,6 +842,23 @@ impl HgCommands for RepoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_capability_uses_stream_for_revlogv1_only() {
+        let root = std::env::temp_dir().join(format!("stream-caps-{}", std::process::id()));
+        fs::create_dir_all(root.join("store")).unwrap();
+        for (requirements, expected) in [
+            ("store\nfncache\nrevlogv1\n", "stream"),
+            ("store\nfncache\nrevlogv1\ngeneraldelta\n", "streamreqs=generaldelta,revlogv1"),
+        ] {
+            fs::write(root.join("requires"), requirements).unwrap();
+            let repo = mercurial::RevlogRepo::open(&root).unwrap();
+            let caps = advertised_caps(&repo);
+            assert!(caps.iter().any(|cap| cap == expected), "{caps:?}");
+            assert_eq!(caps.iter().filter(|cap| *cap == "stream" || cap.starts_with("streamreqs=")).count(), 1);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn unbundle_capability_lists_bundle1_types() {

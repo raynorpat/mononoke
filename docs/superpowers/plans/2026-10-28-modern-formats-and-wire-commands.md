@@ -478,7 +478,7 @@ git commit -m "server: resolve tags, named branches and . and report real branch
   - `Request::GetCachedBundleInline { path }` → `Response::GetCachedBundleInline(BundleStream)` with `prefer_uncompressed: true`: uvarint length then the file, from `<.hg>/<peer-bundle-cache-root>/<path>`; Mercurial's errors when the setting or file is missing (`clonebundle %s does not exist`) or the canonical path leaves the root (`clonebundle %s is using an illegal path`).
   - `Request::Streamout` → `Response::Streamout(BundleStream)`: stream v1 (`streamclone.generatev1wireproto`): `0\n`, `"{filecount} {bytecount}\n"`, then per file `"{name}\0{size}\n"` and its bytes, from `list_store` under the store lock. HTTP sends it uncompressed (`streamreslegacy`). Caps: `stream` when the streamed requirements are only `revlogv1`, otherwise `streamreqs=…` (as `_capabilities`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `parses_new_commands` (hgproto request tests): `stream_out\n`, `protocaps\ncaps 5\nfoo b`, `clonebundles_manifest\n* 0\n`, `get_cached_bundle_inline\npath 3\na.b` parse to the new requests.
 
@@ -490,19 +490,19 @@ git commit -m "server: resolve tags, named branches and . and report real branch
 
 `hgrc_value_reads_sections` (revlogrepo tests): comments, continuation, missing key, missing file.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p hgproto && cargo test -p mononoke --test serve stream_out clonebundle -- --test-threads=1`
 Expected: failures.
 
-- [ ] **Step 3: Implement** as in Interfaces. Read `wireprotov1server.py` (`stream`, `clonebundles`, `clonebundles_2`, `get_cached_bundle_inline`, `protocaps`, `_capabilities`), `streamclone.py` (`generatev1`, `generatev1wireproto`), `bundlecaches.py` `get_manifest` first.
+- [x] **Step 3: Implement** as in Interfaces. Read `wireprotov1server.py` (`stream`, `clonebundles`, `clonebundles_2`, `get_cached_bundle_inline`, `protocaps`, `_capabilities`), `streamclone.py` (`generatev1`, `generatev1wireproto`), `bundlecaches.py` `get_manifest` first.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test --workspace && cargo test -p mononoke --test serve -- --test-threads=1`
 Expected: pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add hgproto mercurial server

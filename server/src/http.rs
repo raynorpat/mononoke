@@ -154,7 +154,8 @@ where
             Ok(
                 Response::Getbundle(bundle)
                 | Response::Changegroup(bundle)
-                | Response::Changegroupsubset(bundle),
+                | Response::Changegroupsubset(bundle)
+                | Response::GetCachedBundleInline(bundle),
             ) => {
                 let engine = bundle_engine(&incoming.protocaps, bundle.prefer_uncompressed);
                 // The 200 is already sent if the bundle fails, so the client sees a cut-off body.
@@ -171,6 +172,13 @@ where
                         return Ok(());
                     }
                 }
+                if close {
+                    return Ok(());
+                }
+                continue;
+            }
+            Ok(Response::Streamout(bundle)) => {
+                write_legacy_stream(&mut sock, bundle, close).await?;
                 if close {
                     return Ok(());
                 }
@@ -549,6 +557,22 @@ where
     Ok(sent)
 }
 
+/// `streamreslegacy` is raw even when HTTP compression has been negotiated.
+async fn write_legacy_stream<S: AsyncWrite + Unpin>(
+    sock: &mut S,
+    bundle: BundleStream,
+    close: bool,
+) -> Result<()> {
+    let connection = if close { "close" } else { "keep-alive" };
+    sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/mercurial-0.1\r\nTransfer-Encoding: chunked\r\nConnection: {connection}\r\n\r\n").as_bytes()).await?;
+    let mut body = bundle.body;
+    while let Some(bytes) = body.next().await {
+        write_chunk(sock, &mut bytes?.to_vec()).await?;
+    }
+    sock.write_all(b"0\r\n\r\n").await?;
+    Ok(())
+}
+
 /// Write `buf` as one HTTP chunk and clear it. An empty `buf` writes nothing,
 /// because an empty chunk ends the body.
 async fn write_chunk<S>(sock: &mut S, buf: &mut Vec<u8>) -> Result<u64>
@@ -578,7 +602,10 @@ fn frame_request(cmd: &str, query: &HashMap<String, Vec<u8>>, body: &[u8]) -> Re
     buf.extend_from_slice(cmd.as_bytes());
     buf.push(b'\n');
     match cmd {
-        "capabilities" | "hello" | "branchmap" | "heads" => {}
+        "capabilities" | "hello" | "branchmap" | "heads" | "stream_out" | "clonebundles" => {}
+        "clonebundles_manifest" => write_star(&mut buf, &args),
+        "protocaps" => write_kv(&mut buf, "caps", require(&args, "caps")?),
+        "get_cached_bundle_inline" => write_kv(&mut buf, "path", require(&args, "path")?),
         "getbundle" => write_star(&mut buf, &args),
         "branches" => write_kv(&mut buf, "nodes", arg_or_empty(&args, "nodes")),
         "changegroup" => write_kv(&mut buf, "roots", require(&args, "roots")?),
@@ -684,7 +711,11 @@ fn response_body(response: &Response) -> Result<Bytes> {
             caps.push(format!("compression={}", SERVER_ENGINES.join(",")));
             Ok(Bytes::from(caps.join(" ")))
         }
-        Response::Getbundle(_) | Response::Changegroup(_) | Response::Changegroupsubset(_) => {
+        Response::Getbundle(_)
+        | Response::Changegroup(_)
+        | Response::Changegroupsubset(_)
+        | Response::Streamout(_)
+        | Response::GetCachedBundleInline(_) => {
             Err("changegroups are streamed by the connection".into())
         }
         Response::Batch(_)
@@ -698,10 +729,9 @@ fn response_body(response: &Response) -> Result<Bytes> {
         | Response::Known(_)
         | Response::Pushkey(_)
         | Response::Listkeys(_)
+        | Response::Clonebundles(_)
+        | Response::Protocaps
         | Response::Unbundle(_) => Ok(hgproto::sshproto::response::encode_cmd(response)),
-        Response::Clonebundles(_) | Response::Streamout => {
-            Err("HTTP response is not implemented for this command".into())
-        }
     }
 }
 
