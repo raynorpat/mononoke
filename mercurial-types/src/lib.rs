@@ -31,4 +31,4 @@ pub use node::Node;
 pub use nodehash::{NULL_HASH, NodeHash};
 pub use path::Path;
 pub use repo::Repo;
-pub use utils::percent_encode;
+pub use utils::{percent_decode, percent_encode};

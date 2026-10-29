@@ -1659,3 +1659,121 @@ fn nodemap_repo_commit_while_serving_is_served() {
     );
     drop(server);
 }
+
+/// Treemanifest repo with files in nested directories over two commits.
+fn init_tree_repo(root: &Path) -> PathBuf {
+    let repo = root.join("repo");
+    let mut init = Command::new("hg");
+    init.current_dir(root)
+        .args(["init", "repo"])
+        .args(["--config", "experimental.treemanifest=1"])
+        .args(["--config", "format.use-persistent-nodemap=false"])
+        .env("HGPLAIN", "1")
+        .env("HGRCPATH", "");
+    assert_hg(
+        &output_timeout(&mut init, Duration::from_secs(120)),
+        "hg init",
+    );
+    fs::create_dir_all(repo.join("a").join("deep")).expect("mkdir a/deep");
+    fs::create_dir_all(repo.join("B")).expect("mkdir B");
+    for (rev, text) in [("first", "1\n"), ("second", "2\n")] {
+        fs::write(repo.join("a").join("x"), text).expect("write a/x");
+        fs::write(repo.join("a").join("deep").join("z"), text).expect("write a/deep/z");
+        fs::write(repo.join("B").join("y"), text).expect("write B/y");
+        fs::write(repo.join("top.txt"), text).expect("write top.txt");
+        assert_hg(
+            &hg(&repo, &["commit", "-Aqm", rev, "-u", "test"]),
+            "hg commit",
+        );
+    }
+    repo
+}
+
+fn requirements(repo: &Path) -> String {
+    let hg_dir = repo.join(".hg");
+    let mut all = fs::read_to_string(hg_dir.join("requires")).expect("requires");
+    all.push_str(&fs::read_to_string(hg_dir.join("store").join("requires")).unwrap_or_default());
+    all
+}
+
+#[test]
+fn tree_repo_clones_over_every_transport() {
+    let temp = TempDir::new("tm");
+    let repo = init_tree_repo(&temp.0);
+    let files = hg(&repo, &["files", "-r", "tip"]);
+    assert_hg(&files, "server files");
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let ssh_url = "ssh://user@dummy/repo";
+
+    let clones = [
+        ("ssh stream", hg_ssh(&temp.0, &["clone", ssh_url, "ssh-stream"], &shim)),
+        (
+            "ssh pull",
+            hg_ssh(&temp.0, &["clone", "--pull", ssh_url, "ssh-pull"], &shim),
+        ),
+        ("http stream", hg(&temp.0, &["clone", &url, "http-stream"])),
+        (
+            "http pull",
+            hg(&temp.0, &["clone", "--pull", &url, "http-pull"]),
+        ),
+    ];
+    for (label, clone) in clones {
+        let dest = temp.0.join(label.replace(' ', "-"));
+        assert!(
+            clone.status.success(),
+            "{label} clone failed:\n{}\n{}\nmononoke:\n{}",
+            String::from_utf8_lossy(&clone.stdout),
+            String::from_utf8_lossy(&clone.stderr),
+            read_log(&log)
+        );
+        let expect = if label.ends_with("stream") {
+            "streaming all changes"
+        } else {
+            "adding changesets"
+        };
+        let stdout = String::from_utf8_lossy(&clone.stdout);
+        assert!(stdout.contains(expect), "{label}: {stdout}");
+        let reqs = requirements(&dest);
+        assert!(
+            reqs.lines().any(|line| line == "treemanifest"),
+            "{label} requires:\n{reqs}"
+        );
+        assert_hg(&hg(&dest, &["verify"]), &format!("{label} verify"));
+        let got = hg(&dest, &["files", "-r", "tip"]);
+        assert_hg(&got, &format!("{label} files"));
+        assert_eq!(got.stdout, files.stdout, "{label} files");
+    }
+    drop(server);
+}
+
+#[test]
+fn flat_repo_still_offers_02() {
+    let temp = TempDir::new("f2");
+    let repo = init_share_safe_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let clone = hg(
+        &temp.0,
+        &[
+            "clone",
+            "--pull",
+            &url,
+            "dest",
+            "--config",
+            "experimental.changegroup3=false",
+        ],
+    );
+    assert!(
+        clone.status.success(),
+        "clone failed:\n{}\n{}\nmononoke:\n{}",
+        String::from_utf8_lossy(&clone.stdout),
+        String::from_utf8_lossy(&clone.stderr),
+        read_log(&log)
+    );
+    assert_hg(&hg(&temp.0.join("dest"), &["verify"]), "verify");
+    drop(server);
+}

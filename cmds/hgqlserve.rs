@@ -18,6 +18,7 @@ use juniper::{EmptyMutation, EmptySubscription, RootNode};
 use mercurial::Result;
 use mercurial::RevlogRepo;
 use mercurial_graphql::repo::{GQLRepo, RepoCtx};
+use mercurial_types::percent_decode;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 #[allow(unused)]
@@ -86,35 +87,6 @@ fn init_mounts(repomap: HashMap<String, RevlogRepo>) -> HashMap<String, Mount> {
             (name, mount)
         })
         .collect()
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut idx = 0;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'+' => {
-                out.push(b' ');
-                idx += 1;
-            }
-            b'%' if idx + 2 < bytes.len() => {
-                let hex = &input[idx + 1..idx + 3];
-                if let Ok(value) = u8::from_str_radix(hex, 16) {
-                    out.push(value);
-                    idx += 3;
-                } else {
-                    out.push(b'%');
-                    idx += 1;
-                }
-            }
-            byte => {
-                out.push(byte);
-                idx += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn graphql_from_query(query: &str) -> std::result::Result<GraphQLRequest, String> {

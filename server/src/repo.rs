@@ -25,9 +25,10 @@ use hgproto::{self, BundleStream, GetbundleArgs, HgCommandRes, HgCommands};
 use mercurial::changeset::RevlogChangeset;
 use mercurial::lock::RepoLock;
 use mercurial::revlog::RevIdx;
+use mercurial_bundles::changegroup::CgVersion;
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{parts, Bundle2EncodeBuilder};
-use mercurial_types::{percent_encode, Changeset, NodeHash, Parents, NULL_HASH};
+use mercurial_types::{percent_decode, percent_encode, Changeset, NodeHash, Parents, NULL_HASH};
 use slog::{info, o, warn, Logger};
 use tokio_util::io::ReaderStream;
 
@@ -75,7 +76,7 @@ fn bundle2caps(stream: bool) -> String {
     let mut caps = vec![
         ("HG20", Vec::<&str>::new()),
         ("listkeys", Vec::new()),
-        ("changegroup", vec!["02"]),
+        ("changegroup", vec!["01", "02", "03"]),
     ];
     if stream {
         caps.push(("stream", vec!["v2"]));
@@ -91,6 +92,40 @@ fn bundle2caps(stream: bool) -> String {
     }
 
     percent_encode(&encodedcaps.join("\n"))
+}
+
+/// The changegroup versions in the client's `bundle2=` bundlecap, unknown ones left out.
+fn client_cg_versions(bundlecaps: &[Vec<u8>]) -> Vec<CgVersion> {
+    let Some(caps) = bundlecaps
+        .iter()
+        .find_map(|cap| cap.strip_prefix(b"bundle2="))
+    else {
+        return Vec::new();
+    };
+    let caps = percent_decode(&String::from_utf8_lossy(caps));
+    caps.lines()
+        .filter_map(|line| line.strip_prefix("changegroup="))
+        .flat_map(|values| values.split(','))
+        .filter_map(|value| CgVersion::from_param(value.as_bytes()))
+        .collect()
+}
+
+/// The changegroup version `getbundle` sends: 03 when the client takes it,
+/// else 02. A treemanifest repository can only be sent as 03.
+fn send_cg_version(
+    repo: &mercurial::RevlogRepo,
+    args: &GetbundleArgs,
+) -> hgproto::Result<CgVersion> {
+    let client = client_cg_versions(&args.bundlecaps);
+    if client.contains(&CgVersion::V3) {
+        Ok(CgVersion::V3)
+    } else if repo.is_treemanifest() {
+        Err(hgproto::Error::from(
+            "no common changegroup version".to_string(),
+        ))
+    } else {
+        Ok(CgVersion::V2)
+    }
 }
 
 fn advertised_caps(repo: &mercurial::RevlogRepo) -> Vec<String> {
@@ -256,6 +291,7 @@ async fn create_bundle(repo: &Arc<Repo>, args: GetbundleArgs) -> hgproto::Result
             repo.hgrepo().clone(),
             args.common.clone(),
             args.heads.clone(),
+            send_cg_version(repo.hgrepo(), &args)?,
         )
         .map_err(|err| hgproto::Error::from(err.to_string()))?;
         bundle.add_part(history);
@@ -641,5 +677,23 @@ impl HgCommands for RepoClient {
                 .map_err(|err| hgproto::Error::from(err.to_string()))
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_cg_versions_reads_the_bundle2_cap() {
+        let caps = vec![
+            b"HG20".to_vec(),
+            b"bundle2=HG20%0Achangegroup%3D01%2C02%2C03%2C04%0Alistkeys".to_vec(),
+        ];
+        assert_eq!(
+            client_cg_versions(&caps),
+            vec![CgVersion::V1, CgVersion::V2, CgVersion::V3]
+        );
+        assert!(client_cg_versions(&[b"HG20".to_vec()]).is_empty());
     }
 }

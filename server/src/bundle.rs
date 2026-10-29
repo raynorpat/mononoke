@@ -14,9 +14,9 @@ use std::task::{Context, Poll};
 use futures::Future;
 use mercurial::revlog::{Chunk, RevIdx, Revlog};
 use mercurial::RevlogRepo;
-use mercurial_bundles::changegroup::{CgDeltaChunk, Part, Section};
+use mercurial_bundles::changegroup::{CgDeltaChunk, CgVersion, Part, Section};
 use mercurial_bundles::part_encode::PartEncodeBuilder;
-use mercurial_bundles::parts::changegroup_part;
+use mercurial_bundles::parts::changegroup_part_version;
 use mercurial_bundles::Error as BundleError;
 use mercurial_types::delta::{Delta, Fragment};
 use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, Path, NULL_HASH};
@@ -87,10 +87,12 @@ pub fn history_part(
     repo: RevlogRepo,
     common: Vec<NodeHash>,
     heads: Vec<NodeHash>,
+    version: CgVersion,
 ) -> Result<PartEncodeBuilder> {
+    let treemanifest = repo.is_treemanifest();
     let (tx, mut rx) = tokio::sync::mpsc::channel(PART_QUEUE);
     tokio::task::spawn_blocking(move || {
-        let sent = history_parts(&repo, &common, &heads, &mut |part| {
+        let sent = history_parts(&repo, &common, &heads, version, &mut |part| {
             tx.blocking_send(Ok(part))
                 .map_err(|_| Error::from("getbundle writer went away"))
         });
@@ -99,13 +101,20 @@ pub fn history_part(
         }
     });
     let parts = futures::stream::poll_fn(move |cx| rx.poll_recv(cx));
-    changegroup_part(parts).map_err(|err| Error::from(err.to_string()))
+    let mut part =
+        changegroup_part_version(parts, version).map_err(|err| Error::from(err.to_string()))?;
+    if treemanifest {
+        part.add_mparam("treemanifest", "1")
+            .map_err(|err| Error::from(err.to_string()))?;
+    }
+    Ok(part)
 }
 
 fn history_parts(
     repo: &RevlogRepo,
     common: &[NodeHash],
     heads: &[NodeHash],
+    version: CgVersion,
     emit: &mut dyn FnMut(Part) -> Result<()>,
 ) -> Result<()> {
     let (nodes, missing) = missing_revs(repo, common, heads)?;
@@ -141,10 +150,32 @@ fn history_parts(
     )?;
     emit(Part::SectionEnd(Section::Manifest))?;
 
+    if version == CgVersion::V3 && repo.is_treemanifest() {
+        read_in_order(
+            &repo.manifest_dirs()?,
+            |dir| {
+                revlog_parts(
+                    &repo.read_dir_revlog(dir)?,
+                    Section::Treemanifest(dir.clone()),
+                    &nodes,
+                    &missing,
+                )
+            },
+            &mut |parts: Vec<Part>| parts.into_iter().try_for_each(&mut *emit),
+        )?;
+    }
+
     let files: Vec<Path> = files.into_iter().collect();
     read_in_order(
         &files,
-        |path| file_parts(repo, path, &nodes, &missing),
+        |path| {
+            revlog_parts(
+                &repo.read_file_revlog(path)?,
+                Section::Filelog(path.clone()),
+                &nodes,
+                &missing,
+            )
+        },
         &mut |parts: Vec<Part>| parts.into_iter().try_for_each(&mut *emit),
     )?;
     emit(Part::End)
@@ -198,27 +229,20 @@ where
     Ok(())
 }
 
-/// The parts for one filelog's missing revisions, ending with its `SectionEnd`,
-/// or nothing when the client has every revision.
-fn file_parts(
-    repo: &RevlogRepo,
-    path: &Path,
+/// The parts for one filelog's or directory manifest's missing revisions,
+/// ending with its `SectionEnd`, or nothing when the client has every revision.
+fn revlog_parts(
+    revlog: &Revlog,
+    section: Section,
     nodes: &[NodeHash],
     missing: &[bool],
 ) -> Result<Vec<Part>> {
-    let revlog = repo.read_file_revlog(path)?;
     let mut parts = Vec::new();
-    if linked_revisions(
-        &revlog,
-        Section::Filelog(path.clone()),
-        nodes,
-        missing,
-        &mut |part| {
-            parts.push(part);
-            Ok(())
-        },
-    )? {
-        parts.push(Part::SectionEnd(Section::Filelog(path.clone())));
+    if linked_revisions(revlog, section.clone(), nodes, missing, &mut |part| {
+        parts.push(part);
+        Ok(())
+    })? {
+        parts.push(Part::SectionEnd(section));
     }
     Ok(parts)
 }
@@ -660,8 +684,12 @@ mod tests {
     }
 
     fn collect_parts(repo: &RevlogRepo, common: &[NodeHash]) -> Vec<Part> {
+        collect_version(repo, common, CgVersion::V2)
+    }
+
+    fn collect_version(repo: &RevlogRepo, common: &[NodeHash], version: CgVersion) -> Vec<Part> {
         let mut parts = Vec::new();
-        history_parts(repo, common, &[], &mut |part| {
+        history_parts(repo, common, &[], version, &mut |part| {
             parts.push(part);
             Ok(())
         })
@@ -772,5 +800,85 @@ mod tests {
             Part::CgChunk(_, chunk) => chunk.node != base,
             _ => true,
         }));
+    }
+
+    #[test]
+    fn tree_history_sends_directory_groups() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "mononoke-bundle-tree-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let temp = TempRepo {
+            repo: root.join("repo"),
+            root,
+        };
+        assert_hg(
+            &hg(
+                &temp.root,
+                &["init", "repo", "--config", "experimental.treemanifest=1"],
+            ),
+            "hg init",
+        );
+        for dir in ["a", "b"] {
+            std::fs::create_dir_all(temp.repo.join(dir)).expect("mkdir");
+        }
+        for (rev, text) in [("first", "1\n"), ("second", "2\n")] {
+            std::fs::write(temp.repo.join("a").join("x"), text).expect("write a/x");
+            std::fs::write(temp.repo.join("b").join("y"), text).expect("write b/y");
+            assert_hg(
+                &hg(&temp.repo, &["commit", "-Aqm", rev, "-u", "test"]),
+                "hg commit",
+            );
+        }
+
+        let repo = open_repo(&temp.repo);
+        assert!(repo.is_treemanifest());
+        let parts = collect_version(&repo, &[], CgVersion::V3);
+        for dir in ["a", "b"] {
+            let dir = Path::new(dir).expect("dir");
+            let sent: Vec<NodeHash> = parts
+                .iter()
+                .filter_map(|part| match part {
+                    Part::CgChunk(Section::Treemanifest(got), chunk) if *got == dir => {
+                        Some(chunk.node)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let revlog = repo.read_dir_revlog(&dir).expect("dirlog");
+            let stored: Vec<NodeHash> = (0..revlog.len().expect("len"))
+                .map(|idx| revlog.get_entry(RevIdx::from(idx)).expect("entry").nodeid)
+                .collect();
+            assert_eq!(stored.len(), 2, "{dir} revisions");
+            assert_eq!(sent, stored, "{dir} group");
+            assert!(parts.contains(&Part::SectionEnd(Section::Treemanifest(dir))));
+        }
+
+        let part = changegroup_part_version(
+            futures::stream::iter(parts.into_iter().map(Ok::<_, BundleError>)),
+            CgVersion::V3,
+        )
+        .expect("part");
+        let mut bundle =
+            mercurial_bundles::Bundle2EncodeBuilder::new(std::io::Cursor::new(Vec::new()));
+        bundle.add_part(part);
+        let bytes = futures::executor::block_on(bundle.build())
+            .expect("encode")
+            .into_inner();
+        let file = temp.root.join("tree.hg");
+        std::fs::write(&file, bytes).expect("write bundle");
+        let out = hg(&temp.root, &["debugbundle", "--all", "tree.hg"]);
+        assert_hg(&out, "hg debugbundle");
+        let listed = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = listed.lines().map(str::trim).collect();
+        for dir in ["a/", "b/"] {
+            assert!(lines.contains(&dir), "{dir} missing:\n{listed}");
+        }
     }
 }

@@ -72,15 +72,18 @@ impl Path {
         raw.extend_from_slice(&self.0);
         raw.push(b'.');
         raw.extend_from_slice(ext);
+        store_path(&raw, dotencode)
+    }
 
-        let de = encodedir(&raw);
-        let encoded = fncache_encode(&de, dotencode);
-        let chosen = if raw.len() > MAX_STORE_PATH_LEN || encoded.len() > MAX_STORE_PATH_LEN {
-            hashencode(&de, dotencode)
-        } else {
-            encoded
-        };
-        pathbuf_from_slashes(&chosen)
+    /// Store-relative directory manifest file of this directory (treemanifest),
+    /// `meta/<dir>/00manifest.<ext>` or hashed `dh/…`.
+    pub fn store_dirlog(&self, dotencode: bool, ext: &[u8]) -> PathBuf {
+        let mut raw = Vec::with_capacity(self.0.len() + 18 + ext.len());
+        raw.extend_from_slice(b"meta/");
+        raw.extend_from_slice(&self.0);
+        raw.extend_from_slice(b"/00manifest.");
+        raw.extend_from_slice(ext);
+        store_path(&raw, dotencode)
     }
 
     #[inline]
@@ -92,6 +95,18 @@ impl Path {
     pub fn as_slice(&self) -> &[u8] {
         &self.0[..]
     }
+}
+
+/// Mercurial's `_hybridencode` of a store-relative `data/…` or `meta/…` name.
+fn store_path(raw: &[u8], dotencode: bool) -> PathBuf {
+    let de = encodedir(raw);
+    let encoded = fncache_encode(&de, dotencode);
+    let chosen = if raw.len() > MAX_STORE_PATH_LEN || encoded.len() > MAX_STORE_PATH_LEN {
+        hashencode(&de, dotencode)
+    } else {
+        encoded
+    };
+    pathbuf_from_slashes(&chosen)
 }
 
 impl AsRef<[u8]> for Path {
@@ -508,6 +523,57 @@ mod test {
             path.store_filelog(true, b"i"),
             std::path::Path::new("data").join("_foo.txt.i")
         );
+    }
+
+    #[test]
+    fn store_dirlog_matches_mercurial() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "mononoke-dirlog-{}-{}",
+            std::process::id(),
+            nanos
+        ));
+        let long = "d".repeat(200);
+        let dirs = ["dir", "Upper/Case", long.as_str()];
+        for dir in dirs {
+            std::fs::create_dir_all(root.join(dir)).expect("mkdir");
+            std::fs::write(root.join(dir).join("f"), b"f\n").expect("write");
+        }
+        let hg = |args: &[&str]| {
+            let out = std::process::Command::new("hg")
+                .current_dir(&root)
+                .args(args)
+                .env("HGPLAIN", "1")
+                .env("HGRCPATH", "")
+                .output()
+                .expect("spawn hg");
+            assert!(out.status.success(), "hg {args:?}: {out:?}");
+        };
+        hg(&["init", "--config", "experimental.treemanifest=1"]);
+        hg(&["commit", "-Aqm", "dirs", "-u", "test"]);
+
+        // Names as listed, since a lookup would ignore case on Windows.
+        fn walk(store: &std::path::Path, dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    walk(store, &path, out);
+                } else {
+                    out.push(path.strip_prefix(store).unwrap().to_path_buf());
+                }
+            }
+        }
+        let store = root.join(".hg").join("store");
+        let mut files = Vec::new();
+        walk(&store, &store, &mut files);
+        for dir in dirs {
+            let path = Path::new(dir.as_bytes()).unwrap().store_dirlog(true, b"i");
+            assert!(files.contains(&path), "{dir}: {} not in {files:?}", path.display());
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

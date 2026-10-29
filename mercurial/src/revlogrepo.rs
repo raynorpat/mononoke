@@ -20,7 +20,7 @@ use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryFutureExt};
 
 use asyncmemo::Filler;
-use mercurial_types::path::encodedir;
+use mercurial_types::path::{decodedir, encodedir};
 use mercurial_types::{BlobNode, Changeset, Manifest, NodeHash, Path, Repo};
 use stockbookmarks::StockBookmarks;
 
@@ -166,9 +166,6 @@ impl RevlogRepo {
                 req.insert(line.chain_err(|| "Line read failed")?.parse()?);
             }
         }
-        if req.contains(&Required::Treemanifest) {
-            return Err("treemanifest is not served".into());
-        }
         if req.contains(&Required::PersistentNodemap) {
             changelog.use_persistent_nodemap()?;
             manifest.use_persistent_nodemap()?;
@@ -277,6 +274,46 @@ impl RevlogRepo {
         self.basepath
             .join("store")
             .join(path.store_filelog(dotencode, ext))
+    }
+
+    /// Whether manifests are stored per directory, under `meta/`.
+    pub fn is_treemanifest(&self) -> bool {
+        self.requirements.contains(&Required::Treemanifest)
+    }
+
+    fn dir_store_path(&self, dir: &Path, ext: &[u8]) -> PathBuf {
+        let dotencode = self.requirements.contains(&Required::Dotencode);
+        self.store_path().join(dir.store_dirlog(dotencode, ext))
+    }
+
+    /// Manifest revlog of directory `dir` (no trailing `/`) in a treemanifest repo.
+    pub fn read_dir_revlog(&self, dir: &Path) -> Result<Revlog> {
+        Revlog::from_idx_data(
+            self.dir_store_path(dir, b"i"),
+            Some(self.dir_store_path(dir, b"d")),
+        )
+    }
+
+    /// Every directory with its own manifest revlog, from fncache's
+    /// `meta/<dir>/00manifest.i` lines, sorted.
+    pub fn manifest_dirs(&self) -> Result<Vec<Path>> {
+        let fncache = match fs::read(self.store_path().join("fncache")) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
+        let mut dirs = Vec::new();
+        for line in fncache.split(|byte| *byte == b'\n') {
+            let line = decodedir(line);
+            if let Some(dir) = line
+                .strip_prefix(b"meta/")
+                .and_then(|rest| rest.strip_suffix(b"/00manifest.i"))
+            {
+                dirs.push(Path::new(dir)?);
+            }
+        }
+        dirs.sort();
+        Ok(dirs)
     }
 
     pub fn get_file_revlog(&self, path: &Path) -> Result<Revlog> {
@@ -513,11 +550,9 @@ mod test {
     }
 
     #[test]
-    fn treemanifest_is_not_served() {
-        let err = open_requires("tree", &["store", "revlogv1", "treemanifest"])
-            .expect_err("treemanifest");
-        let msg = err.to_string();
-        assert!(msg.contains("treemanifest is not served"), "{}", msg);
+    fn treemanifest_opens() {
+        let repo = open_requires("tree", &["store", "revlogv1", "treemanifest"]).expect("open");
+        assert!(repo.is_treemanifest());
     }
 
     #[test]
@@ -606,18 +641,14 @@ mod test {
     }
 
     #[test]
-    fn treemanifest_in_store_requires_is_not_served() {
-        let err = open_split(
+    fn treemanifest_in_store_requires_opens() {
+        let repo = open_split(
             "tree-store",
             &["share-safe"],
             Some(&["store", "treemanifest"]),
         )
-        .expect_err("treemanifest");
-        assert!(
-            err.to_string().contains("treemanifest is not served"),
-            "{}",
-            err
-        );
+        .expect("open");
+        assert!(repo.is_treemanifest());
     }
 
     #[test]

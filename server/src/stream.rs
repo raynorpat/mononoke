@@ -83,23 +83,25 @@ pub fn stream_requirements(repo: &RevlogRepo) -> Option<String> {
 pub fn list_store(repo: &RevlogRepo) -> Result<Vec<StoreFile>> {
     let store = repo.store_path();
     let mut sizes = HashMap::new();
-    for top in ["data", "dh"] {
+    for top in ["data", "meta", "dh"] {
         walk(&store, &store.join(top), &mut sizes)?;
     }
 
     let fncache = fs::read(store.join("fncache"))?;
-    let mut paths = BTreeSet::new();
+    // Revlog names without the extension: `data/<file>` or `meta/<dir>/00manifest`.
+    let mut revlogs = BTreeSet::new();
     for line in fncache
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
     {
         // fncache keeps `encodedir` names, such as `changelog.d.hg/` for a `changelog.d/` directory.
         let line = decodedir(line);
-        let path = line
-            .strip_prefix(b"data/")
-            .and_then(|rest| {
-                rest.strip_suffix(b".i")
-                    .or_else(|| rest.strip_suffix(b".d"))
+        let revlog = line
+            .strip_suffix(b".i")
+            .or_else(|| line.strip_suffix(b".d"))
+            .filter(|stem| {
+                stem.starts_with(b"data/")
+                    || (stem.starts_with(b"meta/") && stem.ends_with(b"/00manifest"))
             })
             .ok_or_else(|| {
                 Error::from(format!(
@@ -107,15 +109,23 @@ pub fn list_store(repo: &RevlogRepo) -> Result<Vec<StoreFile>> {
                     String::from_utf8_lossy(&line)
                 ))
             })?;
-        paths.insert(path.to_vec());
+        revlogs.insert(revlog.to_vec());
     }
 
     let dotencode = repo.get_requirements().contains(&Required::Dotencode);
-    let mut files = Vec::with_capacity(paths.len() + 4);
-    for path in paths {
-        let filelog = Path::new(&path).map_err(|err| Error::from(err.to_string()))?;
+    let mut files = Vec::with_capacity(revlogs.len() + 4);
+    for revlog in revlogs {
+        let dir = revlog
+            .strip_prefix(b"meta/")
+            .and_then(|rest| rest.strip_suffix(b"/00manifest"));
+        let path = Path::new(dir.unwrap_or(&revlog[b"data/".len()..]))
+            .map_err(|err| Error::from(err.to_string()))?;
         for ext in [&b"i"[..], b"d"] {
-            let rel = filelog.store_filelog(dotencode, ext);
+            let rel = if dir.is_some() {
+                path.store_dirlog(dotencode, ext)
+            } else {
+                path.store_filelog(dotencode, ext)
+            };
             let Some(&size) = sizes.get(&rel) else {
                 if ext == b"i" {
                     return Err(format!(
@@ -126,8 +136,7 @@ pub fn list_store(repo: &RevlogRepo) -> Result<Vec<StoreFile>> {
                 }
                 continue;
             };
-            let mut name = b"data/".to_vec();
-            name.extend_from_slice(&path);
+            let mut name = revlog.clone();
             name.push(b'.');
             name.extend_from_slice(ext);
             files.push(StoreFile {
