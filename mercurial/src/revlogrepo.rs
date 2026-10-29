@@ -261,9 +261,7 @@ impl RevlogRepo {
             bytes.push(b'\n');
         }
         bytes.extend_from_slice(format!("{}\n", req).as_bytes());
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, &bytes)?;
-        fs::rename(&tmp, &path)?;
+        crate::revlog::replace_file(&path, &bytes)?;
         reqs.insert(req);
         Ok(())
     }
@@ -285,6 +283,20 @@ impl RevlogRepo {
         let mut inner = self.inner.lock().expect("poisoned lock");
         inner.changelog.reload()?;
         inner.manifest.reload()?;
+        inner.filelogcache.clear();
+        *self.requirements.write().expect("poisoned lock") = read_requirements(&self.basepath)?;
+        Ok(())
+    }
+
+    /// Restore every shared handle, including filelogs opened before a failed
+    /// push and newly created logs that rollback removed from disk.
+    pub fn reload_after_rollback(&self) -> Result<()> {
+        let mut inner = self.inner.lock().expect("poisoned lock");
+        inner.changelog.reload()?;
+        inner.manifest.reload()?;
+        for log in inner.filelogcache.values() {
+            log.reload_after_rollback()?;
+        }
         inner.filelogcache.clear();
         *self.requirements.write().expect("poisoned lock") = read_requirements(&self.basepath)?;
         Ok(())

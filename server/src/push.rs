@@ -72,6 +72,8 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
     let mut groups: Vec<(Section, Vec<CgDeltaChunk>)> = Vec::new();
     let mut changegroup_ids = Vec::new();
     let mut cg_part = false;
+    let mut tree = false;
+    let mut pushkeys = Vec::new();
 
     if bundle1 {
         drain_bundle1(bundle, |part| {
@@ -89,10 +91,10 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
                     if cg_part {
                         changegroup_ids.push(header.part_id());
                         if param(&header, "treemanifest").is_ok() {
-                            use_treemanifest(repo)?;
+                            tree = true;
                         }
                     } else if kind == "pushkey" {
-                        apply_pushkey(repo, &header)?;
+                        pushkeys.push(header);
                     }
                 }
                 Bundle2Item::Inner(inner) if cg_part => match inner.cg2_part() {
@@ -105,8 +107,25 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
         })?;
     }
 
-    for (section, chunks) in groups {
-        append_group(repo, compression, &section, chunks)?;
+    // Validate the entire input before requirements, bookmarks or history change.
+    for (_, chunks) in &groups {
+        if let Some(chunk) = chunks.iter().find(|chunk| chunk.flags != 0) {
+            return Err(format!("unsupported revision flags {:#06x} for {}", chunk.flags, chunk.node).into());
+        }
+    }
+    let mut transaction = PushTransaction::new(repo)?;
+    let applied = (|| -> Result<()> {
+        if tree { use_treemanifest(repo)?; }
+        for (section, chunks) in groups {
+            transaction.watch_group(repo, &section)?;
+            append_group(repo, compression, &section, chunks)?;
+        }
+        for header in pushkeys { apply_pushkey(repo, &header)?; }
+        Ok(())
+    })();
+    if let Err(err) = applied {
+        transaction.rollback(repo).map_err(|rollback| Error::from(format!("{err}; rollback failed: {rollback}")))?;
+        return Err(err);
     }
 
     Ok(Applied {
@@ -115,6 +134,103 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
         push_raced: false,
         bundle1,
     })
+}
+
+/// Revlog writes replace files; hard links retain their old bytes without copying
+/// large histories. Small metadata files are copied because their writers may
+/// truncate in place. Only paths this push can change are recorded.
+struct PushTransaction {
+    backup: std::path::PathBuf,
+    files: Vec<(std::path::PathBuf, Option<std::path::PathBuf>)>,
+    watched: std::collections::HashSet<std::path::PathBuf>,
+    dirs: std::collections::BTreeSet<std::path::PathBuf>,
+    keep_backup: bool,
+}
+
+impl PushTransaction {
+    fn new(repo: &RevlogRepo) -> Result<Self> {
+        let store = repo.store_path();
+        let base = store.parent().expect("hg directory");
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map_err(|err| Error::from(err.to_string()))?.as_nanos();
+        let backup = store.join(format!("push-backup-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&backup)?;
+        let mut tx = Self { backup, files: Vec::new(), watched: Default::default(), dirs: Default::default(), keep_backup: false };
+        for path in [base.join("requires"), store.join("requires"), store.join("fncache"), base.join("bookmarks")] {
+            tx.watch(path, false)?;
+        }
+        Ok(tx)
+    }
+
+    fn watch(&mut self, path: std::path::PathBuf, revlog: bool) -> Result<()> {
+        if self.watched.contains(&path) { return Ok(()); }
+        let saved = match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                let backup = self.backup.join(self.files.len().to_string());
+                if revlog { std::fs::hard_link(&path, &backup)?; }
+                else { std::fs::copy(&path, &backup)?; }
+                Some(backup)
+            }
+            Ok(_) => return Err(format!("push path is not a file: {}", path.display()).into()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
+        let mut parent = path.parent();
+        while let Some(dir) = parent {
+            if dir.exists() { break; }
+            self.dirs.insert(dir.to_path_buf());
+            parent = dir.parent();
+        }
+        self.watched.insert(path.clone());
+        self.files.push((path, saved));
+        Ok(())
+    }
+
+    fn watch_group(&mut self, repo: &RevlogRepo, section: &Section) -> Result<()> {
+        let store = repo.store_path();
+        let dotencode = repo.get_requirements().contains(&Required::Dotencode);
+        for ext in [b"i".as_slice(), b"d".as_slice()] {
+            let path = match section {
+                Section::Changeset => store.join(format!("00changelog.{}", ext[0] as char)),
+                Section::Manifest => store.join(format!("00manifest.{}", ext[0] as char)),
+                Section::Filelog(path) => store.join(path.store_filelog(dotencode, ext)),
+                Section::Treemanifest(dir) => store.join(dir.store_dirlog(dotencode, ext)),
+            };
+            self.watch(path, true)?;
+        }
+        Ok(())
+    }
+
+    fn rollback(&mut self, repo: &RevlogRepo) -> Result<()> {
+        // Never truncate a mapped file (Windows rejects that). Replacing its
+        // name also preserves any independent reader's original file mapping.
+        self.keep_backup = true;
+        for (path, saved) in self.files.iter().rev() {
+            if let Some(saved) = saved {
+                std::fs::rename(saved, path)?;
+            } else {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {},
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
+        for dir in self.dirs.iter().rev() {
+            // Remove only directories we created, and only if empty.
+            // A concurrent unrelated file in a new directory must survive.
+            let _ = std::fs::remove_dir(dir);
+        }
+        repo.reload_after_rollback()?;
+        self.keep_backup = false;
+        Ok(())
+    }
+}
+
+impl Drop for PushTransaction {
+    fn drop(&mut self) {
+        if !self.keep_backup { let _ = std::fs::remove_dir_all(&self.backup); }
+    }
 }
 
 pub(crate) fn is_bundle1(bundle: &[u8]) -> bool {
@@ -620,6 +736,157 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn failed_push_restores_disk_and_shared_revlogs() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        fs::create_dir_all(source.join("newdir")).unwrap();
+        fs::write(source.join("newdir/b"), b"late\n").unwrap();
+        // Force an inline-to-split transition before the later file obstruction.
+        let mut value = 42u32;
+        let large: Vec<u8> = (0..200_000).map(|_| {
+            value ^= value << 13; value ^= value >> 17; value ^= value << 5;
+            value as u8
+        }).collect();
+        fs::write(source.join("a"), large).unwrap();
+        hg(&source, &["commit", "-Aqm", "late", "-u", "test"]);
+        let target = fixture.0.join("target");
+        let obstruction = target.join(".hg/store/data/newdir");
+        fs::write(&obstruction, b"keep me").unwrap();
+        let unrelated = target.join(".hg/store/.00changelog.i.append-tmp");
+        fs::write(&unrelated, b"unrelated temporary file").unwrap();
+        let before = fs::read(target.join(".hg/store/fncache")).unwrap();
+        let repo = fixture.repo();
+        let log = repo.changelog_revlog();
+        let file = repo.get_file_revlog(&mercurial_types::Path::new(b"a").unwrap()).unwrap();
+        let heads: Vec<_> = log.clone().get_heads().unwrap().into_iter().collect();
+        let bundle = fixture.bundle("none-v2");
+        assert!(apply_repo(&repo, &heads, &bundle).is_err());
+        assert_eq!(log.len().unwrap(), 1, "failed push remained in shared changelog");
+        assert_eq!(file.len().unwrap(), 1, "failed push remained in shared filelog");
+        assert!(!target.join(".hg/store/data/a.d").exists(), "split data file survived rollback");
+        assert_eq!(file.get_rev(mercurial::revlog::RevIdx::from(0u32)).unwrap().as_blob().as_slice(), Some(b"first\n".as_slice()));
+        assert_eq!(fs::read(target.join(".hg/store/fncache")).unwrap(), before);
+        assert_eq!(fs::read(&obstruction).unwrap(), b"keep me");
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated temporary file");
+        hg(&target, &["verify"]);
+        fs::remove_file(obstruction).unwrap();
+        apply_repo(&repo, &heads, &bundle).unwrap();
+        assert_eq!(log.len().unwrap(), 3);
+        hg(&target, &["verify"]);
+    }
+
+    #[test]
+    fn failed_tree_push_restores_requirements_fncache_and_new_files() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        let reqpath = source.join(".hg/store/requires");
+        let mut reqs = fs::read(&reqpath).unwrap();
+        reqs.extend_from_slice(b"treemanifest\n");
+        fs::write(reqpath, reqs).unwrap();
+        fs::create_dir_all(source.join("newdir")).unwrap();
+        fs::write(source.join("newdir/b"), b"tree\n").unwrap();
+        hg(&source, &["commit", "-Aqm", "tree", "-u", "test"]);
+        hg(&source, &["bundle", "--all", "-t", "none-v2;cg.version=03", "tree.hg"]);
+        hg(&fixture.0, &["init", "empty"]);
+        let target = fixture.0.join("empty");
+        fs::create_dir_all(target.join(".hg/store/data")).unwrap();
+        fs::write(target.join(".hg/store/data/newdir"), b"unrelated obstruction").unwrap();
+        fs::write(target.join(".hg/store/requires.tmp"), b"unrelated metadata file").unwrap();
+        let repo = RevlogRepo::open(target.join(".hg")).unwrap();
+        let clone = repo.clone();
+        let requirements = repo.get_requirements();
+        let before = fs::read(target.join(".hg/store/requires")).unwrap();
+        let raw = fs::read(source.join("tree.hg")).unwrap();
+        let mut parts = Vec::new();
+        drain_bundle(&raw, |item| {
+            if let Bundle2Item::Inner(inner) = item { parts.push(inner.cg2_part()); }
+            Ok(())
+        }).unwrap();
+        let mut part = mercurial_bundles::parts::changegroup_part_version(
+            futures::stream::iter(parts.into_iter().map(Ok::<_, mercurial_bundles::Error>)), CgVersion::V3,
+        ).unwrap();
+        part.add_mparam("treemanifest", "1").unwrap();
+        let mut builder = mercurial_bundles::Bundle2EncodeBuilder::new(Cursor::new(Vec::new()));
+        builder.add_part(part);
+        let bytes = futures::executor::block_on(builder.build()).unwrap().into_inner();
+        assert!(apply_repo(&repo, &[NULL_HASH], &bytes).is_err());
+        assert_eq!(clone.get_requirements(), requirements);
+        assert_eq!(fs::read(target.join(".hg/store/requires")).unwrap(), before);
+        assert_eq!(clone.changelog_revlog().len().unwrap(), 0);
+        assert_eq!(clone.manifest_revlog().len().unwrap(), 0);
+        assert!(!target.join(".hg/store/fncache").exists());
+        assert!(!target.join(".hg/store/meta").exists());
+        assert!(!target.join(".hg/store/data/a.i").exists());
+        assert_eq!(fs::read(target.join(".hg/store/data/newdir")).unwrap(), b"unrelated obstruction");
+        assert_eq!(fs::read(target.join(".hg/store/requires.tmp")).unwrap(), b"unrelated metadata file");
+        hg(&target, &["verify"]);
+    }
+
+    #[test]
+    fn failed_bookmark_part_restores_prior_bookmark_and_history() {
+        let fixture = Fixture::new();
+        let target = fixture.0.join("target");
+        hg(&target, &["bookmark", "keep"]);
+        let before = fs::read(target.join(".hg/bookmarks")).unwrap();
+        let raw = fixture.bundle("none-v1");
+        let mut builder = mercurial_bundles::Bundle2EncodeBuilder::new(Cursor::new(Vec::new()));
+        let mut cg = PartEncodeBuilder::mandatory("changegroup").unwrap();
+        cg.add_mparam("version", "01").unwrap();
+        cg.set_data_bytes(Bytes::copy_from_slice(&raw[6..])).unwrap();
+        builder.add_part(cg);
+        let old = String::from_utf8(hg(&target, &["log", "-r", "tip", "-T", "{node}"])).unwrap();
+        let new = String::from_utf8(hg(&fixture.0.join("source"), &["log", "-r", "tip", "-T", "{node}"])).unwrap();
+        let mut mark = PartEncodeBuilder::mandatory("pushkey").unwrap();
+        for (key, value) in [("namespace", "bookmarks"), ("key", "keep"), ("old", &old), ("new", &new)] {
+            mark.add_mparam(key, value.to_owned()).unwrap();
+        }
+        builder.add_part(mark);
+        let mut bad = PartEncodeBuilder::mandatory("pushkey").unwrap();
+        bad.add_mparam("namespace", "bookmarks").unwrap();
+        builder.add_part(bad);
+        let bytes = futures::executor::block_on(builder.build()).unwrap().into_inner();
+        let repo = fixture.repo();
+        let heads: Vec<_> = repo.changelog_revlog().get_heads().unwrap().into_iter().collect();
+        let err = apply_repo(&repo, &heads, &bytes).err().expect("invalid second bookmark part");
+        assert!(err.to_string().contains("pushkey missing key"), "{err}");
+        assert_eq!(fs::read(target.join(".hg/bookmarks")).unwrap(), before);
+        assert_eq!(repo.changelog_revlog().len().unwrap(), 1);
+        hg(&target, &["verify"]);
+    }
+
+    #[test]
+    fn flagged_cg03_is_rejected_before_any_write() {
+        let fixture = Fixture::new();
+        let raw = fixture.bundle("none-v2;cg.version=03");
+        let mut parts = Vec::new();
+        drain_bundle(&raw, |item| {
+            if let Bundle2Item::Inner(inner) = item {
+                parts.push(inner.cg2_part());
+            }
+            Ok(())
+        }).unwrap();
+        for part in &mut parts {
+            if let Part::CgChunk(Section::Filelog(_), chunk) = part {
+                chunk.flags = 0x8000;
+            }
+        }
+        let part = mercurial_bundles::parts::changegroup_part_version(
+            futures::stream::iter(parts.into_iter().map(Ok::<_, mercurial_bundles::Error>)),
+            CgVersion::V3,
+        ).unwrap();
+        let mut builder = mercurial_bundles::Bundle2EncodeBuilder::new(Cursor::new(Vec::new()));
+        builder.add_part(part);
+        let bytes = futures::executor::block_on(builder.build()).unwrap().into_inner();
+        let repo = fixture.repo();
+        let heads: Vec<_> = repo.changelog_revlog().get_heads().unwrap().into_iter().collect();
+        let result = apply_repo(&repo, &heads, &bytes);
+        assert!(result.is_err(), "unsupported flags were silently stripped");
+        assert!(result.err().unwrap().to_string().contains("flags"));
+        assert_eq!(repo.changelog_revlog().len().unwrap(), 1);
+        hg(&fixture.0.join("target"), &["verify"]);
     }
 
     #[test]

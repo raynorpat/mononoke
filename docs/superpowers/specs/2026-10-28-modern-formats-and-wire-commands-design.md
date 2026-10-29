@@ -165,7 +165,12 @@ Pushes (`unbundle`):
   repository and compares `hg verify` on the result with what `hg serve`
   produces for the same push. (Matching Mercurial here was the author's
   call, made while writing this up.)
-- Both flat and tree pushes are checked and applied as one unit, as today.
+- Both flat and tree pushes are checked and applied as one unit. Reported
+  failures restore revlogs, fncache, requirements, bookmarks and shared reader
+  state. This is not crash recovery.
+- Nonzero revision flags are rejected before incoming mutations, and outgoing
+  changegroups fail explicitly for flagged revisions. Full censor/LFS semantics
+  remain out of scope.
 
 Stream clones already copy the whole store, so `meta/` comes along. A test
 confirms it.

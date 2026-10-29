@@ -427,7 +427,7 @@ git commit -m "push: accept changegroup 01 and bundle1 pushes"
   - `pub fn global_tags(repo: &RevlogRepo, heads: &[NodeHash]) -> Result<Vec<(Vec<u8>, NodeHash)>>`: `.hgtags` from every head merged as `tags.py` `_readtags`/`_updatetags` do, null nodes removing a tag, plus `.hg/localtags`.
   - `pub fn dirstate_parent(hg_dir: &Path) -> Result<NodeHash>`: p1 from `.hg/dirstate` (dirstate-v1: first 20 bytes; dirstate-v2: the docket's parents, see `dirstateutils/docket.py`), `NULL_HASH` when there is no dirstate.
   - `resolve_key` follows `scmutil.revsymbol`: `.`/`tip`/`null`, revision number, full hash, then bookmarks, tags, branches (`namespaces.py` order, branch → `tip`), then hash prefix.
-  - `Repo` keeps a `BranchCache` behind a mutex: built in `warm_up` after the node map, extended before each `branchmap`/`lookup`, rebuilt when `hgrepo()` reloads.
+  - `Repo` keeps a `BranchCache` behind a mutex: built lazily when a command first needs branch metadata, extended before each `branchmap`/`lookup`, rebuilt when `hgrepo()` reloads. Final review superseded eager warm-up because it scanned every changeset and negated persistent-nodemap startup savings.
   - `branchmap`: real branches; the response line is `quote(name) node node…`, joined by `\n` with no trailing newline (fix the current encoder). `branches(nodes)`: `localrepo.branches` (empty → tip) encoded as `wireprototypes.encodelist` lines; HTTP framing for `branches nodes=`.
 
 - [x] **Step 1: Write the failing tests**

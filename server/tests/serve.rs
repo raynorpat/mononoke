@@ -1842,6 +1842,50 @@ fn tree_repo_clones_over_every_transport() {
 }
 
 #[test]
+fn restricted_tree_reuse_clone_and_pull_matches_stock() {
+    for mixed in [false, true] {
+        let temp = TempDir::new(if mixed { "mixed-reuse" } else { "tree-reuse" });
+        assert_hg(&hg(&temp.0, &["init", "repo", "--config", if mixed {
+            "experimental.treemanifest=0"
+        } else { "experimental.treemanifest=1" }]), "init");
+        let repo = temp.0.join("repo");
+        fs::create_dir_all(repo.join("d")).unwrap();
+        fs::write(repo.join("d/a"), b"root\n").unwrap();
+        assert_hg(&hg(&repo, &["commit", "-Aqm", "root", "-u", "test"]), "root");
+        if mixed {
+            let path = repo.join(".hg/store/requires");
+            let mut reqs = fs::read(&path).unwrap();
+            reqs.extend_from_slice(b"treemanifest\n");
+            fs::write(path, reqs).unwrap();
+        }
+        for name in ["sibling-one", "sibling-two"] {
+            assert_hg(&hg(&repo, &["update", "-C", "-r", "0"]), "update root");
+            fs::write(repo.join("d/a"), b"reused\n").unwrap();
+            assert_hg(&hg(&repo, &["commit", "-qm", name, "-u", "test"]), "sibling");
+        }
+        assert_hg(&hg(&repo, &["verify"]), "verify source");
+        let log = temp.0.join("mono.log");
+        let mono = Running::start(&repo, &log);
+        let stock = HgServe::start(&repo);
+        for (name, port) in [("stock", stock.port), ("mono", mono.port)] {
+            let url = format!("http://127.0.0.1:{port}/");
+            for incremental in [false, true] {
+                let dest = format!("{name}-{incremental}");
+                let clone = hg(&temp.0, &["clone", "--pull", "-r", if incremental { "0" } else { "2" }, &url, &dest]);
+                assert_ok_with_log(&clone, "restricted clone", &log);
+                let dest = temp.0.join(dest);
+                if incremental {
+                    assert_ok_with_log(&hg(&dest, &["pull", "-r", "2", &url]), "restricted pull", &log);
+                }
+                assert_hg(&hg(&dest, &["verify"]), "verify restricted destination");
+                assert_eq!(node_of(&dest, "tip"), node_of(&repo, "2"));
+                assert_eq!(hg(&dest, &["cat", "-r", "tip", "d/a"]).stdout, b"reused\n");
+            }
+        }
+    }
+}
+
+#[test]
 fn flat_repo_still_offers_02() {
     let temp = TempDir::new("f2");
     let repo = init_share_safe_repo(&temp.0);

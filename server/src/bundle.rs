@@ -194,8 +194,8 @@ fn history_parts(
     let heads = match selection {
         Selection::Common { heads, .. } | Selection::Roots { heads, .. } => heads,
     };
-    let restricted = !repo.is_treemanifest()
-        && missing_revs(repo, &[], heads)?
+    let restricted = repo.is_treemanifest()
+        || missing_revs(repo, &[], heads)?
             .1
             .iter()
             .any(|selected| !selected);
@@ -206,9 +206,10 @@ fn history_parts(
         if !missing[rev] {
             continue;
         }
+        check_flags(&repo.changelog_revlog(), RevIdx::from(rev))?;
         let cs = ready(repo.get_changeset_by_nodeid(node))??;
         files.extend(cs.files().iter().cloned());
-        if restricted {
+        if restricted && *cs.manifestid() != NULL_HASH {
             manifest_links.entry(*cs.manifestid()).or_insert(*node);
         }
         if version == CgVersion::V1 {
@@ -240,6 +241,7 @@ fn history_parts(
     emit(Part::SectionEnd(Section::Changeset))?;
 
     let mut file_links: HashMap<Path, HashMap<NodeHash, NodeHash>> = HashMap::new();
+    let mut tree_links: std::collections::BTreeMap<Path, HashMap<NodeHash, NodeHash>> = Default::default();
     let common = if restricted {
         let common_heads = match selection {
             Selection::Common { common, .. } => common.clone(),
@@ -267,11 +269,40 @@ fn history_parts(
             .collect();
         // Iterate manifests in changeset order so each filenode gets its first
         // outgoing changeset as linknode.
+        let mut visited_trees = std::collections::HashSet::new();
         for (rev, selected) in missing.iter().enumerate() {
             if !selected {
                 continue;
             }
             let cs = ready(repo.get_changeset_by_nodeid(&nodes[rev]))??;
+            if repo.is_treemanifest() {
+                // Walk references, not storage linkrevs: identical manifests and
+                // files may first have been stored on an unselected sibling.
+                // A tree repository can also contain flat root manifests.
+                let mut pending = vec![(Vec::new(), *cs.manifestid())];
+                while let Some((prefix, node)) = pending.pop() {
+                    if node == NULL_HASH || !visited_trees.insert((prefix.clone(), node)) { continue; }
+                    let log = if prefix.is_empty() {
+                        repo.manifest_revlog()
+                    } else {
+                        repo.read_dir_revlog(&Path::new(&prefix).map_err(|err| Error::from(err.to_string()))?)?
+                    };
+                    let text = full_text(&log.get_rev_by_nodeid(&node)?)?;
+                    for (path, details) in mercurial::manifest::revlog::parse(&text)? {
+                        let mut full = prefix.clone();
+                        if !full.is_empty() { full.push(b'/'); }
+                        full.extend_from_slice(path.as_slice());
+                        let path = Path::new(&full).map_err(|err| Error::from(err.to_string()))?;
+                        if details.is_tree() {
+                            tree_links.entry(path).or_default().entry(*details.nodeid()).or_insert(nodes[rev]);
+                            pending.push((full, *details.nodeid()));
+                        } else if files.contains(&path) {
+                            file_links.entry(path).or_default().entry(*details.nodeid()).or_insert(nodes[rev]);
+                        }
+                    }
+                }
+                continue;
+            }
             let manifest = repo.manifest_revlog();
             let idx = manifest.get_idx_by_nodeid(cs.manifestid())?;
             let entry = manifest.get_entry(idx)?;
@@ -319,16 +350,22 @@ fn history_parts(
     emit(Part::SectionEnd(Section::Manifest))?;
 
     if version == CgVersion::V3 && repo.is_treemanifest() {
+        let dirs: Vec<_> = tree_links.keys().cloned().collect();
         read_in_order(
-            &repo.manifest_dirs()?,
+            &dirs,
             |dir| {
-                revlog_parts(
+                let mut parts = Vec::new();
+                if referenced_revisions(
                     &repo.read_dir_revlog(dir)?,
                     Section::Treemanifest(dir.clone()),
-                    &nodes,
-                    &missing,
+                    &tree_links[dir],
+                    common.as_deref(),
                     version,
-                )
+                    &mut |part| { parts.push(part); Ok(()) },
+                )? {
+                    parts.push(Part::SectionEnd(Section::Treemanifest(dir.clone())));
+                }
+                Ok(parts)
             },
             &mut |parts: Vec<Part>| parts.into_iter().try_for_each(&mut *emit),
         )?;
@@ -575,6 +612,7 @@ fn v1_revision(
 }
 
 fn indexed_parents(revlog: &Revlog, idx: RevIdx) -> Result<(Parents, bool)> {
+    check_flags(revlog, idx)?;
     let entry = revlog.get_entry(idx)?;
     let p1 = match entry.p1 {
         Some(parent) => Some(revlog.get_entry(parent)?.nodeid),
@@ -586,6 +624,14 @@ fn indexed_parents(revlog: &Revlog, idx: RevIdx) -> Result<(Parents, bool)> {
     };
     let blob = BlobNode::new(Vec::<u8>::new(), p1.as_ref(), p2.as_ref());
     Ok((*blob.parents(), blob.maybe_renamed()))
+}
+
+fn check_flags(revlog: &Revlog, idx: RevIdx) -> Result<()> {
+    let entry = revlog.get_entry(idx)?;
+    if !entry.flags.is_empty() {
+        return Err(format!("unsupported revision flags {:#06x} for {}", entry.flags.bits(), entry.nodeid).into());
+    }
+    Ok(())
 }
 
 fn stored_revision(
@@ -1047,6 +1093,21 @@ mod tests {
             missing_revs(&repo, &[], &[unknown]).is_err(),
             "unknown head"
         );
+    }
+
+    #[test]
+    fn flagged_output_is_rejected_in_every_version() {
+        let temp = init_share_safe_repo();
+        let path = temp.repo.join(".hg/store/data/a.txt.i");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[6..8].copy_from_slice(&0x8000u16.to_be_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let repo = open_repo(&temp.repo);
+        for version in [CgVersion::V1, CgVersion::V2, CgVersion::V3] {
+            let result = history_parts(&repo, &Selection::Common { common: vec![], heads: vec![] }, version, &mut |_| Ok(()));
+            assert!(result.is_err(), "nonzero flags lost for {version:?}");
+            assert!(result.unwrap_err().to_string().contains("flags"));
+        }
     }
 
     #[test]

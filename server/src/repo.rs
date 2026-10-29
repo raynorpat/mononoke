@@ -209,7 +209,6 @@ impl Repo {
     /// store listing. Blocks; run it off the runtime thread.
     pub fn warm_up(&self) -> Result<()> {
         self.hgrepo().changelog_revlog().load_node_map()?;
-        self.with_branches(|_, _| Ok(()))?;
         if stream_requirements(self.hgrepo()).is_some() {
             self.stream_listing()?;
         }
@@ -240,20 +239,12 @@ impl Repo {
     // Keep reload and branch metadata in the same lock order: stamp, then cache.
     fn with_branches<T>(
         &self,
-        f: impl FnOnce(&mercurial::RevlogRepo, &BranchCache) -> Result<T>,
+        f: impl FnOnce(&mercurial::RevlogRepo, &mut BranchCache) -> Result<T>,
     ) -> Result<T> {
         self.hgrepo();
         let _stamp = self.changelog_seen.lock().expect("changelog stamp lock");
         let mut cache = self.branch_cache.lock().expect("branch cache lock");
-        cache.extend(&self.revlogs)?;
-        f(&self.revlogs, &cache)
-    }
-
-    /// Record the changelog as this server's own push left it, so the push
-    /// does not look like an outside change. Call with the write locks held.
-    fn note_own_write(&self) {
-        *self.changelog_seen.lock().expect("changelog stamp lock") =
-            changelog_stamp(&self.revlogs.store_path());
+        f(&self.revlogs, &mut cache)
     }
 
     /// The stream clone file listing. Reused while the changelog is as it was
@@ -522,6 +513,7 @@ impl HgCommands for RepoClient {
         async move {
             tokio::task::spawn_blocking(move || {
                 repo.with_branches(|hg, cache| {
+                    cache.extend(hg)?;
                     let parents = names::changelog_parents(hg)?;
                     let log = hg.changelog_revlog();
                     cache
@@ -815,8 +807,18 @@ impl HgCommands for RepoClient {
             *listing = None;
             let _locks = write_locks(repo.hgrepo()).await?;
             // `hgrepo()` again under the locks, to see anything hg wrote while we waited.
-            let applied = crate::push::apply_repo(repo.hgrepo(), &heads, &bundle);
-            repo.note_own_write();
+            repo.hgrepo();
+            let applied = {
+                // Match with_branches' lock order. No branch reader can cache
+                // changesets from a transaction that is subsequently rolled back.
+                let mut stamp = repo.changelog_seen.lock().expect("changelog stamp lock");
+                let applied = crate::push::apply_repo(&repo.revlogs, &heads, &bundle);
+                if applied.is_err() {
+                    *repo.branch_cache.lock().expect("branch cache lock") = BranchCache::default();
+                }
+                *stamp = changelog_stamp(&repo.revlogs.store_path());
+                applied
+            };
             let reply = match applied {
                 Ok(applied) => crate::push::reply(&applied).await,
                 Err(err) => {
@@ -842,6 +844,36 @@ impl HgCommands for RepoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warm_up_does_not_read_changeset_text() {
+        let root = std::env::temp_dir().join(format!("warmup-lazy-{}", std::process::id()));
+        fs::create_dir_all(root.join("store")).unwrap();
+        fs::write(root.join("requires"), b"store\nrevlogv1\n").unwrap();
+        let logger = Logger::root(slog::Discard, slog::o!());
+        let repo = Repo::new(&logger, &root).unwrap();
+        repo.hgrepo().changelog_revlog().append_snapshot(
+            mercurial::revlog::RevlogAppend {
+                node: NodeHash::from_bytes(&[1; 20]).unwrap(), p1: None, p2: None,
+                linkrev: Some(0), text: b"intentionally invalid changeset text".to_vec(),
+            }, mercurial::revlog::RevlogCompression::Zlib,
+        ).unwrap();
+        // Startup only needs index metadata. Parsing branch metadata is deferred
+        // until a command needs it, where this malformed changeset must fail.
+        repo.warm_up().expect("warmup must not parse changesets");
+        fs::write(root.join("dirstate"), [1u8; 20]).unwrap();
+        fs::write(root.join("bookmarks"), format!("{} quick\n", "01".repeat(20))).unwrap();
+        let repo = Arc::new(repo);
+        let client = RepoClient::new(Arc::clone(&repo), &logger);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        for key in ["tip", "null", ".", "0", "quick", &"01".repeat(20)] {
+            runtime.block_on(client.lookup(key.as_bytes().to_vec())).expect("cheap lookup must not parse branch metadata");
+        }
+        assert!(repo.with_branches(|hg, cache| cache.extend(hg)).is_err());
+        drop(client);
+        drop(repo);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn stream_capability_uses_stream_for_revlogv1_only() {

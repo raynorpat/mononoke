@@ -253,7 +253,7 @@ pub fn dirstate_parent(hg_dir: &Path) -> Result<NodeHash> {
 
 pub fn resolve_key(
     repo: &RevlogRepo,
-    branches: &BranchCache,
+    branches: &mut BranchCache,
     bookmarks: &[(Vec<u8>, Vec<u8>)],
     key: &[u8],
 ) -> std::result::Result<NodeHash, String> {
@@ -313,6 +313,7 @@ pub fn resolve_key(
             .find(|(n, _)| n == &name)
             .map(|(_, node)| node);
         if named_node.is_none() {
+            branches.extend(repo).map_err(|e| e.to_string())?;
             if let Some(rev) =
                 branches.tip(&name, &changelog_parents(repo).map_err(|e| e.to_string())?)
             {

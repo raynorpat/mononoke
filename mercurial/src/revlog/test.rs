@@ -818,6 +818,20 @@ fn nodemap_resolves_every_node() {
 }
 
 #[test]
+fn nodemap_entry_reads_do_not_rebuild_nodeidx() {
+    let repo = nodemap_repo("entry-reads");
+    let revlog = Revlog::from_idx(repo.join(".hg/store/00changelog.i")).unwrap();
+    assert!(revlog.use_persistent_nodemap().unwrap());
+    for rev in 0..revlog.len().unwrap() {
+        let entry = revlog.get_entry(RevIdx::from(rev)).unwrap();
+        assert_eq!(revlog.index_of(&entry.nodeid).unwrap(), rev);
+    }
+    assert!(revlog.inner.lock().unwrap().nodeidx.len() <= 1, "nodemap was duplicated into nodeidx");
+    drop(revlog);
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
 fn unknown_node_sharing_prefix_is_not_found() {
     let repo = nodemap_repo("prefix");
     let revlog = Revlog::from_idx(changelog_path(&repo)).expect("open");

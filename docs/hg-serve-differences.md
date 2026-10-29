@@ -107,8 +107,13 @@ Largefiles (`statlfile`, `getlfile`, `putlfile`) and LFS are not served.
 ### Pushes
 
 - Pushes check the client's view of the heads. Pushes to one repository take
-  turns, and each takes Mercurial's locks (see below). There is no transaction
-  rollback if an append fails after earlier groups were written.
+  turns, and each takes Mercurial's locks (see below). A failed push restores
+  revlogs, fncache, requirements and bookmarks, including shared reader state.
+  Rollback retains original revlogs with hard links; the repository filesystem
+  must support them. This handles reported write failures, not crash recovery.
+- Pushes containing nonzero revision flags are rejected before any changes.
+  Changegroup pulls of such revisions also fail explicitly. Censored revisions
+  and extension-backed flag semantics are not implemented.
 - A pushed revision keeps the client's delta when that delta is against a
   revision the server has, compresses smaller than the full text, and keeps
   the delta chain within 1,000 deltas and twice the text's size. Otherwise it
@@ -149,7 +154,8 @@ run it again.
 - The changegroup path finds what the client is missing from the changelog
   index, and reads filelogs on 16 threads.
 - At startup the server loads a valid persistent nodemap, or builds a node
-  map when none is available, and warms branch metadata and the stream-clone
-  file listing in the background. Historical timings above predate these
+  map when none is available, and warms the stream-clone file listing in the
+  background. Branch metadata is loaded lazily when a command needs it, then
+  extended or invalidated after history changes. Historical timings above predate these
   format changes. Pushes wait for any store listing already in progress.
 - Responses are streamed, so memory use stays flat during large clones.

@@ -58,9 +58,10 @@ INFO Listening for HTTPS on 0.0.0.0:8443, repo: "/srv/hg/myrepo"
 INFO Warmed up, repo: "/srv/hg/myrepo"
 ```
 
-"Warmed up" appears once the node map, branch metadata and stream-clone
+"Warmed up" appears once the node map and stream-clone
 listing are ready. A valid persistent nodemap avoids rebuilding its covered
-node index. The server answers requests during warm-up; pushes wait for any
+node index. Branch metadata is loaded on the first command that needs it.
+The server answers requests during warm-up; pushes wait for any
 store listing already in progress.
 
 ### Several repositories

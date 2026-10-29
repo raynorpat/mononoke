@@ -348,11 +348,32 @@ impl Revlog {
     /// changed. Every clone shares the reloaded state, and cached offsets, nodes
     /// and text are dropped. An in-memory revlog is left as it is.
     pub fn reload(&self) -> Result<()> {
+        self.reload_inner(false)
+    }
+
+    /// Reload after rollback, including newly created logs removed from disk.
+    pub(crate) fn reload_after_rollback(&self) -> Result<()> {
+        self.reload_inner(true)
+    }
+
+    fn reload_inner(&self, allow_missing: bool) -> Result<()> {
         let mut inner = self.inner.lock().expect("lock poisoned");
         let Some(idx_path) = inner.idx_path.clone() else {
             return Ok(());
         };
-        let fresh = Revlog::from_idx_data(&idx_path, inner.data_path.clone())?;
+        let fresh = if !allow_missing || idx_path.exists() {
+            Revlog::from_idx_data(&idx_path, inner.data_path.clone())?
+        } else {
+            // A failed transaction may have removed a newly created filelog.
+            // Retained Arc handles must forget its revisions too.
+            let fresh = Revlog::new(Vec::new(), None)?;
+            {
+                let mut empty = fresh.inner.lock().expect("lock poisoned");
+                empty.idx_path = Some(idx_path);
+                empty.data_path = inner.data_path.clone();
+            }
+            fresh
+        };
         let fresh = Arc::try_unwrap(fresh.inner)
             .expect("a just-opened revlog has no other clones")
             .into_inner()
@@ -471,7 +492,9 @@ impl RevlogInner {
         }
 
         // Update NodeHash cache
-        self.nodeidx.insert(entry.nodeid, idx);
+        if self.nodemap.as_ref().map_or(true, |nm| idx.as_u32() > nm.tip_rev) {
+            self.nodeidx.insert(entry.nodeid, idx);
+        }
 
         Ok(entry)
     }
@@ -1221,12 +1244,21 @@ struct RevlogSnapshot {
 ///
 /// `std::fs::write` truncates the destination first. A crash there leaves an empty
 /// index, which reopens as an empty revlog.
-fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = sibling_tmp(path);
-    if let Err(err) = std::fs::write(&tmp, bytes) {
+pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let (tmp, mut file) = loop {
+        let tmp = sibling_tmp(path);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err.into()),
+        }
+    };
+    if let Err(err) = file.write_all(bytes) {
+        drop(file);
         let _ = std::fs::remove_file(&tmp);
         return Err(err.into());
     }
+    drop(file);
     if let Err(err) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err.into());
@@ -1235,12 +1267,14 @@ fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn sibling_tmp(path: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.to_path_buf();
     let name = match path.file_name() {
         Some(name) => name.to_string_lossy().into_owned(),
         None => "revlog".to_string(),
     };
-    tmp.set_file_name(format!(".{name}.append-tmp"));
+    tmp.set_file_name(format!(".{name}.append-tmp-{}-{id}", std::process::id()));
     tmp
 }
 
