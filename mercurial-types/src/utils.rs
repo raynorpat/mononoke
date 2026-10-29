@@ -62,9 +62,11 @@ pub fn percent_decode(input: &str) -> String {
                 idx += 1;
             }
             b'%' if idx + 2 < bytes.len() => {
-                let hex = &input[idx + 1..idx + 3];
-                if let Ok(value) = u8::from_str_radix(hex, 16) {
-                    out.push(value);
+                // Byte slice, so a multibyte character after `%` cannot split a str.
+                let hex = &bytes[idx + 1..idx + 3];
+                if hex.iter().all(u8::is_ascii_hexdigit) {
+                    let hex = std::str::from_utf8(hex).expect("ascii hex digits");
+                    out.push(u8::from_str_radix(hex, 16).expect("two hex digits"));
                     idx += 3;
                 } else {
                     out.push(b'%');
@@ -78,4 +80,19 @@ pub fn percent_decode(input: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_keeps_bad_escapes() {
+        assert_eq!(percent_decode("a%2Cb%3d+c"), "a,b= c");
+        assert_eq!(percent_decode("%aé"), "%aé");
+        // Not 0x0f: the bad escape keeps its `%`, then `+` is a space as usual.
+        assert_eq!(percent_decode("%+f"), "% f");
+        assert_eq!(percent_decode("x%"), "x%");
+        assert_eq!(percent_decode("x%a"), "x%a");
+    }
 }
