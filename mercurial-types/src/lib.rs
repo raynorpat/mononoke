@@ -18,6 +18,7 @@ pub mod node;
 pub mod nodehash;
 pub mod path;
 pub mod repo;
+pub mod textdiff;
 pub mod utils;
 
 pub use blob::{Blob, BlobHash};
