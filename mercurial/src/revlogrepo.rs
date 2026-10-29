@@ -148,9 +148,16 @@ impl RevlogRepo {
 
         let req = read_requirements(&base)?;
         // `hg init` writes no store revlogs until the first commit or push.
+        // Create-only, so a revlog hg writes meanwhile is never truncated.
         for name in ["00changelog.i", "00manifest.i"] {
-            if !store.join(name).exists() {
-                fs::write(store.join(name), [])?;
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(store.join(name))
+            {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err.into()),
             }
         }
         let changelog = Revlog::from_idx_data(store.join("00changelog.i"), None as Option<String>)?;
@@ -639,6 +646,19 @@ mod test {
         assert_eq!(fncache, ["meta/Sub/Dir/00manifest.i"]);
         assert!(index);
         assert_eq!(dirs.expect("dirs"), [sub]);
+    }
+
+    #[test]
+    fn open_leaves_existing_changelog_untouched() {
+        let dir = make_split("keep", &["store", "revlogv1"], None);
+        let path = dir.join("store").join("00changelog.i");
+        let before = fs::read(&path).expect("read changelog");
+        let opened = RevlogRepo::open(&dir).map(|_| ());
+        let after = fs::read(&path).expect("reread changelog");
+        let _ = fs::remove_dir_all(&dir);
+        opened.expect("open");
+        assert!(!before.is_empty());
+        assert_eq!(after, before);
     }
 
     #[test]

@@ -58,7 +58,12 @@ impl GQLRepo {
     fn heads(ctx: &RepoCtx) -> Result<Vec<GQLChangeset>, String> {
         let repo = ctx.repo();
         let set = ready(repo.get_heads().try_collect::<Vec<_>>()).map_err(|err| err.to_string())?;
-        Ok(set.into_iter().map(GQLChangeset::from).collect())
+        // An empty repository reports the null node as its head.
+        Ok(set
+            .into_iter()
+            .filter(|node| *node != mercurial_types::NULL_HASH)
+            .map(GQLChangeset::from)
+            .collect())
     }
 
     /// Fetch a specific changeset
