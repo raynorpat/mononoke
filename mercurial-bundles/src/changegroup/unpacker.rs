@@ -15,9 +15,9 @@ use slog;
 use tokio_util::codec::Decoder;
 
 use mercurial_types::delta::Fragment;
-use mercurial_types::{Delta, Path};
+use mercurial_types::{Delta, NodeHash, Path};
 
-use super::{CgDeltaChunk, Part, Section};
+use super::{CgDeltaChunk, CgVersion, Part, Section};
 use crate::bail;
 use crate::errors::*;
 use crate::utils::BytesExt;
@@ -27,7 +27,11 @@ use crate::InnerPart;
 pub struct Cg2Unpacker {
     #[allow(dead_code)]
     logger: slog::Logger,
+    version: CgVersion,
     state: State,
+    /// Version 01 chunks have no base: it is the previous node of the group,
+    /// or p1 for the first.
+    prev_node: Option<NodeHash>,
 }
 
 impl Part {
@@ -57,16 +61,12 @@ impl Part {
     }
 }
 
-// See the chunk header definition below for the first 100 bytes. The last 4 is
-// for the length field itself.
-const CHUNK_HEADER_LEN: usize = 20 + 20 + 20 + 20 + 20 + 4;
-
 impl Decoder for Cg2Unpacker {
     type Item = InnerPart;
     type Error = Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<InnerPart>> {
-        match Self::decode_next(buf, self.state.take()) {
+        match self.decode_next(buf) {
             Err(e) => {
                 self.state = State::Invalid;
                 Err(e)
@@ -110,15 +110,22 @@ impl Decoder for Cg2Unpacker {
 
 impl Cg2Unpacker {
     pub fn new(logger: slog::Logger) -> Self {
+        Self::with_version(logger, CgVersion::V2)
+    }
+
+    pub fn with_version(logger: slog::Logger, version: CgVersion) -> Self {
         Cg2Unpacker {
             logger,
+            version,
             state: State::Changeset,
+            prev_node: None,
         }
     }
 
-    fn decode_next(buf: &mut BytesMut, state: State) -> Result<(Option<Part>, State)> {
+    fn decode_next(&mut self, buf: &mut BytesMut) -> Result<(Option<Part>, State)> {
+        let state = self.state.take();
         match state {
-            State::Changeset => match Self::decode_chunk(buf)? {
+            State::Changeset => match self.decode_chunk(buf)? {
                 None => Ok((None, State::Changeset)),
                 Some(CgChunk::Empty) => {
                     Ok((Some(Part::SectionEnd(Section::Changeset)), State::Manifest))
@@ -128,32 +135,77 @@ impl Cg2Unpacker {
                     State::Changeset,
                 )),
             },
-            State::Manifest => match Self::decode_chunk(buf)? {
+            State::Manifest => match self.decode_chunk(buf)? {
                 None => Ok((None, State::Manifest)),
                 Some(CgChunk::Empty) => {
-                    Ok((Some(Part::SectionEnd(Section::Manifest)), State::Filename))
+                    let next = if self.version == CgVersion::V3 {
+                        State::Treemanifest
+                    } else {
+                        State::Filename
+                    };
+                    Ok((Some(Part::SectionEnd(Section::Manifest)), next))
                 }
                 Some(CgChunk::Delta(chunk)) => Ok((
                     Some(Part::CgChunk(Section::Manifest, chunk)),
                     State::Manifest,
                 )),
             },
+            State::Treemanifest => match Self::decode_filename(buf)? {
+                DecodeRes::None => Ok((None, State::Treemanifest)),
+                DecodeRes::Some(dir) => {
+                    let dir = match dir.as_slice().strip_suffix(b"/") {
+                        Some(dir) => Path::new(dir)?,
+                        None => bail!(ErrorKind::Cg2Decode(
+                            "directory manifest name has no trailing '/'".into()
+                        )),
+                    };
+                    self.decode_tree_chunk(buf, dir)
+                }
+                // The empty chunk ending the directory manifests; files follow.
+                DecodeRes::End => {
+                    self.state = State::Filename;
+                    self.decode_next(buf)
+                }
+            },
+            State::Tree(dir) => self.decode_tree_chunk(buf, dir),
             State::Filename => {
                 let filename = Self::decode_filename(buf)?;
                 match filename {
                     DecodeRes::None => Ok((None, State::Filename)),
-                    DecodeRes::Some(f) => Self::decode_filelog_chunk(buf, f),
+                    DecodeRes::Some(f) => self.decode_filelog_chunk(buf, f),
                     DecodeRes::End => Ok((Some(Part::End), State::End)),
                 }
             }
-            State::Filelog(filename) => Self::decode_filelog_chunk(buf, filename),
+            State::Filelog(filename) => self.decode_filelog_chunk(buf, filename),
             State::End => Ok((None, State::End)),
             State::Invalid => Err(ErrorKind::Cg2Decode("byte stream corrupt".into())),
         }
     }
 
-    fn decode_filelog_chunk(buf: &mut BytesMut, f: Path) -> Result<(Option<Part>, State)> {
-        match Self::decode_chunk(buf)? {
+    fn decode_tree_chunk(
+        &mut self,
+        buf: &mut BytesMut,
+        dir: Path,
+    ) -> Result<(Option<Part>, State)> {
+        match self.decode_chunk(buf)? {
+            None => Ok((None, State::Tree(dir))),
+            Some(CgChunk::Empty) => Ok((
+                Some(Part::SectionEnd(Section::Treemanifest(dir))),
+                State::Treemanifest,
+            )),
+            Some(CgChunk::Delta(chunk)) => Ok((
+                Some(Part::CgChunk(Section::Treemanifest(dir.clone()), chunk)),
+                State::Tree(dir),
+            )),
+        }
+    }
+
+    fn decode_filelog_chunk(
+        &mut self,
+        buf: &mut BytesMut,
+        f: Path,
+    ) -> Result<(Option<Part>, State)> {
+        match self.decode_chunk(buf)? {
             None => Ok((None, State::Filelog(f))),
             Some(CgChunk::Empty) => {
                 Ok((Some(Part::SectionEnd(Section::Filelog(f))), State::Filename))
@@ -165,7 +217,7 @@ impl Cg2Unpacker {
         }
     }
 
-    fn decode_chunk(buf: &mut BytesMut) -> Result<Option<CgChunk>> {
+    fn decode_chunk(&mut self, buf: &mut BytesMut) -> Result<Option<CgChunk>> {
         if buf.len() < 4 {
             return Ok(None);
         }
@@ -176,12 +228,15 @@ impl Cg2Unpacker {
         let chunk_len = chunk_len as usize;
         if chunk_len == 0 {
             let _ = buf.drain_i32();
+            self.prev_node = None;
             return Ok(Some(CgChunk::Empty));
         }
-        if chunk_len < CHUNK_HEADER_LEN {
+        // The last 4 is for the length field itself.
+        let header_len = self.version.header_len() + 4;
+        if chunk_len < header_len {
             let msg = format!(
                 "invalid chunk: length >= {} required, found {}",
-                CHUNK_HEADER_LEN, chunk_len
+                header_len, chunk_len
             );
             bail!(ErrorKind::Cg2Decode(msg));
         }
@@ -198,21 +253,32 @@ impl Cg2Unpacker {
         // p2: NodeHash (20 bytes) -- NULL_HASH if only 1 parent
         // base node: NodeHash (20 bytes) (new in changegroup2)
         // link node: NodeHash (20 bytes)
+        // flags: u16 (new in changegroup3)
         // ---
 
         let node = buf.drain_node();
         let p1 = buf.drain_node();
         let p2 = buf.drain_node();
-        let base = buf.drain_node();
+        let base = match self.version {
+            CgVersion::V1 => self.prev_node.unwrap_or(p1),
+            _ => buf.drain_node(),
+        };
         let linknode = buf.drain_node();
+        let flags = if self.version == CgVersion::V3 {
+            buf.drain_u16()
+        } else {
+            0
+        };
+        self.prev_node = Some(node);
 
-        let delta = Self::decode_delta(buf, chunk_len - CHUNK_HEADER_LEN)?;
+        let delta = Self::decode_delta(buf, chunk_len - header_len)?;
         Ok(Some(CgChunk::Delta(CgDeltaChunk {
             node,
             p1,
             p2,
             base,
             linknode,
+            flags,
             delta,
         })))
     }
@@ -293,6 +359,9 @@ enum CgChunk {
 enum State {
     Changeset,
     Manifest,
+    /// Version 03: expecting a directory manifest header or the empty chunk after them.
+    Treemanifest,
+    Tree(Path),
     Filename,
     Filelog(Path),
     End,

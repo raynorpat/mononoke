@@ -47,6 +47,7 @@ pub struct Cg2PartSequence {
     changesets_end: changegroup::Part,
     manifests: Vec<changegroup::Part>,
     manifests_end: changegroup::Part,
+    trees: Vec<(Vec<changegroup::Part>, changegroup::Part)>,
     filelogs: Vec<(Vec<changegroup::Part>, changegroup::Part)>,
     end: changegroup::Part,
 }
@@ -60,6 +61,12 @@ impl Cg2PartSequence {
                 .chain(iter::once(&self.changesets_end))
                 .chain(self.manifests.iter())
                 .chain(iter::once(&self.manifests_end))
+                .chain(
+                    self.trees
+                        .iter()
+                        .filter(|entry| !entry.0.is_empty())
+                        .flat_map(|entry| entry.0.iter().chain(iter::once(&entry.1))),
+                )
                 .chain(
                     self.filelogs
                         .iter()
@@ -85,6 +92,38 @@ impl Cg2PartSequence {
     }
 }
 
+impl Cg2PartSequence {
+    /// Restrict the sequence to what `version` can carry: 02 has no directory
+    /// manifests or flags, and 01 also has no base (it is the previous node of
+    /// the group, or p1 for the first).
+    pub fn for_version(mut self, version: changegroup::CgVersion) -> Self {
+        use changegroup::{CgVersion, Part};
+
+        if version != CgVersion::V3 {
+            self.trees.clear();
+        }
+        let groups = iter::once(&mut self.changesets)
+            .chain(iter::once(&mut self.manifests))
+            .chain(self.trees.iter_mut().map(|t| &mut t.0))
+            .chain(self.filelogs.iter_mut().map(|f| &mut f.0));
+        for group in groups {
+            let mut prev = None;
+            for part in group {
+                if let Part::CgChunk(_, chunk) = part {
+                    if version != CgVersion::V3 {
+                        chunk.flags = 0;
+                    }
+                    if version == CgVersion::V1 {
+                        chunk.base = prev.unwrap_or(chunk.p1);
+                    }
+                    prev = Some(chunk.node);
+                }
+            }
+        }
+        self
+    }
+}
+
 impl PartialEq<[changegroup::Part]> for Cg2PartSequence {
     fn eq(&self, other: &[changegroup::Part]) -> bool {
         self.as_iter().eq(other.iter())
@@ -101,6 +140,14 @@ impl Arbitrary for Cg2PartSequence {
         let changesets = gen_parts(Section::Changeset, g);
         let manifests = gen_parts(Section::Manifest, g);
 
+        let ntrees = gen_range(g, 0, size);
+        let mut trees = Vec::with_capacity(ntrees);
+        for _ in 0..ntrees {
+            let path = arbitrary_path(g);
+            let section_end = Part::SectionEnd(Section::Treemanifest(path.clone()));
+            trees.push((gen_parts(Section::Treemanifest(path), g), section_end));
+        }
+
         let nfilelogs = gen_range(g, 0, size);
         let mut filelogs = Vec::with_capacity(nfilelogs);
 
@@ -115,6 +162,7 @@ impl Arbitrary for Cg2PartSequence {
             changesets_end: Part::SectionEnd(Section::Changeset),
             manifests,
             manifests_end: Part::SectionEnd(Section::Manifest),
+            trees,
             filelogs,
             end: Part::End,
         }
@@ -134,6 +182,7 @@ impl Arbitrary for Cg2PartSequence {
             )
                 .shrink()
                 .map(|(c, m, f)| Cg2PartSequence {
+                    trees: Vec::new(),
                     changesets: c,
                     changesets_end: Part::SectionEnd(Section::Changeset),
                     manifests: m,
@@ -186,6 +235,7 @@ impl Arbitrary for changegroup::CgDeltaChunk {
             p2: arbitrary_node(g),
             base: arbitrary_node(g),
             linknode: arbitrary_node(g),
+            flags: u16::arbitrary(g),
             delta: arbitrary_delta(g),
         }
     }
@@ -200,6 +250,7 @@ impl Arbitrary for changegroup::CgDeltaChunk {
                 p2: clone.p2,
                 base: clone.base,
                 linknode: clone.linknode,
+                flags: clone.flags,
                 delta,
             }),
         )

@@ -255,6 +255,7 @@ fn append_group(
                 p2,
                 base,
                 linknode: _,
+                flags: _,
                 delta,
             } = chunk;
             // Keep the client's delta when it is against a revision we have.
@@ -288,6 +289,7 @@ fn revlog_for(repo: &RevlogRepo, section: &Section) -> Result<Revlog> {
         Section::Changeset => Ok(repo.changelog_revlog()),
         Section::Manifest => Ok(repo.manifest_revlog()),
         Section::Filelog(path) => Ok(repo.file_revlog_for_append(path)?),
+        Section::Treemanifest(_) => Err("directory manifests are not accepted yet".into()),
     }
 }
 

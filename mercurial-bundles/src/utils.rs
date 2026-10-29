@@ -37,6 +37,7 @@ impl SplitTo for BytesMut {
 
 pub trait BytesExt {
     fn drain_u8(&mut self) -> u8;
+    fn drain_u16(&mut self) -> u16;
     fn drain_u32(&mut self) -> u32;
     fn drain_i32(&mut self) -> i32;
     fn drain_str(&mut self, len: usize) -> Result<String>;
@@ -53,6 +54,11 @@ where
     #[inline]
     fn drain_u8(&mut self) -> u8 {
         self.split_to(1)[0]
+    }
+
+    #[inline]
+    fn drain_u16(&mut self) -> u16 {
+        BigEndian::read_u16(self.split_to(2).as_ref())
     }
 
     #[inline]

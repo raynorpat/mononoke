@@ -14,18 +14,28 @@ use futures::Stream;
 use crate::chunk::Chunk;
 use crate::errors::*;
 
-use super::{CgDeltaChunk, Part, Section};
+use super::{CgDeltaChunk, CgVersion, Part, Section};
 
 pub struct Cg2Packer<S> {
     delta_stream: S,
     last_seen: Section,
+    version: CgVersion,
+    /// Version 03: whether the empty chunk ending the directory manifests has
+    /// been written.
+    trees_closed: bool,
 }
 
 impl<S> Cg2Packer<S> {
     pub fn new(delta_stream: S) -> Self {
+        Self::with_version(delta_stream, CgVersion::V2)
+    }
+
+    pub fn with_version(delta_stream: S, version: CgVersion) -> Self {
         Cg2Packer {
             delta_stream,
             last_seen: Section::Changeset,
+            version,
+            trees_closed: version != CgVersion::V3,
         }
     }
 }
@@ -44,7 +54,16 @@ where
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err.into()))),
             Poll::Ready(Some(Ok(Part::CgChunk(section, delta_chunk)))) => {
-                let mut builder = ChunkBuilder::new();
+                if matches!(section, Section::Treemanifest(_)) && this.version != CgVersion::V3 {
+                    return Poll::Ready(Some(Err(ErrorKind::Bundle2Encode(
+                        "directory manifests need changegroup 03".into(),
+                    ))));
+                }
+                let mut builder = ChunkBuilder::new(this.version);
+                if matches!(section, Section::Filelog(_)) && !this.trees_closed {
+                    builder.close_trees();
+                    this.trees_closed = true;
+                }
                 if this.last_seen != section {
                     builder.encode_section(&section);
                     this.last_seen = section;
@@ -55,7 +74,15 @@ where
             Poll::Ready(Some(Ok(Part::SectionEnd(_section)))) => {
                 Poll::Ready(Some(Ok(empty_cg_chunk())))
             }
-            Poll::Ready(Some(Ok(Part::End))) => Poll::Ready(Some(Ok(empty_cg_chunk()))),
+            Poll::Ready(Some(Ok(Part::End))) => {
+                if this.trees_closed {
+                    Poll::Ready(Some(Ok(empty_cg_chunk())))
+                } else {
+                    this.trees_closed = true;
+                    // The end of the directory manifests, then the end of the files.
+                    Poll::Ready(Some(Chunk::new(vec![0; 8])))
+                }
+            }
         }
     }
 }
@@ -69,38 +96,50 @@ fn empty_cg_chunk() -> Chunk {
 }
 
 struct ChunkBuilder {
+    version: CgVersion,
     inner: Vec<u8>,
     len_offset: usize,
 }
 
 impl ChunkBuilder {
-    pub fn new() -> Self {
+    pub fn new(version: CgVersion) -> Self {
         ChunkBuilder {
+            version,
             // Reserve four bytes in the beginning for the length.
             inner: vec![0, 0, 0, 0],
             len_offset: 0,
         }
     }
 
+    /// Put the empty chunk that ends the directory manifests in front of the
+    /// first file section. Must be called before anything else.
+    pub fn close_trees(&mut self) -> &mut Self {
+        self.inner = vec![0; 8];
+        self.len_offset = 4;
+        self
+    }
+
     /// Encode the beginning of a section. This should always happen before any
     /// delta chunks are encoded.
     pub fn encode_section(&mut self, section: &Section) -> &mut Self {
-        assert_eq!(
-            self.inner.len(),
-            4,
-            "encode_section must only be called once at the start"
-        );
         // Changeset and manifest sections are implicitly encoded, so we don't
         // need to do anything there.
-        // TODO: will need to encode tree manifests here as well
-        if let Section::Filelog(f) = section {
-            // Note that the filename length must include the four bytes for itself.
-            BigEndian::write_i32(&mut self.inner[0..], (f.len() + 4) as i32);
-            self.inner.put_slice(f.as_slice());
-            // Add four more bytes for the start of the section.
-            self.len_offset = self.inner.len();
-            self.inner.put_slice(&[0, 0, 0, 0]);
-        }
+        let (name, suffix): (_, &[u8]) = match section {
+            Section::Filelog(f) => (f, b""),
+            Section::Treemanifest(d) => (d, b"/"),
+            _ => return self,
+        };
+        // Note that the filename length must include the four bytes for itself.
+        let at = self.len_offset;
+        BigEndian::write_i32(
+            &mut self.inner[at..],
+            (name.len() + suffix.len() + 4) as i32,
+        );
+        self.inner.put_slice(name.as_slice());
+        self.inner.put_slice(suffix);
+        // Add four more bytes for the start of the section.
+        self.len_offset = self.inner.len();
+        self.inner.put_slice(&[0, 0, 0, 0]);
         self
     }
 
@@ -108,8 +147,13 @@ impl ChunkBuilder {
         self.inner.put_slice(chunk.node.as_ref());
         self.inner.put_slice(chunk.p1.as_ref());
         self.inner.put_slice(chunk.p2.as_ref());
-        self.inner.put_slice(chunk.base.as_ref());
+        if self.version != CgVersion::V1 {
+            self.inner.put_slice(chunk.base.as_ref());
+        }
         self.inner.put_slice(chunk.linknode.as_ref());
+        if self.version == CgVersion::V3 {
+            self.inner.put_u16(chunk.flags);
+        }
 
         for fragment in chunk.delta.fragments() {
             self.inner.put_i32(fragment.start as i32);

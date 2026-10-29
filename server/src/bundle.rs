@@ -302,6 +302,7 @@ fn stored_revision(
                     p2,
                     base,
                     linknode,
+                    flags: 0,
                     delta: Delta::new(fragments).map_err(|err| Error::from(err.to_string()))?,
                 },
             ))
@@ -365,6 +366,7 @@ fn fulltext_chunk(
             p2,
             base: NULL_HASH,
             linknode,
+            flags: 0,
             delta: fulltext_delta(text)?,
         },
     ))

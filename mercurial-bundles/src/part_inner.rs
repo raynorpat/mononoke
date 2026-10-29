@@ -22,7 +22,7 @@ use tokio::io::AsyncRead;
 use tokio_util::codec::Decoder;
 
 use crate::bail;
-use crate::changegroup;
+use crate::changegroup::{self, CgVersion};
 use crate::errors::*;
 use crate::part_header::PartHeader;
 use crate::part_outer::{OuterFrame, OuterStream};
@@ -79,9 +79,7 @@ impl<R> StreamWrapper<PayloadTake<R>> for PayloadBytes<R> {
 }
 
 enum PayloadDecode<R> {
-    Cg2(
-        futures_ext::decode::LayeredDecode<PayloadBytes<R>, changegroup::unpacker::Cg2Unpacker>,
-    ),
+    Cg2(futures_ext::decode::LayeredDecode<PayloadBytes<R>, changegroup::unpacker::Cg2Unpacker>),
     CheckHeads(futures_ext::decode::LayeredDecode<PayloadBytes<R>, CheckHeadsDecoder>),
     Skip(futures_ext::decode::LayeredDecode<PayloadBytes<R>, SkipDecoder>),
 }
@@ -190,6 +188,17 @@ pub fn validate_header(header: PartHeader) -> Result<Option<PartHeader>> {
                     unknown_params
                 ));
             }
+            let bad_version = header.part_type_lower().as_str() == "changegroup"
+                && header
+                    .mparams()
+                    .get("version")
+                    .is_some_and(|v| CgVersion::from_param(v).is_none());
+            if bad_version {
+                bail!(ErrorKind::BundleUnknownPartParams(
+                    header.part_type().to_ascii_string(),
+                    vec!["version".to_string()]
+                ));
+            }
             Ok(Some(header))
         }
         None => {
@@ -214,9 +223,20 @@ where
         inner: stream.take_while_wrapper(is_payload as PayloadPred),
     };
     let inner = match header.part_type_lower().as_str() {
-        "changegroup" => PayloadDecode::Cg2(bytes.decode(changegroup::unpacker::Cg2Unpacker::new(
-            logger.new(o!("stream" => "cg2")),
-        ))),
+        "changegroup" => {
+            // validate_header rejected unknown versions; no version means 01.
+            let version = header
+                .mparams()
+                .get("version")
+                .and_then(|v| CgVersion::from_param(v))
+                .unwrap_or(CgVersion::V1);
+            PayloadDecode::Cg2(
+                bytes.decode(changegroup::unpacker::Cg2Unpacker::with_version(
+                    logger.new(o!("stream" => "cg2")),
+                    version,
+                )),
+            )
+        }
         "check:heads" => PayloadDecode::CheckHeads(bytes.decode(CheckHeadsDecoder)),
         // Pushkey data is in the part header. Other recognized parts are not stored.
         _ => PayloadDecode::Skip(bytes.decode(SkipDecoder)),

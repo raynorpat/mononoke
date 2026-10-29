@@ -388,6 +388,7 @@ fn changegroup_part_emits_cg02_fulltext() {
                 p2: NULL_HASH,
                 base: NULL_HASH,
                 linknode: node,
+                flags: 0,
                 delta,
             },
         ),

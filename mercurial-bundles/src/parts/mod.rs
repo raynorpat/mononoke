@@ -7,7 +7,7 @@
 use bytes::Bytes;
 use futures::{Stream, TryFutureExt, TryStreamExt};
 
-use crate::changegroup::{self, packer::Cg2Packer};
+use crate::changegroup::{self, packer::Cg2Packer, CgVersion};
 use crate::errors::*;
 use crate::part_encode::PartEncodeBuilder;
 
@@ -47,8 +47,17 @@ where
     S: Stream<Item = std::result::Result<changegroup::Part, E>> + Send + Unpin + 'static,
     Error: From<E>,
 {
+    changegroup_part_version(chunks, CgVersion::V2)
+}
+
+/// Like `changegroup_part`, for the given changegroup version.
+pub fn changegroup_part_version<S, E>(chunks: S, version: CgVersion) -> Result<PartEncodeBuilder>
+where
+    S: Stream<Item = std::result::Result<changegroup::Part, E>> + Send + Unpin + 'static,
+    Error: From<E>,
+{
     let mut builder = PartEncodeBuilder::mandatory("changegroup")?;
-    builder.add_mparam("version", "02")?;
-    builder.set_data_generated(Cg2Packer::new(chunks));
+    builder.add_mparam("version", version.param())?;
+    builder.set_data_generated(Cg2Packer::with_version(chunks, version));
     Ok(builder)
 }
