@@ -42,6 +42,11 @@ pub(super) fn parse_docket(bytes: &[u8]) -> Option<Docket> {
     })
 }
 
+/// The uid a `.n` docket names its data file by.
+pub fn docket_uid(bytes: &[u8]) -> Option<Vec<u8>> {
+    parse_docket(bytes).map(|docket| docket.uid)
+}
+
 #[derive(Debug)]
 pub(super) struct PersistentNodeMap {
     pub trie: Datafile,

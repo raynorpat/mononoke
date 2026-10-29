@@ -1502,3 +1502,160 @@ fn commit_made_with_hg_while_serving_is_served() {
     assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), tip_node);
     drop(server);
 }
+
+/// Clients must ask for a nodemap too, or Mercurial drops the streamed one.
+const SLOW_NODEMAP: [&str; 4] = [
+    "--config",
+    "storage.revlog.persistent-nodemap.slow-path=allow",
+    "--config",
+    "format.use-persistent-nodemap=true",
+];
+
+fn hg_nm(repo: &Path, args: &[&str]) -> Output {
+    let all: Vec<&str> = args.iter().copied().chain(SLOW_NODEMAP).collect();
+    hg(repo, &all)
+}
+
+fn hg_ssh_nm(dir: &Path, args: &[&str], shim: &Path) -> Output {
+    let all: Vec<&str> = args.iter().copied().chain(SLOW_NODEMAP).collect();
+    hg_ssh(dir, &all, shim)
+}
+
+/// Repo with Mercurial 7.0's default formats and a persistent nodemap, a
+/// changelog of 3000 revisions (a nodemap is only written for a non-inline
+/// revlog) and one real commit with a file.
+fn init_nodemap_repo(root: &Path) -> PathBuf {
+    let repo = root.join("repo");
+    let mut init = Command::new("hg");
+    init.current_dir(root)
+        .args(["init", "repo"])
+        .args(SLOW_NODEMAP)
+        .env("HGPLAIN", "1")
+        .env("HGRCPATH", "");
+    assert_hg(
+        &output_timeout(&mut init, Duration::from_secs(120)),
+        "hg init",
+    );
+    assert_hg(&hg_nm(&repo, &["debugbuilddag", "+3000"]), "debugbuilddag");
+    fs::write(repo.join("a.txt"), b"alpha\n").expect("write a.txt");
+    assert_hg(&hg_nm(&repo, &["add", "a.txt"]), "hg add");
+    assert_hg(
+        &hg_nm(&repo, &["commit", "-m", "first", "-u", "test"]),
+        "hg commit",
+    );
+    assert!(
+        repo.join(".hg/store/00changelog.n").exists(),
+        "hg wrote no changelog nodemap"
+    );
+    repo
+}
+
+/// The server never writes a nodemap, so it lags behind pushes until hg updates it.
+fn assert_nodemap_repo_sound(repo: &Path, what: &str) {
+    assert_hg(&hg_nm(repo, &["debugupdatecaches"]), what);
+    assert_hg(&hg_nm(repo, &["verify"]), what);
+    assert_hg(&hg_nm(repo, &["debugnodemap", "--check"]), what);
+}
+
+#[test]
+fn nodemap_repo_clones_pulls_and_pushes() {
+    let temp = TempDir::new("nm");
+    let repo = init_nodemap_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let ssh_url = "ssh://user@dummy/repo";
+
+    let ssh_stream = hg_ssh_nm(&temp.0, &["clone", ssh_url, "ssh-stream"], &shim);
+    assert_hg(&ssh_stream, "ssh stream clone");
+    assert!(
+        String::from_utf8_lossy(&ssh_stream.stdout).contains("streaming all changes"),
+        "not streamed"
+    );
+    assert!(
+        temp.0.join("ssh-stream/.hg/store/00changelog.n").exists(),
+        "stream clone has no changelog nodemap"
+    );
+    assert_hg(&hg_nm(&temp.0.join("ssh-stream"), &["verify"]), "verify");
+    assert_hg(
+        &hg_ssh_nm(&temp.0, &["clone", "--pull", ssh_url, "ssh-pull"], &shim),
+        "ssh pull clone",
+    );
+    assert_hg(
+        &hg_nm(&temp.0, &["clone", &url, "http-stream"]),
+        "http stream clone",
+    );
+    assert!(
+        temp.0.join("http-stream/.hg/store/00changelog.n").exists(),
+        "stream clone has no changelog nodemap"
+    );
+    assert_hg(
+        &hg_nm(&temp.0, &["clone", "--pull", &url, "http-pull"]),
+        "http pull clone",
+    );
+
+    for (label, dir, over_ssh) in [
+        ("ssh", "ssh-stream", true),
+        ("http", "http-pull", false),
+    ] {
+        let clone = temp.0.join(dir);
+        assert_hg(&hg_nm(&clone, &["pull", "-u", &url]), "pull");
+        fs::write(clone.join(format!("{label}.txt")), label).expect("write");
+        assert_hg(&hg_nm(&clone, &["add", &format!("{label}.txt")]), "add");
+        assert_hg(
+            &hg_nm(&clone, &["commit", "-m", label, "-u", "test"]),
+            "commit",
+        );
+        let push = if over_ssh {
+            hg_ssh_nm(&clone, &["push"], &shim)
+        } else {
+            hg_nm(&clone, &["push", &url])
+        };
+        assert!(
+            push.status.success(),
+            "{label} push failed:\n{}\n{}\nmononoke:\n{}",
+            String::from_utf8_lossy(&push.stdout),
+            String::from_utf8_lossy(&push.stderr),
+            read_log(&log)
+        );
+    }
+    drop(server);
+    assert_nodemap_repo_sound(&repo, "served repo after pushes");
+}
+
+#[test]
+fn nodemap_repo_commit_while_serving_is_served() {
+    let temp = TempDir::new("nc");
+    let repo = init_nodemap_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    assert_hg(&hg_nm(&temp.0, &["clone", &url, "before"]), "first clone");
+
+    fs::write(repo.join("outside.txt"), b"outside\n").expect("write");
+    assert_hg(&hg_nm(&repo, &["add", "outside.txt"]), "hg add");
+    assert_hg(
+        &hg_nm(&repo, &["commit", "-m", "outside", "-u", "test"]),
+        "hg commit",
+    );
+    let tip = hg_nm(&repo, &["log", "-r", "tip", "-T", "{node}"]);
+    assert_hg(&tip, "tip");
+    let tip_node = String::from_utf8_lossy(&tip.stdout).trim().to_owned();
+
+    assert_hg(&hg_nm(&temp.0.join("before"), &["pull", &url]), "pull");
+    let got = hg_nm(&temp.0.join("before"), &["log", "-r", "tip", "-T", "{node}"]);
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), tip_node);
+
+    assert_hg(&hg_nm(&temp.0, &["clone", &url, "after"]), "second clone");
+    let after = temp.0.join("after");
+    assert_hg(&hg_nm(&after, &["verify"]), "verify second clone");
+    let got = hg_nm(&after, &["log", "-r", "tip", "-T", "{node}"]);
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout).trim(),
+        tip_node,
+        "mononoke:\n{}",
+        read_log(&log)
+    );
+    drop(server);
+}

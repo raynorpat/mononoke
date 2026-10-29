@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::StreamExt;
+use mercurial::revlog::docket_uid;
 use mercurial::revlogrepo::Required;
 use mercurial::RevlogRepo;
 use mercurial_bundles::part_encode::PartEncodeBuilder;
@@ -40,6 +41,8 @@ pub struct StoreFile {
     name: Vec<u8>,
     path: PathBuf,
     size: u64,
+    /// Contents read while listing, for files `hg` replaces or deletes (the nodemap).
+    data: Option<Bytes>,
 }
 
 /// The `streamreqs` capability value, or `None` when this repo cannot be listed
@@ -62,6 +65,7 @@ pub fn stream_requirements(repo: &RevlogRepo) -> Option<String> {
                     | Required::ShareSafe
                     | Required::DirstateV2
                     | Required::DirstateTrackedKeyV1
+                    | Required::PersistentNodemap
             )
         })
         .map(ToString::to_string)
@@ -130,26 +134,43 @@ pub fn list_store(repo: &RevlogRepo) -> Result<Vec<StoreFile>> {
                 name,
                 path: store.join(rel),
                 size,
+                data: None,
             });
         }
     }
 
-    for name in [
-        "00manifest.i",
-        "00manifest.d",
-        "00changelog.i",
-        "00changelog.d",
-    ] {
-        let path = store.join(name);
-        match fs::metadata(&path) {
-            Ok(meta) => files.push(StoreFile {
-                name: name.as_bytes().to_vec(),
-                path,
-                size: meta.len(),
-            }),
-            // An inline revlog has no `.d`.
-            Err(err) if err.kind() == io::ErrorKind::NotFound && name.ends_with(".d") => {}
-            Err(err) => return Err(err.into()),
+    // Per revlog in Mercurial's order: `.n`, `.nd`, `.d`, then `.i` last.
+    for stem in ["00manifest", "00changelog"] {
+        // `hg` replaces the docket by rename and deletes the old data file, so
+        // both are read now, under the store lock.
+        if let Ok(docket) = fs::read(store.join(format!("{stem}.n"))) {
+            let uid = docket_uid(&docket)
+                .ok_or_else(|| Error::from(format!("stream clone: bad {stem}.n docket")))?;
+            let data_name = format!("{stem}-{}.nd", String::from_utf8_lossy(&uid));
+            let nodemap = fs::read(store.join(&data_name))?;
+            for (name, bytes) in [(format!("{stem}.n"), docket), (data_name, nodemap)] {
+                files.push(StoreFile {
+                    path: store.join(&name),
+                    size: bytes.len() as u64,
+                    name: name.into_bytes(),
+                    data: Some(Bytes::from(bytes)),
+                });
+            }
+        }
+        for ext in ["d", "i"] {
+            let name = format!("{stem}.{ext}");
+            let path = store.join(&name);
+            match fs::metadata(&path) {
+                Ok(meta) => files.push(StoreFile {
+                    name: name.into_bytes(),
+                    path,
+                    size: meta.len(),
+                    data: None,
+                }),
+                // An inline revlog has no `.d`.
+                Err(err) if err.kind() == io::ErrorKind::NotFound && ext == "d" => {}
+                Err(err) => return Err(err.into()),
+            }
         }
     }
     Ok(files)
@@ -229,7 +250,9 @@ fn send_files(files: &[StoreFile], send: &mut dyn FnMut(Bytes) -> Result<()>) ->
     read_in_order(
         files,
         |file| {
-            if file.size as usize <= PIECE {
+            if let Some(data) = &file.data {
+                Ok(Some(data.to_vec()))
+            } else if file.size as usize <= PIECE {
                 read_listed(file).map(Some)
             } else {
                 Ok(None)
@@ -336,6 +359,7 @@ mod tests {
             name: b"data/short.i".to_vec(),
             path,
             size: 5,
+            data: None,
         };
         let err = read_listed(&file).expect_err("short read");
         assert_eq!(
@@ -349,6 +373,30 @@ mod tests {
         })
         .expect_err("short piece");
         assert!(err.to_string().starts_with("clone could only read 3 bytes"));
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn stream_requirements_skip_persistent_nodemap() {
+        let dir = std::env::temp_dir().join(format!("mononoke-streamreqs-{}", std::process::id()));
+        fs::create_dir_all(dir.join("store")).expect("store");
+        fs::write(
+            dir.join("requires"),
+            "store
+fncache
+revlogv1
+generaldelta
+persistent-nodemap
+",
+        )
+        .expect("requires");
+        fs::write(dir.join("store").join("00changelog.i"), b"").expect("changelog");
+        fs::write(dir.join("store").join("00manifest.i"), b"").expect("manifest");
+        let repo = RevlogRepo::open(&dir).expect("open");
+        assert_eq!(
+            stream_requirements(&repo).as_deref(),
+            Some("generaldelta,revlogv1")
+        );
         fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

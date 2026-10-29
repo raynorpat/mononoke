@@ -29,6 +29,7 @@ mod nodemap;
 mod test;
 
 use self::parser::{Entry, Header, Version};
+pub use self::nodemap::docket_uid;
 pub use self::revidx::RevIdx;
 
 #[derive(Debug)]

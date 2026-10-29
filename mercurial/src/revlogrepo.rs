@@ -47,6 +47,7 @@ pub enum Required {
     RevlogCompressionZstd,
     ShareSafe,
     SparseRevlog,
+    PersistentNodemap,
     /// Working-copy formats only. The server never reads a dirstate.
     DirstateV2,
     DirstateTrackedKeyV1,
@@ -69,6 +70,7 @@ impl Display for Required {
             Required::RevlogCompressionZstd => "revlog-compression-zstd",
             Required::ShareSafe => "share-safe",
             Required::SparseRevlog => "sparserevlog",
+            Required::PersistentNodemap => "persistent-nodemap",
             Required::DirstateV2 => "dirstate-v2",
             Required::DirstateTrackedKeyV1 => "dirstate-tracked-key-v1",
         };
@@ -95,6 +97,7 @@ impl FromStr for Required {
             "revlog-compression-zstd" => Ok(Required::RevlogCompressionZstd),
             "share-safe" => Ok(Required::ShareSafe),
             "sparserevlog" => Ok(Required::SparseRevlog),
+            "persistent-nodemap" => Ok(Required::PersistentNodemap),
             "dirstate-v2" => Ok(Required::DirstateV2),
             "dirstate-tracked-key-v1" => Ok(Required::DirstateTrackedKeyV1),
             unk => Err(ErrorKind::UnknownReq(unk.into()).into()),
@@ -165,6 +168,10 @@ impl RevlogRepo {
         }
         if req.contains(&Required::Treemanifest) {
             return Err("treemanifest is not served".into());
+        }
+        if req.contains(&Required::PersistentNodemap) {
+            changelog.use_persistent_nodemap()?;
+            manifest.use_persistent_nodemap()?;
         }
 
         Ok(RevlogRepo {
@@ -511,6 +518,11 @@ mod test {
             .expect_err("treemanifest");
         let msg = err.to_string();
         assert!(msg.contains("treemanifest is not served"), "{}", msg);
+    }
+
+    #[test]
+    fn persistent_nodemap_requirement_opens() {
+        open_requires("nodemap", &["store", "revlogv1", "persistent-nodemap"]).expect("open");
     }
 
     #[test]
