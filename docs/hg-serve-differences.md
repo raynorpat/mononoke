@@ -70,13 +70,17 @@ served, but only by changegroup.
 ### Wire protocol commands
 
 Implemented: `capabilities`, `hello`, `batch`, `heads`, `known`, `branchmap`,
-`between`, `getbundle`, `listkeys`, `pushkey` and `unbundle`.
+`between`, `getbundle`, `listkeys`, `lookup`, `pushkey` and `unbundle`.
+
+`getbundle` honours `heads`, so `hg clone -r` and `hg pull -r` get only the
+requested changesets and their ancestors.
 
 Not implemented or partial:
 
-- `lookup` is advertised, but returns an "unimplemented" error. Client
-  commands that resolve a name or hash on the server fail, for example
-  `hg pull -r <rev>` and `hg clone -r <rev>`.
+- `lookup` resolves what a remote usually asks for: `null`, `tip`, revision
+  numbers (negative ones count from the end), full hashes, unique hash
+  prefixes and bookmarks. It does not resolve tags, branch names or `.`, so
+  `hg clone -r v1.0` or `hg pull -r stable` fail with "unknown revision".
 - `branchmap` puts every head under `default`. Named branches are not
   reported.
 - `changegroup` and `changegroupsubset` (pre-bundle2 clients) return nothing.
@@ -94,10 +98,13 @@ Not implemented or partial:
 ### Pushes
 
 - A push is checked against `check:heads` and applied as one unit. Pushes to
-  one repository take turns.
-- Each pushed revision is written as a full-text snapshot (compressed), not as
-  a delta. Pushed history uses more disk than the same history committed with
-  `hg`. Clones and pulls are not affected.
+  one repository take turns, and each takes Mercurial's locks (see below).
+- A pushed revision keeps the client's delta when that delta is against a
+  revision the server has, compresses smaller than the full text, and keeps
+  the delta chain within 1,000 deltas and twice the text's size. Otherwise it
+  is stored as a compressed full text, as Mercurial does in the same cases.
+  Unlike Mercurial, the server does not search for a better delta base than
+  the one the client used.
 - New filelogs get Mercurial fncache entries, so `hg verify` passes on a pushed
   repository.
 - There is no pushrebase. A push that is not a fast-forward of the server's
@@ -105,10 +112,23 @@ Not implemented or partial:
 
 ### Writing to a served repository
 
-The server assumes it is the only writer. It does not take Mercurial's
-`.hg/store/lock`, and it keeps revlogs and the stream-clone listing in memory.
-Do not commit or push into a served repository with `hg` while the server is
-running. Stop the server, make the change, then start the server again.
+`hg` can commit, push, strip or tag in a served repository while the server
+runs:
+
+- The server takes Mercurial's own locks: `.hg/wlock` and then
+  `.hg/store/lock` for a push or a bookmark change, and `.hg/store/lock` while
+  it lists the store for a stream clone. While `hg` holds a lock the server
+  waits, up to Mercurial's default 600 seconds. `hg` waits for the server in
+  the same way.
+- Before each request the server checks the size and modification time of
+  the changelog files. If something else changed them, it reloads the
+  repository and lists the store again for the next stream clone.
+
+If the server is killed while it holds a lock, the lock file stays behind and
+pushes and `hg` commands wait for it. Remove it with
+`hg debuglocks --force-free-lock` (or `--force-free-wlock`) once no `hg` or server
+process is writing. A clone or pull that is running while `hg strip` removes
+revisions can fail; run it again.
 
 ### Performance behaviour
 

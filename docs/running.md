@@ -73,8 +73,8 @@ one `mononoke` per repository on different ports.
 
 The server runs in the foreground until stopped. Use your init system (systemd,
 a Windows service wrapper, and so on) to keep it running and to capture stdout.
-Stop the server before changing a served repository with `hg`, then start it
-again (see [hg-serve-differences.md](hg-serve-differences.md#writing-to-a-served-repository)).
+`hg` can still work in a served repository while the server runs (see
+[hg-serve-differences.md](hg-serve-differences.md#writing-to-a-served-repository)).
 
 ## Clients over HTTP and HTTPS
 
@@ -137,10 +137,19 @@ hg push -B mybookmark        # push and move a bookmark
 A push is rejected if the server's heads changed since the client last pulled,
 as with `hg serve`. Pull, merge or rebase, and push again.
 
+To clone or pull part of the history, name a revision. The server resolves
+hashes, hash prefixes, revision numbers, `tip` and bookmarks, but not tags or
+branch names:
+
+```sh
+hg clone -r mybookmark http://server:8000/ partial
+hg pull -r 1a2b3c4d
+```
+
 ## Checking a served repository
 
-`hg verify` can run against a served repository. It only reads, but stop the
-server first if you want a result that reflects no in-flight push.
+`hg verify` can run against a served repository while the server runs. It takes
+the store lock, so a push waits for it to finish.
 
 ```sh
 hg -R REPODIR verify

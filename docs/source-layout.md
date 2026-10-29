@@ -22,11 +22,13 @@ list goes from the lowest layer up.
   `decodedir`), blobs, deltas, and bdiff. No I/O.
 - **`mercurial`**: reads and writes repositories on disk.
   - `revlog/`: revlog index and data parsing, reconstruction from delta
-    chains, zlib, zstd and lz4 decompression, and appending snapshots
-    (`append_snapshot`).
+    chains, zlib, zstd and lz4 decompression, appending revisions as deltas or
+    snapshots (`append_revision`), and reloading after an outside change.
   - `revlogrepo.rs`: `RevlogRepo`, a whole repository. It checks
     requirements, and opens the changelog, the manifest and filelogs
     (including hashed `dh/` paths). It also records fncache entries.
+  - `lock.rs`: Mercurial's lock files (`.hg/wlock`, `.hg/store/lock`), in the
+    format `hg` reads.
   - `changeset/`, `manifest/`, `file.rs`, `symlink.rs`: parse changesets,
     manifests and file revisions.
 - **`bookmarks`**, **`bookmarks/stockbookmarks`**: bookmark traits, and the
@@ -58,8 +60,9 @@ list goes from the lowest layer up.
   - `main.rs`: command-line options, one thread per repository, the ssh
     socket loop and the HTTP listeners.
   - `repo.rs`: `Repo` and `RepoClient`. Implements `HgCommands`:
-    capabilities, heads, known, getbundle, unbundle, bookmarks. Also the
-    push lock, the cached stream-clone listing, and the startup warm-up.
+    capabilities, heads, known, lookup, getbundle, unbundle, bookmarks. Also
+    takes Mercurial's locks for writes, reloads the repository when `hg`
+    changes it, keeps the cached stream-clone listing, and warms up at start.
   - `bundle.rs`: changegroup generation for `getbundle`. Finds the missing
     changesets from the changelog index, sends manifest and filelog revisions
     by linkrev, and reads filelogs in parallel (`read_in_order`).
