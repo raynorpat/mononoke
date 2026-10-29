@@ -1,7 +1,7 @@
 # Rust Mercurial client and shared repository engine
 
 Date: 2026-10-29
-Status: design for user approval; implementation has not started.
+Status: approved by the user on 2026-10-29; implementation has not started.
 
 ## Intent and agreed scope
 
@@ -429,9 +429,10 @@ copy, and shared-engine approach. The following are design-author proposals:
 - No daemon/watch service in release one; 256 MiB queued-payload budget,
   proposed Windows performance targets and benchmark methodology above.
 
-Approval of this design is required before implementation planning. The next
-artifact is a task-level implementation plan using the writing-plans workflow;
-no product code or dependency changes are authorized by this document alone.
+The user approved this design and requested implementation planning on
+2026-10-29. The next artifact is a task-level implementation plan using the
+writing-plans workflow; the current request is to write that plan, not to
+start product code or dependency changes.
 
 ## Design review
 
