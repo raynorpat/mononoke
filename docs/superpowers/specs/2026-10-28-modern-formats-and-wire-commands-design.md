@@ -128,9 +128,8 @@ Changegroup `03`:
   `hg serve` offers `03` for every repository. Mononoke does the same.
   The bundle2 `changegroup` capability lists the versions the repository
   can *receive* (`bundle2.getrepocaps` uses `supportedincomingversions`):
-  Mercurial lists `01,02,03` for both kinds. Mononoke lists `02,03` for
-  both, because receiving `01` pushes stays out of scope (no stock client
-  since bundle2 sends them). That's the author's call.
+  Mercurial lists `01,02,03` for both kinds, and Mononoke does the same,
+  so it accepts `01` pushes (see Part 2).
   `getbundle` picks from the versions it can *send*
   (`supportedoutgoingversions`), which for a treemanifest repository is
   only `03`.
@@ -200,6 +199,24 @@ Source to read: `wireprotov1server.py`, `scmutil.py` `revsymbol`,
   `mdiff.textdiff` from the installed `hg` on generated and real texts. Not offered for treemanifest
   repositories (Mercurial cannot make `01` from them); return an error
   there. Advertise `changegroupsubset` as Mercurial does.
+- **Receiving `01` pushes**: `unbundle` accepts a bundle2 changegroup part
+  with `version=01` (and a part with no `version`, which means `01`, as
+  `handlechangegroup` defaults). The `01` delta header is
+  `>20s20s20s20s` (node, p1, p2, linknode). The delta base is the previous
+  node in the same group, or p1 for the first one (`cg1unpacker._deltaheader`).
+  Stored with the existing delta-or-snapshot rule, checked and applied as
+  one unit like `02`/`03` pushes.
+- **Pre-bundle2 pushes**: old clients send `unbundle` with a bundle1
+  stream (`HG10UN`, `HG10GZ`, `HG10BZ`: a 6-byte header, then a `01`
+  changegroup, compressed as named). Accept these too, and advertise
+  `unbundle=HG10GZ,HG10BZ,HG10UN` as `wireprotov1server._capabilities`
+  does (`bundle2.bundlepriority`). The reply is bundle1's plain integer
+  result, not a bundle2 reply (`wireprotov1server.unbundle`). For a
+  treemanifest repository, do what `hg serve` does with a bundle1 push
+  (accept or refuse; check `server.bundle1*` defaults in
+  `configitems.toml`). Tests push with stock hg forced to the old path
+  (`--config devel.legacy.exchange=bundle1`) and with a bundle2 `01` part,
+  then check `hg verify`.
 - **`stream_out`**: legacy stream v1 from the existing stream-clone file
   listing and store lock. Advertise `stream` when the only streamed format
   is `revlogv1`, otherwise `streamreqs=<sorted list>`, as
