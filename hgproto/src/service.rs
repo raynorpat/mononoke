@@ -91,9 +91,7 @@ impl<H: HgCommands> HgService<H> {
                 new,
             } => map_cmd(hgcmds.pushkey(namespace, key, old, new), Response::Pushkey),
             Request::Streamout => map_cmd(hgcmds.stream_out(), |_| Response::Streamout),
-            Request::Unbundle { heads, bundle } => {
-                map_cmd(hgcmds.unbundle(heads, bundle), Response::Unbundle)
-            }
+            Request::Unbundle { heads, bundle } => hgcmds.unbundle(heads, bundle),
         }
     }
 
@@ -311,7 +309,7 @@ pub trait HgCommands {
     }
 
     // @wireprotocommand('unbundle', 'heads')
-    fn unbundle(&self, _heads: Vec<NodeHash>, _bundle: Bytes) -> HgCommandRes<Bytes> {
+    fn unbundle(&self, _heads: Vec<NodeHash>, _bundle: Bytes) -> HgCommandRes<Response> {
         unimplemented("unbundle")
     }
 }

@@ -385,7 +385,7 @@ git commit -m "server: serve changegroup 01 to legacy clients"
   - `push.rs`: a bundle starting `HG10UN`, `HG10GZ` (zlib) or `HG10BZ` (bzip2 with the `BZ` magic stripped, as `exchange.readbundle` re-adds it) is decoded and its `01` changegroup applied with the same checks and locking as bundle2 pushes, replying `Pushres { ret: 1, output }` on success and Mercurial's bundle1 error reply for a heads mismatch. A bundle2 changegroup part with `version=01` (or none) is applied with the V1 unpacker.
   - Caps: `unbundle=HG10GZ,HG10BZ,HG10UN` instead of plain `unbundle`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `bundle1_push_over_ssh_and_http` (serve.rs): from a clone, commit, `hg push --config devel.legacy.exchange=bundle1` over ssh and over HTTP; server `hg verify` passes and has the commit.
 
@@ -395,19 +395,19 @@ git commit -m "server: serve changegroup 01 to legacy clients"
 
 `unbundle_capability_lists_bundle1_types` (repo.rs tests): caps contain `unbundle=HG10GZ,HG10BZ,HG10UN`.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p mononoke --lib push:: repo:: && cargo test -p mononoke --test serve bundle1 -- --test-threads=1`
 Expected: failures.
 
-- [ ] **Step 3: Implement** as in Interfaces. Read `wireprotov1server.py` `unbundle`, `wireprotoserver.py` (`pushres` encoding), `exchange.py` `readbundle`, `bundle2.py` `handlechangegroup` first.
+- [x] **Step 3: Implement** as in Interfaces. Read `wireprotov1server.py` `unbundle`, `wireprotoserver.py` (`pushres` encoding), `exchange.py` `readbundle`, `bundle2.py` `handlechangegroup` first.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test --workspace && cargo test -p mononoke --test serve -- --test-threads=1`
 Expected: pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add hgproto server

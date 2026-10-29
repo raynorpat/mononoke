@@ -4,23 +4,26 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use async_compression::CompressorType;
+use async_compression::{CompressorType, Decompressor, DecompressorType};
 use bookmarks::{Bookmarks, BookmarksMut, Version};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, Stream};
 use mercurial::revlog::{Revlog, RevlogAppend, RevlogCompression};
 use mercurial::revlogrepo::Required;
 use mercurial::RevlogRepo;
 use mercurial_bundles::bundle2::Bundle2Stream;
-use mercurial_bundles::changegroup::{CgDeltaChunk, Part, Section};
+use mercurial_bundles::changegroup::{
+    unpacker::Cg2Unpacker, CgDeltaChunk, CgVersion, Part, Section,
+};
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{Bundle2Item, InnerPart, PartHeader};
 use mercurial_types::delta::Delta;
 use mercurial_types::{NodeHash, NULL_HASH};
+use tokio_util::codec::Decoder;
 
 use crate::errors::{Error, Result};
 
@@ -28,6 +31,7 @@ pub(crate) struct Applied {
     pub(crate) body: Vec<u8>,
     pub(crate) changegroup_ids: Vec<u32>,
     pub(crate) push_raced: bool,
+    bundle1: bool,
 }
 
 pub fn apply_unbundle(repo_path: &std::path::Path, heads: &[NodeHash], bundle: &[u8]) -> Result<Vec<u8>> {
@@ -46,18 +50,21 @@ pub(crate) fn heads_match(repo: &RevlogRepo, heads: &[NodeHash]) -> Result<bool>
 }
 
 pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -> Result<Applied> {
+    let bundle1 = is_bundle1(bundle);
     if !heads_match(repo, heads)? {
         return Ok(Applied {
             body: b"0\n".to_vec(),
             changegroup_ids: Vec::new(),
             push_raced: false,
+            bundle1,
         });
     }
-    if !check_heads_agree(repo, bundle)? {
+    if !bundle1 && !check_heads_agree(repo, bundle)? {
         return Ok(Applied {
             body: Vec::new(),
             changegroup_ids: Vec::new(),
             push_raced: true,
+            bundle1,
         });
     }
 
@@ -66,29 +73,37 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
     let mut changegroup_ids = Vec::new();
     let mut cg_part = false;
 
-    drain_bundle(bundle, |item| {
-        match item {
-            Bundle2Item::Start(_) => {}
-            Bundle2Item::Header(header) => {
-                let kind = header.part_type_lower().as_str();
-                cg_part = kind == "changegroup";
-                if cg_part {
-                    changegroup_ids.push(header.part_id());
-                    if param(&header, "treemanifest").is_ok() {
-                        use_treemanifest(repo)?;
-                    }
-                } else if kind == "pushkey" {
-                    apply_pushkey(repo, &header)?;
-                }
+    if bundle1 {
+        drain_bundle1(bundle, |part| {
+            if let Part::CgChunk(section, chunk) = part {
+                push_chunk(&mut groups, section, chunk);
             }
-            Bundle2Item::Inner(inner) if cg_part => match inner.cg2_part() {
-                Part::CgChunk(section, chunk) => push_chunk(&mut groups, section, chunk),
-                Part::SectionEnd(_) | Part::End => {}
-            },
-            Bundle2Item::Inner(_) => {}
-        }
-        Ok(())
-    })?;
+        })?;
+    } else {
+        drain_bundle(bundle, |item| {
+            match item {
+                Bundle2Item::Start(_) => {}
+                Bundle2Item::Header(header) => {
+                    let kind = header.part_type_lower().as_str();
+                    cg_part = kind == "changegroup";
+                    if cg_part {
+                        changegroup_ids.push(header.part_id());
+                        if param(&header, "treemanifest").is_ok() {
+                            use_treemanifest(repo)?;
+                        }
+                    } else if kind == "pushkey" {
+                        apply_pushkey(repo, &header)?;
+                    }
+                }
+                Bundle2Item::Inner(inner) if cg_part => match inner.cg2_part() {
+                    Part::CgChunk(section, chunk) => push_chunk(&mut groups, section, chunk),
+                    Part::SectionEnd(_) | Part::End => {}
+                },
+                Bundle2Item::Inner(_) => {}
+            }
+            Ok(())
+        })?;
+    }
 
     for (section, chunks) in groups {
         append_group(repo, compression, &section, chunks)?;
@@ -98,7 +113,60 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
         body: b"1\n".to_vec(),
         changegroup_ids,
         push_raced: false,
+        bundle1,
     })
+}
+
+pub(crate) fn is_bundle1(bundle: &[u8]) -> bool {
+    // Legacy wire peers send the unpacked changegroup without an HG10 header.
+    bundle.starts_with(b"HG10") || bundle.first() == Some(&0)
+}
+
+pub fn heads_error() -> hgproto::Response {
+    hgproto::Response::Pusherr(Bytes::from_static(
+        b"repository changed while preparing changes - please try again",
+    ))
+}
+
+pub(crate) async fn reply(applied: &Applied) -> Result<hgproto::Response> {
+    if applied.body == b"0\n" {
+        return Ok(heads_error());
+    }
+    if applied.bundle1 {
+        return Ok(hgproto::Response::Pushres {
+            ret: 1,
+            output: Bytes::new(),
+        });
+    }
+    reply_bundle(applied).await.map(hgproto::Response::Unbundle)
+}
+
+fn drain_bundle1(bundle: &[u8], mut on_part: impl FnMut(Part)) -> Result<()> {
+    let mut raw = Vec::new();
+    if bundle.first() == Some(&0) {
+        raw.extend_from_slice(bundle);
+    } else {
+        match bundle.get(4..6) {
+            Some(b"UN") => raw.extend_from_slice(&bundle[6..]),
+            Some(b"GZ") => {
+                flate2::read::ZlibDecoder::new(&bundle[6..]).read_to_end(&mut raw)?;
+            }
+            Some(b"BZ") => {
+                // Bundle1 omits the BZ bytes at the start of a bzip2 stream.
+                let compressed = [b"BZ".as_slice(), &bundle[6..]].concat();
+                let mut decoder = Decompressor::new(Cursor::new(compressed), DecompressorType::Bzip2);
+                ready(tokio::io::AsyncReadExt::read_to_end(&mut decoder, &mut raw))?;
+            }
+            _ => return Err("unknown bundle1 compression type".into()),
+        }
+    }
+    let logger = slog::Logger::root(slog::Discard, slog::o!());
+    let mut decoder = Cg2Unpacker::with_version(logger, CgVersion::V1);
+    let mut raw = BytesMut::from(raw.as_slice());
+    while let Some(inner) = decoder.decode_eof(&mut raw).map_err(bundle_err)? {
+        on_part(inner.cg2_part());
+    }
+    Ok(())
 }
 
 pub(crate) async fn reply_bundle(applied: &Applied) -> Result<Bytes> {
@@ -453,5 +521,175 @@ where
         Some(Ok(value)) => Ok(value),
         Some(Err(err)) => Err(err.to_string().into()),
         None => Err("bookmark update blocked".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Fixture(PathBuf);
+
+    fn hg(path: &Path, args: &[&str]) -> Vec<u8> {
+        let out = Command::new("hg")
+            .current_dir(path)
+            .args(args)
+            .env("HGPLAIN", "1")
+            .env("HGRCPATH", "")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "hg {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!("push01-{stamp}"));
+            fs::create_dir_all(&root).unwrap();
+            hg(
+                &root,
+                &[
+                    "init",
+                    "source",
+                    "--config",
+                    "format.use-persistent-nodemap=false",
+                ],
+            );
+            let source = root.join("source");
+            fs::write(source.join("a"), b"first\n").unwrap();
+            hg(&source, &["commit", "-Aqm", "first", "-u", "test"]);
+            hg(&root, &["clone", "-q", "source", "target"]);
+            fs::write(source.join("a"), b"second\n").unwrap();
+            hg(&source, &["commit", "-qm", "second", "-u", "test"]);
+            Self(root)
+        }
+
+        fn bundle(&self, kind: &str) -> Vec<u8> {
+            let source = self.0.join("source");
+            let output = source.join("out.hg");
+            let _ = fs::remove_file(&output);
+            hg(
+                &source,
+                &["bundle", "-t", kind, "-r", "tip", "--base", "0", "out.hg"],
+            );
+            fs::read(output).unwrap()
+        }
+
+        fn repo(&self) -> RevlogRepo {
+            RevlogRepo::open(&self.0.join("target/.hg")).unwrap()
+        }
+
+        fn apply(&self, bundle: &[u8]) {
+            let repo = self.repo();
+            let heads: Vec<_> = repo
+                .changelog_revlog()
+                .get_heads()
+                .unwrap()
+                .into_iter()
+                .collect();
+            let applied = apply_repo(&repo, &heads, bundle).unwrap();
+            assert_eq!(applied.body, b"1\n");
+            assert_eq!(repo.changelog_revlog().len().unwrap(), 2);
+            hg(&self.0.join("target"), &["verify"]);
+            assert_eq!(
+                hg(
+                    &self.0.join("target"),
+                    &["log", "-r", "tip", "-T", "{node}"]
+                ),
+                hg(
+                    &self.0.join("source"),
+                    &["log", "-r", "tip", "-T", "{node}"]
+                )
+            );
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn hg10_compressions_decode() {
+        for (kind, magic) in [
+            ("gzip-v1", b"HG10GZ"),
+            ("bzip2-v1", b"HG10BZ"),
+            ("none-v1", b"HG10UN"),
+        ] {
+            let fixture = Fixture::new();
+            let bundle = fixture.bundle(kind);
+            assert!(bundle.starts_with(magic));
+            fixture.apply(&bundle);
+        }
+    }
+
+    #[test]
+    fn headerless_cg01_is_applied() {
+        let fixture = Fixture::new();
+        let bundle = fixture.bundle("none-v1");
+        fixture.apply(&bundle[6..]);
+    }
+
+    #[test]
+    fn bundle2_cg01_part_is_applied() {
+        let fixture = Fixture::new();
+        // Mercurial's bundle command selects HG10 for cg.version=01 even
+        // with none-v2. Wrap its stock V1 payload in an actual bundle2 part.
+        let raw = fixture.bundle("none-v2;cg.version=01");
+        fixture.apply(&bundle2_v1(&raw, true));
+    }
+
+    #[test]
+    fn bundle2_cg01_missing_version_is_applied() {
+        let fixture = Fixture::new();
+        let raw = fixture.bundle("none-v1");
+        fixture.apply(&bundle2_v1(&raw, false));
+    }
+
+    fn bundle2_v1(raw: &[u8], version: bool) -> Vec<u8> {
+        assert!(raw.starts_with(b"HG10UN"));
+        let mut builder = mercurial_bundles::Bundle2EncodeBuilder::new(Cursor::new(Vec::new()));
+        builder.set_compressor_type(CompressorType::Uncompressed);
+        let mut part = PartEncodeBuilder::mandatory("changegroup").unwrap();
+        if version {
+            part.add_mparam("version", "01").unwrap();
+        }
+        part.set_data_bytes(Bytes::copy_from_slice(&raw[6..]))
+            .unwrap();
+        builder.add_part(part);
+        futures::executor::block_on(builder.build())
+            .unwrap()
+            .into_inner()
+    }
+
+    #[test]
+    fn malformed_hg10_compression_does_not_write() {
+        let fixture = Fixture::new();
+        for kind in ["gzip-v1", "bzip2-v1", "none-v1"] {
+            let mut bundle = fixture.bundle(kind);
+            bundle.truncate(bundle.len() / 2);
+            let repo = fixture.repo();
+            let heads: Vec<_> = repo
+                .changelog_revlog()
+                .get_heads()
+                .unwrap()
+                .into_iter()
+                .collect();
+            assert!(apply_repo(&repo, &heads, &bundle).is_err(), "{kind}");
+            assert_eq!(repo.changelog_revlog().len().unwrap(), 1);
+        }
     }
 }

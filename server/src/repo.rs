@@ -66,7 +66,7 @@ fn wireprotocaps() -> Vec<String> {
         "known".to_string(),
         "getbundle".to_string(),
         "changegroupsubset".to_string(),
-        "unbundle".to_string(),
+        "unbundle=HG10GZ,HG10BZ,HG10UN".to_string(),
         "pushkey".to_string(),
         "branchmap".to_string(),
         "listkeys".to_string(),
@@ -713,7 +713,7 @@ impl HgCommands for RepoClient {
     }
 
     // @wireprotocommand('unbundle', 'heads')
-    fn unbundle(&self, heads: Vec<NodeHash>, bundle: Bytes) -> HgCommandRes<Bytes> {
+    fn unbundle(&self, heads: Vec<NodeHash>, bundle: Bytes) -> HgCommandRes<hgproto::Response> {
         info!(self.logger, "unbundle heads {:?}", heads);
         let repo = Arc::clone(&self.repo);
         let logger = self.logger.clone();
@@ -726,10 +726,19 @@ impl HgCommands for RepoClient {
             let applied = crate::push::apply_repo(repo.hgrepo(), &heads, &bundle);
             repo.note_own_write();
             let reply = match applied {
-                Ok(applied) => crate::push::reply_bundle(&applied).await,
+                Ok(applied) => crate::push::reply(&applied).await,
                 Err(err) => {
                     warn!(logger, "push failed: {}", err);
-                    crate::push::abort_bundle(&err.to_string()).await
+                    if crate::push::is_bundle1(&bundle) {
+                        Ok(hgproto::Response::Pushres {
+                            ret: 0,
+                            output: Bytes::new(),
+                        })
+                    } else {
+                        crate::push::abort_bundle(&err.to_string())
+                            .await
+                            .map(hgproto::Response::Unbundle)
+                    }
                 }
             };
             reply.map_err(|err| hgproto::Error::from(err.to_string()))
@@ -741,6 +750,13 @@ impl HgCommands for RepoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unbundle_capability_lists_bundle1_types() {
+        assert!(wireprotocaps()
+            .iter()
+            .any(|cap| cap == "unbundle=HG10GZ,HG10BZ,HG10UN"));
+    }
 
     #[test]
     fn send_cg_version_negotiates_legacy_and_modern_versions() {

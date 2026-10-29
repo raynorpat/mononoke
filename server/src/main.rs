@@ -20,6 +20,7 @@ use hgproto::HgService;
 use mercurial_types::NodeHash;
 use mononoke::errors::{Error, Result, ResultExt};
 use mononoke::listener::{self, ssh_server_mux, Stdio};
+use mononoke::push;
 use mononoke::repo::{self, RepoClient};
 use slog::{crit, error, info, o, Drain, Level, Logger, OwnedKVList, Record, KV};
 use slog_term::PlainSyncDecorator;
@@ -208,7 +209,9 @@ where
     Si: futures::Sink<Bytes, Error = io::Error> + Unpin,
 {
     if !repo.heads_match(&heads)? {
-        stdout.send(Bytes::from_static(b"2\n0\n")).await?;
+        let mut out = BytesMut::new();
+        hgproto::sshproto::response::encode(&push::heads_error(), &mut out);
+        stdout.send(out.freeze()).await?;
         return Ok(None);
     }
     stdout.send(Bytes::from_static(b"0\n")).await?;

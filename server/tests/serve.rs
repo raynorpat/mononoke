@@ -719,6 +719,98 @@ fn ssh_push_appears_in_served_repo() {
 }
 
 #[test]
+fn bundle1_push_over_ssh_and_http() {
+    for ssh in [true, false] {
+        let temp = TempDir::new("b1");
+        let repo = init_zstd_repo(&temp.0);
+        let log = temp.0.join("mononoke.log");
+        let server = Running::start(&repo, &log);
+        let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+        let url = if ssh {
+            "ssh://user@dummy/repo".to_string()
+        } else {
+            format!("http://127.0.0.1:{}/", server.port)
+        };
+        let run = |dir: &Path, args: &[&str]| {
+            if ssh {
+                hg_ssh(dir, args, &shim)
+            } else {
+                hg(dir, args)
+            }
+        };
+        assert_ok_with_log(
+            &run(&temp.0, &["clone", "--pull", &url, "dest"]),
+            "clone",
+            &log,
+        );
+        let dest = temp.0.join("dest");
+        fs::write(dest.join("a.txt"), b"bundle1 edit\n").unwrap();
+        assert_hg(
+            &hg(&dest, &["commit", "-m", "bundle1", "-u", "test"]),
+            "commit",
+        );
+        let push = run(
+            &dest,
+            &["push", "--config", "devel.legacy.exchange=bundle1"],
+        );
+        assert_ok_with_log(&push, "bundle1 push", &log);
+        assert_same_tip(&repo, &dest);
+        assert_eq!(
+            hg(&repo, &["log", "-r", "tip", "-T", "{desc}"]).stdout,
+            b"bundle1"
+        );
+    }
+}
+
+#[test]
+fn bundle1_heads_race_matches_hg_serve() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let temp = TempDir::new("b1race");
+    let repo = init_zstd_repo(&temp.0);
+    let before = changelog_len(&repo);
+    let log = temp.0.join("mononoke.log");
+    let mono = Running::start(&repo, &log);
+    let stock = HgServe::start(&repo);
+    let query = format!("cmd=unbundle&heads={}", "0".repeat(40));
+    let expected = raw_command(stock.port, &query);
+    assert!(expected.starts_with(b"0\n") && expected.len() > 3);
+    assert_eq!(raw_command(mono.port, &query), expected);
+    let mut replies = Vec::new();
+    for binary in [PathBuf::from("hg"), sibling_bin("hgcli")] {
+        let mut child = Command::new(binary)
+            .args(["-R", &cfg_path(&repo), "serve", "--stdio"])
+            .env("HGPLAIN", "1")
+            .env("HGRCPATH", "")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        write!(input, "unbundle\nheads 40\n{}", "0".repeat(40)).unwrap();
+        input.flush().unwrap();
+        // Keep stdin open until the reply arrives: hgcli exits on EOF.
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut length = String::new();
+        output.read_line(&mut length).unwrap();
+        let mut body = vec![0; length.trim().parse::<usize>().unwrap()];
+        output.read_exact(&mut body).unwrap();
+        let mut reply = length.into_bytes();
+        reply.extend(body);
+        drop(input);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        replies.push(reply);
+    }
+    assert_eq!(replies[1], replies[0]);
+    assert_eq!(changelog_len(&repo), before);
+}
+
+#[test]
 fn ssh_push_rejects_changed_remote_heads() {
     let temp = TempDir::new("r");
     let repo = init_zstd_repo(&temp.0);
@@ -1953,6 +2045,15 @@ fn tree_push_into_flat_repo_is_refused() {
 
 #[test]
 fn flat_client_push_into_tree_repo_matches_hg() {
+    flat_push_into_tree_repo_matches_hg(false);
+}
+
+#[test]
+fn bundle1_flat_client_push_into_tree_repo_matches_hg() {
+    flat_push_into_tree_repo_matches_hg(true);
+}
+
+fn flat_push_into_tree_repo_matches_hg(legacy: bool) {
     let temp = TempDir::new("tc");
     init_share_safe_repo(&temp.0);
     assert_hg(&hg(&temp.0, &["clone", "-q", "repo", "client"]), "flat clone");
@@ -1968,7 +2069,11 @@ fn flat_client_push_into_tree_repo_matches_hg() {
     let stock = HgServe::start(&temp.0.join("stock"));
     for port in [mono.port, stock.port] {
         let url = format!("http://127.0.0.1:{port}/");
-        assert_ok_with_log(&hg(&client, &["push", &url]), "push", &log);
+        let mut args = vec!["push", &url];
+        if legacy {
+            args.extend(["--config", "devel.legacy.exchange=bundle1"]);
+        }
+        assert_ok_with_log(&hg(&client, &args), "push", &log);
     }
     drop(mono);
     drop(stock);
@@ -2045,9 +2150,14 @@ fn raw_command(port: u16, query: &str) -> Vec<u8> {
     let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
     sock.set_read_timeout(Some(Duration::from_secs(30)))
         .expect("read timeout");
+    let method = if query.starts_with("cmd=unbundle&") {
+        "POST"
+    } else {
+        "GET"
+    };
     write!(
         sock,
-        "GET /?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/mercurial-0.1\r\nConnection: close\r\n\r\n"
+        "{method} /?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/mercurial-0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
     .expect("send request");
     let mut raw = Vec::new();

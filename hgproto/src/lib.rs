@@ -157,6 +157,11 @@ pub enum Response {
     Lookup(std::result::Result<NodeHash, String>),
     Known(Vec<bool>),
     Pushkey(bool),
+    Pushres {
+        ret: i64,
+        output: Bytes,
+    },
+    Pusherr(Bytes),
     Streamout,
     Unbundle(Bytes),
 }

@@ -665,6 +665,17 @@ fn frame_preview(buf: &[u8]) -> String {
 
 fn response_body(response: &Response) -> Result<Bytes> {
     match response {
+        Response::Pushres { ret, output } => {
+            let mut body = format!("{ret}\n").into_bytes();
+            body.extend_from_slice(output);
+            Ok(Bytes::from(body))
+        }
+        Response::Pusherr(message) => {
+            let mut body = b"0\n".to_vec();
+            body.extend_from_slice(message);
+            body.push(b'\n');
+            Ok(Bytes::from(body))
+        }
         Response::Capabilities(caps) => {
             // HTTP only: getbundle can answer as media type 0.2 in a negotiated compression.
             let mut caps = caps.clone();
@@ -695,6 +706,23 @@ fn response_body(response: &Response) -> Result<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle1_result_includes_http_output() {
+        let response = Response::Pushres {
+            ret: 1,
+            output: Bytes::from_static(b"added changes\n"),
+        };
+        assert_eq!(
+            response_body(&response).unwrap(),
+            b"1\nadded changes\n".as_slice(),
+        );
+        let response = Response::Pushres {
+            ret: 0,
+            output: Bytes::new(),
+        };
+        assert_eq!(response_body(&response).unwrap(), b"0\n".as_slice());
+    }
 
     #[test]
     fn bundle_engine_follows_mercurial() {

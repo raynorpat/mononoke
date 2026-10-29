@@ -34,6 +34,11 @@ where
 }
 
 pub fn encode(response: &Response, out: &mut BytesMut) {
+    if let Response::Pushres { ret, .. } = response {
+        let ret = ret.to_string();
+        out.extend_from_slice(format!("0\n{}\n{ret}", ret.len()).as_bytes());
+        return;
+    }
     let res = encode_cmd(response);
     out.reserve(10 + res.len());
     if !response.is_stream() {
@@ -71,7 +76,11 @@ pub fn encode_cmd(response: &Response) -> Bytes {
             Bytes::from(out)
         }
 
-        Response::Debugwireargs(res) | Response::Unbundle(res) => res.clone(),
+        Response::Debugwireargs(res) | Response::Unbundle(res) | Response::Pusherr(res) => {
+            res.clone()
+        }
+
+        Response::Pushres { .. } => unreachable!("push results use two SSH frames"),
 
         // Callers write the stream themselves, and batch rejects these commands.
         Response::Getbundle(_) | Response::Changegroup(_) | Response::Changegroupsubset(_) => {
@@ -133,5 +142,27 @@ pub fn encode_cmd(response: &Response) -> Bytes {
         }
 
         other => panic!("Response for {:?} unimplemented", other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pushres_has_empty_frame_then_decimal_result() {
+        for (ret, expected) in [
+            (1, b"0\n1\n1".as_slice()),
+            (0, b"0\n1\n0"),
+            (-12, b"0\n3\n-12"),
+        ] {
+            let response = Response::Pushres {
+                ret,
+                output: Bytes::from_static(b"HTTP output\n"),
+            };
+            let mut out = BytesMut::new();
+            encode(&response, &mut out);
+            assert_eq!(&out[..], expected);
+        }
     }
 }
