@@ -23,11 +23,16 @@ use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, Path, NULL_HASH};
 
 use crate::errors::{Error, Result};
 
-/// Changelog nodes in revision order, and for each whether the client lacks
-/// it: every changeset that is not an ancestor of a `common` node.
+/// Changelog nodes in revision order, and for each whether to send it: an
+/// ancestor of a `heads` node (every changeset when `heads` is empty) that is
+/// not an ancestor of a `common` node.
 ///
 /// Parents come from the changelog index, so no changeset text is read.
-fn missing_revs(repo: &RevlogRepo, common: &[NodeHash]) -> Result<(Vec<NodeHash>, Vec<bool>)> {
+fn missing_revs(
+    repo: &RevlogRepo,
+    common: &[NodeHash],
+    heads: &[NodeHash],
+) -> Result<(Vec<NodeHash>, Vec<bool>)> {
     let changelog = repo.changelog_revlog();
     let len = changelog.len()? as usize;
     let mut nodes = Vec::with_capacity(len);
@@ -37,10 +42,28 @@ fn missing_revs(repo: &RevlogRepo, common: &[NodeHash]) -> Result<(Vec<NodeHash>
         nodes.push(entry.nodeid);
         parents.push([entry.p1, entry.p2]);
     }
+    // Mark `start` and its ancestors with `to`, stopping where already marked.
+    let mark = |flags: &mut Vec<bool>, start: usize, to: bool| {
+        let mut stack = vec![start];
+        while let Some(idx) = stack.pop() {
+            if flags[idx] == to {
+                continue;
+            }
+            flags[idx] = to;
+            stack.extend(parents[idx].iter().flatten().map(|p| p.as_u32() as usize));
+        }
+    };
 
-    let mut missing = vec![true; len];
+    // NULL_HASH is not a changelog node, so it neither adds nor excludes revisions.
+    let heads: Vec<&NodeHash> = heads.iter().filter(|node| **node != NULL_HASH).collect();
+    let mut missing = vec![heads.is_empty(); len];
+    for node in heads {
+        let start = changelog
+            .index_of(node)
+            .map_err(|_| Error::from(format!("unknown revision '{node}'")))?;
+        mark(&mut missing, start as usize, true);
+    }
     for node in common {
-        // NULL_HASH is not a changelog node and does not exclude real revisions.
         if *node == NULL_HASH {
             continue;
         }
@@ -48,14 +71,7 @@ fn missing_revs(repo: &RevlogRepo, common: &[NodeHash]) -> Result<(Vec<NodeHash>
         let Ok(start) = changelog.index_of(node) else {
             continue;
         };
-        let mut stack = vec![start as usize];
-        while let Some(idx) = stack.pop() {
-            if !missing[idx] {
-                continue;
-            }
-            missing[idx] = false;
-            stack.extend(parents[idx].iter().flatten().map(|p| p.as_u32() as usize));
-        }
+        mark(&mut missing, start as usize, false);
     }
     Ok((nodes, missing))
 }
@@ -67,10 +83,14 @@ const PART_QUEUE: usize = 1024;
 ///
 /// Revlog reads block, so they run on tokio's blocking pool instead of the
 /// connection's runtime thread. A dropped part stops the reader at its next send.
-pub fn history_part(repo: RevlogRepo, common: Vec<NodeHash>) -> Result<PartEncodeBuilder> {
+pub fn history_part(
+    repo: RevlogRepo,
+    common: Vec<NodeHash>,
+    heads: Vec<NodeHash>,
+) -> Result<PartEncodeBuilder> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(PART_QUEUE);
     tokio::task::spawn_blocking(move || {
-        let sent = history_parts(&repo, &common, &mut |part| {
+        let sent = history_parts(&repo, &common, &heads, &mut |part| {
             tx.blocking_send(Ok(part))
                 .map_err(|_| Error::from("getbundle writer went away"))
         });
@@ -85,9 +105,10 @@ pub fn history_part(repo: RevlogRepo, common: Vec<NodeHash>) -> Result<PartEncod
 fn history_parts(
     repo: &RevlogRepo,
     common: &[NodeHash],
+    heads: &[NodeHash],
     emit: &mut dyn FnMut(Part) -> Result<()>,
 ) -> Result<()> {
-    let (nodes, missing) = missing_revs(repo, common)?;
+    let (nodes, missing) = missing_revs(repo, common, heads)?;
 
     let mut files = BTreeSet::new();
     for (rev, node) in nodes.iter().enumerate() {
@@ -638,7 +659,7 @@ mod tests {
 
     fn collect_parts(repo: &RevlogRepo, common: &[NodeHash]) -> Vec<Part> {
         let mut parts = Vec::new();
-        history_parts(repo, common, &mut |part| {
+        history_parts(repo, common, &[], &mut |part| {
             parts.push(part);
             Ok(())
         })
@@ -669,26 +690,38 @@ mod tests {
         };
         let repo = open_repo(&temp.repo);
 
-        let (nodes, missing) = missing_revs(&repo, &[]).expect("no common");
+        let (nodes, missing) = missing_revs(&repo, &[], &[]).expect("no common");
         assert_eq!(nodes, vec![node("0"), node("1"), node("2")]);
         assert_eq!(missing, vec![true, true, true]);
 
-        let (_, missing) = missing_revs(&repo, &[NULL_HASH]).expect("null common");
+        let (_, missing) = missing_revs(&repo, &[NULL_HASH], &[]).expect("null common");
         assert_eq!(missing, vec![true, true, true]);
 
-        let (_, missing) = missing_revs(&repo, &[node("1")]).expect("common 1");
+        let (_, missing) = missing_revs(&repo, &[node("1")], &[]).expect("common 1");
         assert_eq!(missing, vec![false, false, true]);
 
-        let (_, missing) = missing_revs(&repo, &[node("0")]).expect("common 0");
+        let (_, missing) = missing_revs(&repo, &[node("0")], &[]).expect("common 0");
         assert_eq!(missing, vec![false, true, true]);
 
-        let (_, missing) = missing_revs(&repo, &[node("1"), node("2")]).expect("both heads");
+        let (_, missing) = missing_revs(&repo, &[node("1"), node("2")], &[]).expect("both heads");
         assert_eq!(missing, vec![false, false, false]);
 
         // A client may have commits this server never saw.
         let unknown = NodeHash::from_bytes(&[0x42; 20]).expect("unknown node");
-        let (_, missing) = missing_revs(&repo, &[unknown, node("2")]).expect("unknown");
+        let (_, missing) = missing_revs(&repo, &[unknown, node("2")], &[]).expect("unknown");
         assert_eq!(missing, vec![false, true, false]);
+
+        // `heads` limits what is sent to their ancestors.
+        let (_, missing) = missing_revs(&repo, &[], &[node("1")]).expect("heads 1");
+        assert_eq!(missing, vec![true, true, false]);
+        let (_, missing) = missing_revs(&repo, &[node("0")], &[node("2")]).expect("heads 2");
+        assert_eq!(missing, vec![false, false, true]);
+        let (_, missing) = missing_revs(&repo, &[node("1")], &[node("1")]).expect("have it");
+        assert_eq!(missing, vec![false, false, false]);
+        assert!(
+            missing_revs(&repo, &[], &[unknown]).is_err(),
+            "unknown head"
+        );
     }
 
     #[test]

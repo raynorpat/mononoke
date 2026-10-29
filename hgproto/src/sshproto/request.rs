@@ -137,8 +137,9 @@ fn ident_string(input: &[u8]) -> ParseRes<'_, String> {
     Ok((rest, String::from_utf8_lossy(name).into_owned()))
 }
 
-/// A pushkey value is length-delimited and already complete. Bookmark names may
-/// contain characters `ident` rejects, such as `-`.
+/// A length-delimited value that is already complete: pushkey values and
+/// lookup keys. These may contain characters `ident` rejects, such as `-`, or
+/// start with a digit.
 fn value_string(input: &[u8]) -> ParseRes<'_, String> {
     Ok((b"", String::from_utf8_lossy(input).into_owned()))
 }
@@ -535,7 +536,8 @@ fn parse_request<'a>(input: &'a [u8], parse_params: ParamParser) -> ParseRes<'a,
     }
     if let Some(val) = attempt(parse_named(input, b"lookup", parse_params, 1, |kv| {
         Ok(Request::Lookup {
-            key: parseval(&kv, "key", ident_string)?,
+            // A revision number, hash prefix or bookmark, not an identifier.
+            key: parseval(&kv, "key", value_string)?,
         })
     }))? {
         return Ok(val);
@@ -1336,6 +1338,17 @@ mod test_parse {
                 key: "bookmarks".to_string(),
             },
         );
+
+        // Keys are revision numbers, hash prefixes and bookmark names too.
+        for key in ["0", "-1", "d86873c6", "my-feature/v2"] {
+            let inp = format!("lookup\nkey {}\n{}", key.len(), key);
+            test_parse(
+                inp.as_str(),
+                Request::Lookup {
+                    key: key.to_string(),
+                },
+            );
+        }
     }
 
     #[test]

@@ -1251,3 +1251,93 @@ fn dirstate_v2_tracked_key_repo_is_served_and_clients_keep_their_own_dirstate() 
     }
     drop(server);
 }
+
+#[test]
+fn lookup_resolves_names_and_clone_r_gets_only_ancestors() {
+    // `--debug` surrounds the hash with protocol chatter, so pick the hash line.
+    let last_line = |out: &Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.len() == 40 && line.bytes().all(|b| b.is_ascii_hexdigit()))
+            .last()
+            .unwrap_or("")
+            .to_owned()
+    };
+    let temp = TempDir::new("lk");
+    let repo = init_zstd_repo(&temp.0);
+    for (rev, text) in [(1, "beta\n"), (2, "gamma\n")] {
+        fs::write(repo.join("a.txt"), text).expect("write a.txt");
+        assert_hg(
+            &hg(&repo, &["commit", "-m", &format!("rev{rev}"), "-u", "test"]),
+            "hg commit",
+        );
+    }
+    assert_hg(
+        &hg(&repo, &["bookmark", "-r", "1", "feature"]),
+        "hg bookmark",
+    );
+    let node = |rev: &str| {
+        let out = hg(&repo, &["log", "-r", rev, "-T", "{node}"]);
+        assert_hg(&out, "hg log");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let (n0, n1, n2) = (node("0"), node("1"), node("2"));
+
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    // `hg identify -r KEY URL` resolves KEY with the remote `lookup` command.
+    let identify = |key: &str| hg(&temp.0, &["identify", "--debug", "-i", "-r", key, &url]);
+    let null = "0".repeat(40);
+    for (key, want) in [
+        ("tip", &n2),
+        ("0", &n0),
+        ("-1", &n2),
+        (n1.as_str(), &n1),
+        (&n1[..8], &n1),
+        ("feature", &n1),
+        ("null", &null),
+    ] {
+        let out = identify(key);
+        assert_hg(&out, &format!("identify {key}"));
+
+        let got = last_line(&out);
+        assert_eq!(&got, want, "lookup {key}\nmononoke:\n{}", read_log(&log));
+    }
+    let missing = identify("nope");
+    assert!(!missing.status.success(), "lookup of nope succeeded");
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("unknown revision 'nope'"), "{stderr}");
+
+    let ssh = hg_ssh(
+        &temp.0,
+        &[
+            "identify",
+            "--debug",
+            "-i",
+            "-r",
+            "feature",
+            "ssh://user@dummy/repo",
+        ],
+        &shim,
+    );
+    assert_hg(&ssh, "ssh identify");
+    assert_eq!(last_line(&ssh), n1);
+
+    // `-r` sends getbundle `heads`, so the clone stops at rev 1.
+    let partial = hg(&temp.0, &["clone", "-r", "feature", &url, "partial"]);
+    assert_hg(&partial, "clone -r");
+    let revs = hg(&temp.0.join("partial"), &["log", "-T", "{node}\n"]);
+    assert_hg(&revs, "partial log");
+    let mut got: Vec<String> = String::from_utf8_lossy(&revs.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    got.sort();
+    let mut want = vec![n0.clone(), n1.clone()];
+    want.sort();
+    assert_eq!(got, want, "clone -r feature");
+    drop(server);
+}

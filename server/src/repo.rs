@@ -21,6 +21,7 @@ use futures::future::BoxFuture;
 use futures::{future, stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use hgproto::{self, BundleStream, GetbundleArgs, HgCommandRes, HgCommands};
 use mercurial::changeset::RevlogChangeset;
+use mercurial::revlog::RevIdx;
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{parts, Bundle2EncodeBuilder};
 use mercurial_types::{percent_encode, Changeset, NodeHash, Parents, NULL_HASH};
@@ -192,7 +193,7 @@ async fn create_bundle(repo: &Arc<Repo>, args: GetbundleArgs) -> hgproto::Result
     if args.stream {
         bundle.add_part(stream_clone_part(repo).await?);
     } else if args.cg {
-        let history = history_part(repo.hgrepo.clone(), args.common.clone())
+        let history = history_part(repo.hgrepo.clone(), args.common.clone(), args.heads.clone())
             .map_err(|err| hgproto::Error::from(err.to_string()))?;
         bundle.add_part(history);
     }
@@ -248,6 +249,69 @@ async fn stream_clone_part(repo: &Arc<Repo>) -> hgproto::Result<PartEncodeBuilde
     .map_err(|err| hgproto::Error::from(err.to_string()))?
     .map_err(|err| hgproto::Error::from(err.to_string()))?;
     stream_part(files, &requirements).map_err(|err| hgproto::Error::from(err.to_string()))
+}
+
+/// Resolve a `lookup` key as Mercurial's `revsymbol` does for the forms a
+/// remote asks about: `null`, `tip`, a revision number (negative counts from
+/// the end), a full hash, a bookmark, then a unique hash prefix. Tags, branch
+/// names and `.` are not resolved.
+fn resolve_key(
+    repo: &mercurial::RevlogRepo,
+    bookmarks: &[(Vec<u8>, Vec<u8>)],
+    key: &str,
+) -> std::result::Result<NodeHash, String> {
+    let changelog = repo.changelog_revlog();
+    let len = i64::from(changelog.len().map_err(|err| err.to_string())?);
+    let node_at = |rev: i64| {
+        changelog
+            .get_entry(RevIdx::from(rev as u32))
+            .map(|entry| entry.nodeid)
+            .map_err(|err| err.to_string())
+    };
+    match key {
+        "null" => return Ok(NULL_HASH),
+        "tip" if len == 0 => return Ok(NULL_HASH),
+        "tip" => return node_at(len - 1),
+        _ => {}
+    }
+    // Only the canonical spelling is a number, so `01` is not rev 1. Out of
+    // range falls through to the names below, as in Mercurial.
+    if let Ok(num) = key.parse::<i64>() {
+        let rev = if num < 0 { num + len } else { num };
+        if num.to_string() == key && (0..len).contains(&rev) {
+            return node_at(rev);
+        }
+    }
+    if key.len() == 40 {
+        if let Ok(node) = key.parse::<NodeHash>() {
+            if changelog.index_of(&node).is_ok() {
+                return Ok(node);
+            }
+        }
+    }
+    if let Some((_, hex)) = bookmarks.iter().find(|(name, _)| name == key.as_bytes()) {
+        return std::str::from_utf8(hex)
+            .ok()
+            .and_then(|hex| hex.parse().ok())
+            .ok_or_else(|| format!("bookmark '{key}' has a bad node"));
+    }
+    if !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        let prefix = key.to_ascii_lowercase();
+        let mut found = None;
+        for rev in 0..len {
+            let node = node_at(rev)?;
+            if node.to_hex().as_str().starts_with(&prefix) {
+                if found.is_some() {
+                    return Err(format!("00changelog@{key}: ambiguous identifier"));
+                }
+                found = Some(node);
+            }
+        }
+        if let Some(node) = found {
+            return Ok(node);
+        }
+    }
+    Err(format!("unknown revision '{key}'"))
 }
 
 struct ParentStream {
@@ -377,6 +441,21 @@ impl HgCommands for RepoClient {
                 "bookmarks" => Ok(bookmark_pairs(&repo).await?.into_iter().collect()),
                 _ => Ok(HashMap::new()),
             }
+        }
+        .boxed()
+    }
+
+    // @wireprotocommand('lookup', 'key')
+    fn lookup(&self, key: String) -> HgCommandRes<NodeHash> {
+        info!(self.logger, "lookup {}", key);
+        let repo = Arc::clone(&self.repo);
+        async move {
+            let bookmarks = bookmark_pairs(&repo).await?;
+            // A hash prefix scans the changelog.
+            tokio::task::spawn_blocking(move || resolve_key(&repo.hgrepo, &bookmarks, &key))
+                .await
+                .map_err(|err| hgproto::Error::from(err.to_string()))?
+                .map_err(hgproto::Error::from)
         }
         .boxed()
     }

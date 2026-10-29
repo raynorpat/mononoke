@@ -95,6 +95,9 @@ pub fn encode_cmd(response: &Response) -> Bytes {
 
         Response::Pushkey(ok) => Bytes::from_static(if *ok { b"1\n" } else { b"0\n" }),
 
+        Response::Lookup(Ok(node)) => Bytes::from(format!("1 {}\n", node)),
+        Response::Lookup(Err(msg)) => Bytes::from(format!("0 {}\n", msg)),
+
         Response::Listkeys(pairs) => {
             let mut names: Vec<_> = pairs.iter().collect();
             names.sort_by(|left, right| left.0.cmp(right.0));

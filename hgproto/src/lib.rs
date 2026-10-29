@@ -153,7 +153,8 @@ pub enum Response {
     Heads(HashSet<NodeHash>),
     Hello(HashMap<String, Vec<String>>),
     Listkeys(HashMap<Vec<u8>, Vec<u8>>),
-    Lookup(NodeHash),
+    /// The node, or why `key` did not resolve. Mercurial answers both on the wire.
+    Lookup(std::result::Result<NodeHash, String>),
     Known(Vec<bool>),
     Pushkey(bool),
     Streamout,

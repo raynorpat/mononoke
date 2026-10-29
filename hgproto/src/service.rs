@@ -79,7 +79,11 @@ impl<H: HgCommands> HgService<H> {
             Request::Listkeys { namespace } => {
                 map_cmd(hgcmds.listkeys(namespace), Response::Listkeys)
             }
-            Request::Lookup { key } => map_cmd(hgcmds.lookup(key), Response::Lookup),
+            // Mercurial reports a failed lookup in the response, as `0 <message>`.
+            Request::Lookup { key } => hgcmds
+                .lookup(key)
+                .map(|res| Ok(Response::Lookup(res.map_err(|err| err.to_string()))))
+                .boxed(),
             Request::Known { nodes } => map_cmd(hgcmds.known(nodes), Response::Known),
             Request::Pushkey {
                 namespace,
@@ -340,6 +344,24 @@ mod test {
             Ok(Response::Hello(ref r)) if r == &res => (),
             bad => panic!("Bad result {:?}", bad),
         }
+    }
+
+    #[test]
+    fn lookup_failure_is_a_response_not_an_error() {
+        // Mercurial answers a failed lookup with `0 <message>`, which the client shows.
+        let service = HgService::new(Dummy);
+        let r = block_on(service.call(Request::Lookup { key: "nope".into() }));
+        let response = match r {
+            Ok(response @ Response::Lookup(Err(_))) => response,
+            bad => panic!("Bad result {:?}", bad),
+        };
+        let encoded = sshproto::response::encode_cmd(&response);
+        assert!(encoded.starts_with(b"0 "), "{encoded:?}");
+        assert!(encoded.ends_with(b"\n"), "{encoded:?}");
+
+        let node = NodeHash::from_bytes(&[0xab; 20]).expect("node");
+        let encoded = sshproto::response::encode_cmd(&Response::Lookup(Ok(node)));
+        assert_eq!(&encoded[..], format!("1 {}\n", "ab".repeat(20)).as_bytes());
     }
 
     #[test]

@@ -664,8 +664,8 @@ fn response_body(response: &Response) -> Result<Bytes> {
             Ok(Bytes::from(caps.join(" ")))
         }
         Response::Getbundle(_) => Err("getbundle is streamed by the connection".into()),
-        Response::Lookup(node) => Ok(Bytes::from(format!("1 {node}\n"))),
         Response::Batch(_)
+        | Response::Lookup(_)
         | Response::Between(_)
         | Response::Branchmap(_)
         | Response::Debugwireargs(_)
