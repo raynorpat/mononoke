@@ -8,8 +8,9 @@ supported.
 
 Mononoke serves an existing Mercurial repository. `REPODIR` is the directory
 that contains `.hg`. Any repository made by `hg init` or `hg clone` works if
-its requirements are supported. The main ones that are not are `treemanifest`
-and `persistent-nodemap`. Check the requirements with:
+its requirements are supported. Stock Mercurial 7.0 repositories, including
+`persistent-nodemap`, and treemanifest repositories are supported. Experimental
+revlog v2/changelog v2 and narrow repositories are not. Check requirements with:
 
 ```sh
 cat REPODIR/.hg/requires REPODIR/.hg/store/requires
@@ -18,7 +19,7 @@ cat REPODIR/.hg/requires REPODIR/.hg/store/requires
 To make a new repository that serves well, including stream clones:
 
 ```sh
-hg init REPODIR --config format.use-persistent-nodemap=false
+hg init REPODIR
 ```
 
 The server writes its ssh socket to `REPODIR/.hg/mononoke.sock`. Unix socket
@@ -57,10 +58,10 @@ INFO Listening for HTTPS on 0.0.0.0:8443, repo: "/srv/hg/myrepo"
 INFO Warmed up, repo: "/srv/hg/myrepo"
 ```
 
-"Warmed up" appears once the changelog node map and the stream-clone file
-listing are built. That takes about 30 seconds on a repository the size of
-mozilla-central. The server answers requests before then, and pushes wait
-until it finishes.
+"Warmed up" appears once the node map, branch metadata and stream-clone
+listing are ready. A valid persistent nodemap avoids rebuilding its covered
+node index. The server answers requests during warm-up; pushes wait for any
+store listing already in progress.
 
 ### Several repositories
 
@@ -138,13 +139,52 @@ A push is rejected if the server's heads changed since the client last pulled,
 as with `hg serve`. Pull, merge or rebase, and push again.
 
 To clone or pull part of the history, name a revision. The server resolves
-hashes, hash prefixes, revision numbers, `tip` and bookmarks, but not tags or
-branch names:
+hashes, hash prefixes, revision numbers, `.`, `tip`, bookmarks, tags and named
+branches:
 
 ```sh
 hg clone -r mybookmark http://server:8000/ partial
+hg clone -r v1.0 http://server:8000/ tagged
+hg pull -r stable
 hg pull -r 1a2b3c4d
 ```
+
+## Clone bundles
+
+Put a clone-bundle manifest in `REPODIR/.hg/clonebundles.manifest`. For a
+bundle hosted separately, a line can be:
+
+```text
+https://example.com/full.hg BUNDLESPEC=zstd-v2
+```
+
+To serve a bundle over the repository's existing connection, create it below
+the configured cache root:
+
+```sh
+mkdir -p REPODIR/.hg/bundles
+hg -R REPODIR bundle --all -t zstd-v2 REPODIR/.hg/bundles/full.hg
+```
+
+Set the root in `REPODIR/.hg/hgrc`:
+
+```ini
+[server]
+peer-bundle-cache-root = bundles
+```
+
+Then add this line to `REPODIR/.hg/clonebundles.manifest`:
+
+```text
+peer-bundle-cache://full.hg BUNDLESPEC=zstd-v2
+```
+
+Without an override the root is `.hg/bundle-cache`. Clients that support
+inline clone bundles fetch the file over ssh or HTTP and pull any remaining
+revisions normally. Older clone-bundle clients receive external URLs only.
+Cached paths must resolve inside the configured root. Manifest and root
+setting changes apply without restarting Mononoke. Regenerate the bundle
+when updating the cached history.
 
 ## Checking a served repository
 
@@ -154,3 +194,8 @@ the store lock, so a push waits for it to finish.
 ```sh
 hg -R REPODIR verify
 ```
+
+Mononoke never rewrites persistent nodemap files after a push. Mercurial
+refreshes them on its next write, or explicitly with `hg debugupdatecaches`.
+Stop Mononoke before an in-place `hg strip` on Windows, where mapped revlogs
+cannot be truncated while the server is running.

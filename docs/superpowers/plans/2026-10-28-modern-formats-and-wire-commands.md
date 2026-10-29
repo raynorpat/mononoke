@@ -15,7 +15,7 @@
 - Work on a new branch `formats` from `master`. Never commit to `master`.
 - Commit messages: `<subsystem>: <what it does>`, one or two lines, no trailers (CLAUDE.md).
 - Behaviour to match is Mercurial 7.0.3's Python source. Read the file named in each task before writing code.
-- Out of scope: `revlogv2` (`exp-revlogv2.2`), `changelogv2` (`exp-changelog-v2`), changegroup `04`, narrow, largefiles, LFS. These stay "Unknown requirement".
+- Out of scope: `revlogv2` (`exp-revlogv2.2`), `changelogv2` (`exp-changelog-v2`), changegroup `04`, narrow and LFS stay unsupported. Unknown repository requirements remain refused. Keep the existing partial acceptance of `largefiles`; its blob commands remain unsupported.
 - The server never writes `.n` / `.nd` nodemap files.
 - Requirement names exactly: `persistent-nodemap`, `treemanifest`.
 - Bundle2 `changegroup` capability: `01,02,03` for every repository. `getbundle` sends the highest version both sides list, except a treemanifest repository only sends `03`.
@@ -381,15 +381,15 @@ git commit -m "server: serve changegroup 01 to legacy clients"
 **Interfaces:**
 - Consumes: V1 unpacker (Task 3).
 - Produces:
-  - `Response::Pushres { ret: i64, output: Bytes }`. ssh: two frames, the output and then `ret` as decimal (`_sshv1respondbytes(b'')`, `_sshv1respondbytes(b'%d' % res)`). HTTP: body `"{ret}\n{output}"`.
-  - `push.rs`: a bundle starting `HG10UN`, `HG10GZ` (zlib) or `HG10BZ` (bzip2 with the `BZ` magic stripped, as `exchange.readbundle` re-adds it) is decoded and its `01` changegroup applied with the same checks and locking as bundle2 pushes, replying `Pushres { ret: 1, output }` on success and Mercurial's bundle1 error reply for a heads mismatch. A bundle2 changegroup part with `version=01` (or none) is applied with the V1 unpacker.
+  - `Response::Pushres { ret: i64, output: Bytes }`. ssh: an empty frame followed by `ret` as framed decimal (`_sshv1respondbytes(b'')`, `_sshv1respondbytes(b'%d' % res)`); output is used only by HTTP's `"{ret}\n{output}"` body. `Pusherr` uses Mercurial's transport-specific heads-race reply.
+  - `push.rs`: decode `HG10UN`, `HG10GZ` (zlib), `HG10BZ` (restore stripped `BZ` magic), and headerless leading-NUL `01` wire changegroups, as `exchange.readbundle` does. Apply with the same checks and locking as bundle2, replying `Pushres { ret: 1, output }` on success and Mercurial's bundle1 error reply for a heads mismatch. A bundle2 changegroup part with `version=01` (or none) uses the V1 unpacker.
   - Caps: `unbundle=HG10GZ,HG10BZ,HG10UN` instead of plain `unbundle`.
 
 - [x] **Step 1: Write the failing tests**
 
 `bundle1_push_over_ssh_and_http` (serve.rs): from a clone, commit, `hg push --config devel.legacy.exchange=bundle1` over ssh and over HTTP; server `hg verify` passes and has the commit.
 
-`bundle2_cg01_part_is_applied` (push.rs): build a bundle2 with stock `hg bundle -t 'none-v2;cg.version=01' -r tip --base <parent>` from a clone, `apply_repo` it, the revision is in the changelog and `hg verify` passes.
+`bundle2_cg01_part_is_applied` (push.rs): generate V1 with stock `hg bundle -t 'none-v2;cg.version=01' -r tip --base <parent>` (Mercurial actually emits `HG10UN`), wrap its raw V1 payload in a real HG20 changegroup part, then `apply_repo`; the revision is in the changelog and `hg verify` passes. Test explicit and omitted version parameters.
 
 `hg10_compressions_decode` (push.rs): `hg bundle -t gzip-v1`, `bzip2-v1`, `none-v1` of the same revision each apply.
 
@@ -397,7 +397,7 @@ git commit -m "server: serve changegroup 01 to legacy clients"
 
 - [x] **Step 2: Run them to verify they fail**
 
-Run: `cargo test -p mononoke --lib push:: repo:: && cargo test -p mononoke --test serve bundle1 -- --test-threads=1`
+Run: `cargo test -p mononoke --lib && cargo test -p mononoke --test serve bundle1 -- --test-threads=1`
 Expected: failures.
 
 - [x] **Step 3: Implement** as in Interfaces. Read `wireprotov1server.py` `unbundle`, `wireprotoserver.py` (`pushres` encoding), `exchange.py` `readbundle`, `bundle2.py` `handlechangegroup` first.
@@ -423,7 +423,7 @@ git commit -m "push: accept changegroup 01 and bundle1 pushes"
 
 **Interfaces:**
 - Produces, in `names.rs`:
-  - `pub struct BranchCache { names: Vec<Vec<u8>>, branch_of: Vec<u32>, closed: Vec<bool> }` built from changeset extras (`branch`, missing means `default`; `close` marks closed), with `fn extend(&mut self, repo: &RevlogRepo) -> Result<()>` reading only revisions it has not seen, and `fn heads(&self, parents: &[[Option<u32>; 2]]) -> BTreeMap<Vec<u8>, Vec<u32>>` (parents per revision from the changelog index; a revision is a branch head unless a child on the same branch exists; closed heads included; ordered by revision). `fn tip(&self, name: &[u8], parents: &[[Option<u32>; 2]]) -> Option<u32>`: the highest open head, or the highest head when all are closed (`branchtip`).
+  - `pub struct BranchCache { names: Vec<Vec<u8>>, branch_of: Vec<u32>, closed: Vec<bool> }` built from changeset extras (`branch`, missing means `default`; `close` marks closed), with `fn extend(&mut self, repo: &RevlogRepo) -> Result<()>` reading only revisions it has not seen, and `fn heads(&self, parents: &[[Option<u32>; 2]]) -> BTreeMap<Vec<u8>, Vec<u32>>` (parents per revision from the changelog index; a branch head has no descendant on the same branch, including paths leaving and re-entering it; closed heads included; ordered by revision). `fn tip(&self, name: &[u8], parents: &[[Option<u32>; 2]]) -> Option<u32>`: the highest open head, or the highest head when all are closed (`branchtip`).
   - `pub fn global_tags(repo: &RevlogRepo, heads: &[NodeHash]) -> Result<Vec<(Vec<u8>, NodeHash)>>`: `.hgtags` from every head merged as `tags.py` `_readtags`/`_updatetags` do, null nodes removing a tag, plus `.hg/localtags`.
   - `pub fn dirstate_parent(hg_dir: &Path) -> Result<NodeHash>`: p1 from `.hg/dirstate` (dirstate-v1: first 20 bytes; dirstate-v2: the docket's parents, see `dirstateutils/docket.py`), `NULL_HASH` when there is no dirstate.
   - `resolve_key` follows `scmutil.revsymbol`: `.`/`tip`/`null`, revision number, full hash, then bookmarks, tags, branches (`namespaces.py` order, branch → `tip`), then hash prefix.
@@ -446,7 +446,7 @@ git commit -m "push: accept changegroup 01 and bundle1 pushes"
 
 - [x] **Step 2: Run them to verify they fail**
 
-Run: `cargo test -p mononoke --lib names:: && cargo test -p mononoke --test serve lookup branch -- --test-threads=1`
+Run: `cargo test -p mononoke --lib names:: && cargo test -p mononoke --test serve lookup -- --test-threads=1 && cargo test -p mononoke --test serve branch -- --test-threads=1`
 Expected: failures.
 
 - [x] **Step 3: Implement** as in Interfaces. Read `scmutil.py` `revsymbol`, `namespaces.py`, `tags.py`, `branchmap.py`, `localrepo.py` `branches`/`branchtip`, `dirstateutils/docket.py` first.
@@ -474,15 +474,15 @@ git commit -m "server: resolve tags, named branches and . and report real branch
 **Interfaces:**
 - Produces:
   - `RevlogRepo::hgrc_value(&self, section: &str, key: &str) -> Result<Option<String>>`: reads `.hg/hgrc` on every call (so edits apply without restart); `[section]` headers, `key = value`, `#`/`;` comments, continuation lines starting with whitespace. Missing file → `None`.
-  - `Request::Protocaps { caps }` → `Response::Protocaps` encoded `OK`. `Request::ClonebundlesManifest` → `Response::Clonebundles(String)` with `.hg/clonebundles.manifest` as is (empty if missing). `Request::Clonebundles` drops lines starting with `peer-bundle-cache://`. Caps `clonebundles` and `clonebundles_manifest` are advertised only when the manifest file exists (`hgext/clonebundles.py`).
-  - `Request::GetCachedBundleInline { path }` → `Response::GetCachedBundleInline(BundleStream)` with `prefer_uncompressed: true`: uvarint length then the file, from `<.hg>/<peer-bundle-cache-root>/<path>`; Mercurial's errors when the setting or file is missing (`clonebundle %s does not exist`) or the canonical path leaves the root (`clonebundle %s is using an illegal path`).
+  - `Request::Protocaps { caps }` → `Response::Protocaps` encoded `OK`, advertised over SSH. `Request::ClonebundlesManifest` → `Response::Clonebundles(String)` with nonempty manifest lines normalized to LF and a final LF. Both commands return empty bytes when the manifest is missing/empty. `Request::Clonebundles` drops lines starting with `peer-bundle-cache://`. Caps `clonebundles` and `clonebundles_manifest` are advertised when the manifest exists, including an empty file.
+  - `Request::GetCachedBundleInline { path }` → `Response::GetCachedBundleInline(BundleStream)` with `prefer_uncompressed: true`: uvarint length then the file, below the configured root relative to `.hg`, defaulting to `bundle-cache`. Missing file: `clonebundle %s does not exist`; canonical path outside the root: `clonebundle %s is using an illegal path`. Stock SSH clients report generic stream failure for an unframed error; HTTP and server logs retain the exact message.
   - `Request::Streamout` → `Response::Streamout(BundleStream)`: stream v1 (`streamclone.generatev1wireproto`): `0\n`, `"{filecount} {bytecount}\n"`, then per file `"{name}\0{size}\n"` and its bytes, from `list_store` under the store lock. HTTP sends it uncompressed (`streamreslegacy`). Caps: `stream` when the streamed requirements are only `revlogv1`, otherwise `streamreqs=…` (as `_capabilities`).
 
 - [x] **Step 1: Write the failing tests**
 
 `parses_new_commands` (hgproto request tests): `stream_out\n`, `protocaps\ncaps 5\nfoo b`, `clonebundles_manifest\n* 0\n`, `get_cached_bundle_inline\npath 3\na.b` parse to the new requests.
 
-`stream_out_matches_hg_serve` (serve.rs): `cmd=stream_out` bytes equal on a flat repo without persistent-nodemap, and `hg clone --stream --config experimental.stream-v2=false` (check `streamclone.py` for the exact switch) clones and verifies.
+`stream_out_matches_hg_serve` (serve.rs): `cmd=stream_out` bytes equal on a flat repo without persistent-nodemap, and `hg clone --stream --config devel.legacy.exchange=bundle1` clones and verifies (the installed version has no `experimental.stream-v2` switch).
 
 `clonebundles_match_hg_serve` (serve.rs): with a manifest holding one `https://` line and one `peer-bundle-cache://b.hg` line: both commands' bytes equal `hg serve --config extensions.clonebundles=`.
 
@@ -492,7 +492,7 @@ git commit -m "server: resolve tags, named branches and . and report real branch
 
 - [x] **Step 2: Run them to verify they fail**
 
-Run: `cargo test -p hgproto && cargo test -p mononoke --test serve stream_out clonebundle -- --test-threads=1`
+Run: `cargo test -p hgproto && cargo test -p mononoke --test serve stream_out -- --test-threads=1 && cargo test -p mononoke --test serve clonebundle -- --test-threads=1`
 Expected: failures.
 
 - [x] **Step 3: Implement** as in Interfaces. Read `wireprotov1server.py` (`stream`, `clonebundles`, `clonebundles_2`, `get_cached_bundle_inline`, `protocaps`, `_capabilities`), `streamclone.py` (`generatev1`, `generatev1wireproto`), `bundlecaches.py` `get_manifest` first.
@@ -514,11 +514,11 @@ git commit -m "server: serve stream_out, clone bundles and protocaps"
 **Files:**
 - Modify: `docs/hg-serve-differences.md`, `docs/running.md`
 
-- [ ] **Step 1: Update** "Repository formats": `persistent-nodemap` and `treemanifest` accepted; the server reads but never writes nodemap files, and `hg` brings them up to date. "Refused" keeps revlogv2/changelogv2/narrow. "Wire protocol commands": every v1 command is implemented except largefiles/LFS; remove the "Not implemented or partial" items that are done. "Serving": the server now reads `[server] peer-bundle-cache-root` from `.hg/hgrc` and nothing else. `running.md`: how to set up `clonebundles.manifest` and inline clone bundles.
+- [x] **Step 1: Update** "Repository formats": `persistent-nodemap` and `treemanifest` accepted; the server reads but never writes nodemap files, and `hg` brings them up to date. "Refused" keeps revlogv2/changelogv2/narrow. "Wire protocol commands": every v1 command is implemented except largefiles/LFS; remove the "Not implemented or partial" items that are done. "Serving": the server now reads `[server] peer-bundle-cache-root` from `.hg/hgrc` and nothing else. `running.md`: how to set up `clonebundles.manifest` and inline clone bundles.
 
-- [ ] **Step 2: Verify**: every command name and requirement in the docs matches the code (`grep` the capability strings in `server/src/repo.rs`).
+- [x] **Step 2: Verify**: every command name and requirement in the docs matches the code (`grep` the capability strings in `server/src/repo.rs`).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs
