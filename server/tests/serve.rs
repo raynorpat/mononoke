@@ -2143,6 +2143,417 @@ fn node_of(repo: &Path, rev: &str) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn init_names_repo(root: &Path) -> PathBuf {
+    let repo = init_zstd_repo(root);
+    for args in [
+        vec!["tag", "v1.0", "-r", "0", "-u", "test"],
+        vec!["branch", "stable"],
+        vec!["commit", "-m", "stable", "-u", "test"],
+        vec!["tag", "moved", "-r", "0", "-u", "test"],
+        vec!["tag", "-f", "moved", "-r", "2", "-u", "test"],
+        vec!["commit", "--close-branch", "-m", "closed", "-u", "test"],
+        vec!["update", "-r", "2"],
+    ] {
+        assert_hg(&hg(&repo, &args), "names fixture");
+    }
+    fs::write(repo.join("open"), b"open").unwrap();
+    assert_hg(&hg(&repo, &["add", "open"]), "add open");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "open", "-u", "test"]),
+        "open head",
+    );
+    assert_hg(&hg(&repo, &["bookmark", "bookmark"]), "bookmark");
+    assert_hg(&hg(&repo, &["update", "-r", "0"]), "update root");
+    assert_hg(&hg(&repo, &["branch", "feature x"]), "feature branch");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "feature", "-u", "test"]),
+        "feature",
+    );
+    assert_hg(&hg(&repo, &["branch", "closed"]), "closed branch");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "closed base", "-u", "test"]),
+        "closed base",
+    );
+    assert_hg(
+        &hg(
+            &repo,
+            &["commit", "--close-branch", "-m", "closed", "-u", "test"],
+        ),
+        "closed branch",
+    );
+    assert_hg(
+        &hg(&repo, &["tag", "--local", "local", "-r", "0"]),
+        "local tag",
+    );
+    repo
+}
+
+#[test]
+fn lookup_matches_hg_serve() {
+    let temp = TempDir::new("names-lookup");
+    let repo = init_names_repo(&temp.0);
+    assert_hg(
+        &hg(&repo, &["debugbuilddag", "--from-existing", "+32"]),
+        "prefix collisions",
+    );
+    let log = temp.0.join("mononoke.log");
+    let mono = Running::start(&repo, &log);
+    let stock = HgServe::start(&repo);
+    let prefix = node_of(&repo, "2")[..6].to_string();
+    let nodes = hg(&repo, &["log", "-T", "{node}\n"]).stdout;
+    let digit = b"0123456789abcdef"
+        .iter()
+        .find(|&&b| {
+            nodes
+                .split(|c| *c == b'\n')
+                .filter(|n| n.first() == Some(&b))
+                .count()
+                > 1
+        })
+        .unwrap();
+    let ambiguous = format!("x{}", char::from(*digit));
+    for key in [
+        ".", "tip", "null", "0", "-1", "v1.0", "moved", "local", "stable", "closed", "bookmark",
+        &prefix, &ambiguous, "nosuch",
+    ] {
+        let query = format!("cmd=lookup&key={key}");
+        assert_eq!(
+            raw_command(mono.port, &query),
+            raw_command(stock.port, &query),
+            "lookup {key}"
+        );
+    }
+    // Fresh local tags and working-copy parents do not change the changelog stamp.
+    assert_hg(&hg(&repo, &["update", "-r", "0"]), "update while serving");
+    assert_hg(
+        &hg(&repo, &["tag", "--local", "fresh", "-r", "2"]),
+        "local while serving",
+    );
+    for key in [".", "fresh"] {
+        let query = format!("cmd=lookup&key={key}");
+        assert_eq!(
+            raw_command(mono.port, &query),
+            raw_command(stock.port, &query)
+        );
+    }
+    assert_hg(
+        &hg(&repo, &["tag", "--local", "stable", "-r", "0"]),
+        "tag shadows branch",
+    );
+    // cachedlocalrepo watches changelog/bookmarks, not localtags; recreate
+    // the stock reference to compare current namespace precedence.
+    drop(stock);
+    let stock = HgServe::start(&repo);
+    let query = "cmd=lookup&key=stable";
+    assert_eq!(
+        raw_command(mono.port, query),
+        raw_command(stock.port, query),
+        "namespace precedence after local tag"
+    );
+    assert_eq!(
+        raw_command(mono.port, query),
+        format!("1 {}\n", node_of(&repo, "0")).as_bytes()
+    );
+    assert_hg(
+        &hg(&repo, &["bookmark", "-f", "-r", "2", "stable"]),
+        "bookmark shadows tag",
+    );
+    drop(stock);
+    let stock = HgServe::start(&repo);
+    assert_eq!(
+        raw_command(mono.port, query),
+        raw_command(stock.port, query),
+        "namespace precedence after bookmark"
+    );
+    assert_eq!(
+        raw_command(mono.port, query),
+        format!("1 {}\n", node_of(&repo, "2")).as_bytes()
+    );
+}
+
+#[test]
+fn lookup_ignores_missing_global_tag_targets() {
+    let temp = TempDir::new("names-missing-target");
+    let repo = init_zstd_repo(&temp.0);
+    assert_hg(&hg(&repo, &["branch", "stable"]), "stable branch");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "stable", "-u", "test"]),
+        "stable commit",
+    );
+    let root = node_of(&repo, "0");
+    let prefix = format!("x{}", &root[..6]);
+    let missing = "ab".repeat(20);
+    fs::write(
+        repo.join(".hgtags"),
+        format!("{missing} broken\n{missing} stable\n{missing} {prefix}\n"),
+    )
+    .unwrap();
+    assert_hg(&hg(&repo, &["add", ".hgtags"]), "add missing-target tags");
+    assert_hg(
+        &hg(
+            &repo,
+            &["commit", "-m", "missing tag targets", "-u", "test"],
+        ),
+        "commit missing-target tags",
+    );
+    let log = temp.0.join("mononoke.log");
+    let mono = Running::start(&repo, &log);
+    let stock = HgServe::start(&repo);
+    for key in ["broken", "stable", &prefix] {
+        let query = format!("cmd=lookup&key={key}");
+        let want = raw_command(stock.port, &query);
+        let expected = if key == prefix {
+            format!("1 {root}\n")
+        } else {
+            format!("0 unknown revision '{key}'\n")
+        };
+        assert_eq!(want, expected.as_bytes(), "stock {key}");
+        assert_eq!(raw_command(mono.port, &query), want, "missing target {key}");
+    }
+}
+
+fn parsed_branchmap(
+    bytes: &[u8],
+) -> std::collections::BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> {
+    bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut parts = line.split(|b| *b == b' ');
+            (
+                parts.next().unwrap().to_vec(),
+                parts.map(<[u8]>::to_vec).collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn branch_names_with_spaces_are_quoted() {
+    let temp = TempDir::new("names-branchmap");
+    let repo = init_names_repo(&temp.0);
+    // A legacy Latin-1 branch name exercises byte-preserving lookup parsing.
+    let create = "from mercurial import context; repo.commitctx(context.memctx(repo, [repo[b'tip'].node(), repo.nullid], b'raw branch', [], lambda *args: None, user=b'test', extra={b'branch': b'raw\\xff%+/' }))";
+    assert_hg(&hg(&repo, &["debugshell", "-c", create]), "raw branch");
+    let log = temp.0.join("mononoke.log");
+    let mono = Running::start(&repo, &log);
+    let stock = HgServe::start(&repo);
+    let got = raw_command(mono.port, "cmd=branchmap");
+    assert_eq!(
+        parsed_branchmap(&got),
+        parsed_branchmap(&raw_command(stock.port, "cmd=branchmap"))
+    );
+    assert!(!got.ends_with(b"\n"));
+    assert!(got.windows(11).any(|s| s == b"feature%20x"));
+    // This hg/Python build rejects non-ASCII query values in parse_qsl;
+    // exercise successful lookup through its byte-preserving SSH transport.
+    let mut answers = Vec::new();
+    for (label, bin) in [
+        ("stock", PathBuf::from("hg")),
+        ("mono", sibling_bin("hgcli")),
+    ] {
+        let shim_dir = temp.0.join(label);
+        fs::create_dir(&shim_dir).unwrap();
+        let shim = write_ssh_shim(&shim_dir, &bin, &repo);
+        let out = hg_ssh(
+            &temp.0,
+            &["identify", "-i", "-r", "raw\u{ff}%+/", "ssh://dummy/repo"],
+            &shim,
+        );
+        assert_hg(&out, "SSH legacy-name lookup");
+        answers.push(out.stdout);
+    }
+    assert_eq!(answers[0], answers[1]);
+    let dest = temp.0.join("pull-dest");
+    assert_hg(&hg(&temp.0, &["init", "pull-dest"]), "init pull");
+    let url = format!("http://127.0.0.1:{}/", mono.port);
+    assert_hg(
+        &hg(&dest, &["pull", "-r", "feature x", &url]),
+        "pull feature",
+    );
+    assert_eq!(node_of(&dest, "tip"), node_of(&repo, "feature x"));
+    assert_hg(
+        &hg(&dest, &["pull", "-r", "raw\u{ff}%+/", &url]),
+        "pull normalized legacy name",
+    );
+    assert_eq!(node_of(&dest, "tip"), node_of(&repo, "tip"));
+}
+
+#[test]
+fn branch_cache_tracks_pushes_commits_and_strip() {
+    let temp = TempDir::new("names-reload");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let mono = Running::start(&repo, &log);
+    let stock = HgServe::start(&repo);
+    let check = |stock_port| {
+        assert_eq!(
+            parsed_branchmap(&raw_command(mono.port, "cmd=branchmap")),
+            parsed_branchmap(&raw_command(stock_port, "cmd=branchmap"))
+        )
+    };
+    check(stock.port);
+    assert_hg(&hg(&repo, &["branch", "stable"]), "outside branch");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "stable", "-u", "test"]),
+        "outside commit",
+    );
+    check(stock.port);
+    assert_hg(&hg(&repo, &["branch", "-f", "default"]), "re-enter branch");
+    assert_hg(
+        &hg(&repo, &["commit", "-m", "default", "-u", "test"]),
+        "transition commit",
+    );
+    check(stock.port);
+    drop(stock);
+    // Windows keeps mapped revlogs open, so strip an independent copy and
+    // replace the changelog atomically while Mononoke retains its old view.
+    assert_hg(
+        &hg(&temp.0, &["clone", "--pull", "-U", "repo", "stripped"]),
+        "offline strip clone",
+    );
+    let stripped = temp.0.join("stripped");
+    assert_hg(
+        &hg(
+            &stripped,
+            &[
+                "--config",
+                "extensions.strip=",
+                "strip",
+                "--no-backup",
+                "-r",
+                "1",
+            ],
+        ),
+        "outside strip",
+    );
+    for name in ["00changelog.i", "00changelog.d"] {
+        let old = repo.join(".hg/store").join(name);
+        if old.exists() {
+            fs::rename(&old, repo.join(format!("old-{name}"))).unwrap();
+        }
+        let replacement = stripped.join(".hg/store").join(name);
+        if replacement.exists() {
+            fs::copy(replacement, old).unwrap();
+        }
+    }
+    let stock = HgServe::start(&repo);
+    check(stock.port);
+    let url = format!("http://127.0.0.1:{}/", mono.port);
+    assert_hg(
+        &hg(&temp.0, &["clone", &url, "client"]),
+        "clone push client",
+    );
+    let client = temp.0.join("client");
+    assert_hg(&hg(&client, &["branch", "pushed"]), "pushed branch");
+    assert_hg(
+        &hg(&client, &["commit", "-m", "pushed", "-u", "test"]),
+        "pushed commit",
+    );
+    assert_hg(
+        &hg(&client, &["push", "--new-branch", &url]),
+        "push new branch",
+    );
+    check(stock.port);
+    assert_eq!(
+        raw_command(mono.port, "cmd=lookup&key=pushed"),
+        raw_command(stock.port, "cmd=lookup&key=pushed")
+    );
+}
+
+#[test]
+fn lookup_dirstate_v2_matches_hg_serve() {
+    let temp = TempDir::new("names-dsv2");
+    let repo = init_zstd_repo(&temp.0);
+    assert_hg(
+        &hg(
+            &repo,
+            &[
+                "debugupgraderepo",
+                "--run",
+                "--config",
+                "format.use-dirstate-v2=true",
+                "--config",
+                "storage.dirstate-v2.slow-path=allow",
+            ],
+        ),
+        "upgrade dirstate",
+    );
+    fs::write(
+        repo.join(".hg/hgrc"),
+        b"[storage]\ndirstate-v2.slow-path=allow\n",
+    )
+    .unwrap();
+    let log = temp.0.join("mononoke.log");
+    let mono = Running::start(&repo, &log);
+    let stock = HgServe::start(&repo);
+    assert_eq!(
+        raw_command(mono.port, "cmd=lookup&key=."),
+        raw_command(stock.port, "cmd=lookup&key=.")
+    );
+}
+
+#[test]
+fn branches_matches_hg_serve() {
+    let temp = TempDir::new("names-branches");
+    let repo = init_merge_rename_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let mono = Running::start(&repo, &log);
+    let stock = HgServe::start(&repo);
+    for query in [
+        "cmd=branches&nodes=".to_string(),
+        format!(
+            "cmd=branches&nodes={}%20{}",
+            node_of(&repo, "tip"),
+            node_of(&repo, "3")
+        ),
+        format!("cmd=branches&nodes={}", "0".repeat(40)),
+    ] {
+        assert_eq!(
+            raw_command(mono.port, &query),
+            raw_command(stock.port, &query),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn clone_r_tag_and_branch() {
+    let temp = TempDir::new("names-clone");
+    let repo = init_names_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let mono = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", mono.port);
+    for (key, dest) in [
+        ("v1.0", "tag-dest"),
+        ("stable", "branch-dest"),
+        (".", "dot-dest"),
+    ] {
+        assert_hg(
+            &hg(&temp.0, &["clone", "-r", key, &url, dest]),
+            "clone named revision",
+        );
+        let want = hg(
+            &repo,
+            &[
+                "log",
+                "-r",
+                &format!("ancestors('{key}')"),
+                "-T",
+                "{node}\n",
+            ],
+        );
+        assert_hg(&want, "ancestor nodes");
+        let got = hg(
+            &temp.0.join(dest),
+            &["log", "-r", "sort(all(), rev)", "-T", "{node}\n"],
+        );
+        assert_hg(&got, "clone nodes");
+        assert_eq!(got.stdout, want.stdout, "clone {key}");
+        assert_hg(&hg(&temp.0.join(dest), &["verify"]), "verify named clone");
+    }
+}
+
 /// `GET /?<query>` with `Connection: close`. Returns the body, zlib-inflated
 /// when it is a stream response (`application/mercurial-0.1`).
 fn raw_command(port: u16, query: &str) -> Vec<u8> {

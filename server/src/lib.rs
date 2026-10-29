@@ -10,6 +10,7 @@ pub mod bundle;
 pub mod errors;
 pub mod http;
 pub mod listener;
+pub mod names;
 pub mod push;
 pub mod repo;
 pub mod stream;

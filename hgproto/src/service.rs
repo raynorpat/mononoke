@@ -225,7 +225,7 @@ pub trait HgCommands {
     }
 
     // @wireprotocommand('branchmap')
-    fn branchmap(&self) -> HgCommandRes<HashMap<String, HashSet<NodeHash>>> {
+    fn branchmap(&self) -> HgCommandRes<HashMap<Vec<u8>, HashSet<NodeHash>>> {
         unimplemented("branchmap")
     }
 
@@ -279,7 +279,7 @@ pub trait HgCommands {
     }
 
     // @wireprotocommand('lookup', 'key')
-    fn lookup(&self, _key: String) -> HgCommandRes<NodeHash> {
+    fn lookup(&self, _key: Vec<u8>) -> HgCommandRes<NodeHash> {
         unimplemented("lookup")
     }
 

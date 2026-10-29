@@ -580,6 +580,7 @@ fn frame_request(cmd: &str, query: &HashMap<String, Vec<u8>>, body: &[u8]) -> Re
     match cmd {
         "capabilities" | "hello" | "branchmap" | "heads" => {}
         "getbundle" => write_star(&mut buf, &args),
+        "branches" => write_kv(&mut buf, "nodes", arg_or_empty(&args, "nodes")),
         "changegroup" => write_kv(&mut buf, "roots", require(&args, "roots")?),
         "changegroupsubset" => {
             write_kv(&mut buf, "bases", require(&args, "bases")?);
@@ -689,6 +690,7 @@ fn response_body(response: &Response) -> Result<Bytes> {
         Response::Batch(_)
         | Response::Lookup(_)
         | Response::Between(_)
+        | Response::Branches(_)
         | Response::Branchmap(_)
         | Response::Debugwireargs(_)
         | Response::Hello(_)
@@ -697,7 +699,7 @@ fn response_body(response: &Response) -> Result<Bytes> {
         | Response::Pushkey(_)
         | Response::Listkeys(_)
         | Response::Unbundle(_) => Ok(hgproto::sshproto::response::encode_cmd(response)),
-        Response::Branches(_) | Response::Clonebundles(_) | Response::Streamout => {
+        Response::Clonebundles(_) | Response::Streamout => {
             Err("HTTP response is not implemented for this command".into())
         }
     }

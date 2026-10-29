@@ -11,6 +11,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::batch;
 use crate::Response;
+use mercurial_types::NULL_HASH;
 
 fn separated<I, W>(write: &mut W, iter: I, sep: &str) -> io::Result<()>
 where
@@ -128,7 +129,16 @@ pub fn encode_cmd(response: &Response) -> Bytes {
             names.sort();
             let mut out = Vec::new();
             for name in names {
-                out.extend_from_slice(name.as_bytes());
+                if !out.is_empty() {
+                    out.push(b'\n');
+                }
+                for &byte in name {
+                    if byte.is_ascii_alphanumeric() || b"_.-~/".contains(&byte) {
+                        out.push(byte);
+                    } else {
+                        write!(&mut out, "%{byte:02X}").expect("write vec");
+                    }
+                }
                 let mut nodes: Vec<_> = map[name].iter().collect();
                 nodes.sort();
                 for node in nodes {
@@ -136,7 +146,22 @@ pub fn encode_cmd(response: &Response) -> Bytes {
                     let hex = node.to_hex();
                     out.extend_from_slice(hex.as_str().as_bytes());
                 }
-                out.push(b'\n');
+            }
+            Bytes::from(out)
+        }
+
+        Response::Branches(branches) => {
+            let mut out = Vec::new();
+            for b in branches {
+                writeln!(
+                    &mut out,
+                    "{} {} {} {}",
+                    b.top,
+                    b.node,
+                    b.p0.unwrap_or(NULL_HASH),
+                    b.p1.unwrap_or(NULL_HASH)
+                )
+                .expect("write vec");
             }
             Bytes::from(out)
         }

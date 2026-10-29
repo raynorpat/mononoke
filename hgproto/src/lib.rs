@@ -50,6 +50,12 @@ pub struct BranchRes {
     p1: Option<NodeHash>,
 }
 
+impl BranchRes {
+    pub fn new(top: NodeHash, node: NodeHash, p0: Option<NodeHash>, p1: Option<NodeHash>) -> Self {
+        Self { top, node, p0, p1 }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum Request {
     Batch {
@@ -83,7 +89,7 @@ pub enum Request {
         namespace: String,
     },
     Lookup {
-        key: String,
+        key: Vec<u8>,
     },
     Known {
         nodes: Vec<NodeHash>,
@@ -142,7 +148,7 @@ impl Debug for GetbundleArgs {
 pub enum Response {
     Batch(Vec<Bytes>),
     Between(Vec<Vec<NodeHash>>),
-    Branchmap(HashMap<String, HashSet<NodeHash>>),
+    Branchmap(HashMap<Vec<u8>, HashSet<NodeHash>>),
     Branches(Vec<BranchRes>),
     Clonebundles(String),
     Capabilities(Vec<String>),

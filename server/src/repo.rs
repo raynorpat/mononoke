@@ -34,6 +34,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::bundle::{history_part, legacy_changegroup, Selection};
 use crate::errors::Result;
+use crate::names::{self, BranchCache};
 use crate::stream::{list_store, stream_part, stream_requirements, StoreFile};
 
 pub struct Repo {
@@ -46,6 +47,7 @@ pub struct Repo {
     /// Keeps the last listing, with the changelog it was made against, for
     /// later stream clones. A push clears it.
     store_listing: tokio::sync::Mutex<Option<(ChangelogStamp, Arc<Vec<StoreFile>>)>>,
+    branch_cache: std::sync::Mutex<BranchCache>,
     logger: Logger,
 }
 
@@ -163,6 +165,7 @@ impl Repo {
             path: format!("{:?}", path),
             revlogs: mercurial::RevlogRepo::open(path)?,
             changelog_seen,
+            branch_cache: std::sync::Mutex::new(BranchCache::default()),
             store_listing: tokio::sync::Mutex::new(None),
             logger: parent_logger.new(o!("repo" => format!("{:?}", path))),
         })
@@ -173,6 +176,7 @@ impl Repo {
     /// store listing. Blocks; run it off the runtime thread.
     pub fn warm_up(&self) -> Result<()> {
         self.hgrepo().changelog_revlog().load_node_map()?;
+        self.with_branches(|_, _| Ok(()))?;
         if stream_requirements(self.hgrepo()).is_some() {
             self.stream_listing()?;
         }
@@ -187,7 +191,10 @@ impl Repo {
         let mut seen = self.changelog_seen.lock().expect("changelog stamp lock");
         if *seen != now {
             match self.revlogs.reload() {
-                Ok(()) => *seen = now,
+                Ok(()) => {
+                    *self.branch_cache.lock().expect("branch cache lock") = BranchCache::default();
+                    *seen = now;
+                }
                 Err(err) => warn!(
                     self.logger,
                     "reload after an outside change failed: {}", err
@@ -195,6 +202,18 @@ impl Repo {
             }
         }
         &self.revlogs
+    }
+
+    // Keep reload and branch metadata in the same lock order: stamp, then cache.
+    fn with_branches<T>(
+        &self,
+        f: impl FnOnce(&mercurial::RevlogRepo, &BranchCache) -> Result<T>,
+    ) -> Result<T> {
+        self.hgrepo();
+        let _stamp = self.changelog_seen.lock().expect("changelog stamp lock");
+        let mut cache = self.branch_cache.lock().expect("branch cache lock");
+        cache.extend(&self.revlogs)?;
+        f(&self.revlogs, &cache)
     }
 
     /// Record the changelog as this server's own push left it, so the push
@@ -411,69 +430,6 @@ async fn stream_clone_part(repo: &Arc<Repo>) -> hgproto::Result<PartEncodeBuilde
     stream_part(files, &requirements).map_err(|err| hgproto::Error::from(err.to_string()))
 }
 
-/// Resolve a `lookup` key as Mercurial's `revsymbol` does for the forms a
-/// remote asks about: `null`, `tip`, a revision number (negative counts from
-/// the end), a full hash, a bookmark, then a unique hash prefix. Tags, branch
-/// names and `.` are not resolved.
-fn resolve_key(
-    repo: &mercurial::RevlogRepo,
-    bookmarks: &[(Vec<u8>, Vec<u8>)],
-    key: &str,
-) -> std::result::Result<NodeHash, String> {
-    let changelog = repo.changelog_revlog();
-    let len = i64::from(changelog.len().map_err(|err| err.to_string())?);
-    let node_at = |rev: i64| {
-        changelog
-            .get_entry(RevIdx::from(rev as u32))
-            .map(|entry| entry.nodeid)
-            .map_err(|err| err.to_string())
-    };
-    match key {
-        "null" => return Ok(NULL_HASH),
-        "tip" if len == 0 => return Ok(NULL_HASH),
-        "tip" => return node_at(len - 1),
-        _ => {}
-    }
-    // Only the canonical spelling is a number, so `01` is not rev 1. Out of
-    // range falls through to the names below, as in Mercurial.
-    if let Ok(num) = key.parse::<i64>() {
-        let rev = if num < 0 { num + len } else { num };
-        if num.to_string() == key && (0..len).contains(&rev) {
-            return node_at(rev);
-        }
-    }
-    if key.len() == 40 {
-        if let Ok(node) = key.parse::<NodeHash>() {
-            if changelog.index_of(&node).is_ok() {
-                return Ok(node);
-            }
-        }
-    }
-    if let Some((_, hex)) = bookmarks.iter().find(|(name, _)| name == key.as_bytes()) {
-        return std::str::from_utf8(hex)
-            .ok()
-            .and_then(|hex| hex.parse().ok())
-            .ok_or_else(|| format!("bookmark '{key}' has a bad node"));
-    }
-    if !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        let prefix = key.to_ascii_lowercase();
-        let mut found = None;
-        for rev in 0..len {
-            let node = node_at(rev)?;
-            if node.to_hex().as_str().starts_with(&prefix) {
-                if found.is_some() {
-                    return Err(format!("00changelog@{key}: ambiguous identifier"));
-                }
-                found = Some(node);
-            }
-        }
-        if let Some(node) = found {
-            return Ok(node);
-        }
-    }
-    Err(format!("unknown revision '{key}'"))
-}
-
 struct ParentStream {
     repo: Arc<Repo>,
     n: NodeHash,
@@ -528,23 +484,68 @@ impl Stream for ParentStream {
 
 impl HgCommands for RepoClient {
     // @wireprotocommand('branchmap')
-    fn branchmap(&self) -> HgCommandRes<HashMap<String, HashSet<NodeHash>>> {
-        info!(self.logger, "branchmap");
+    fn branchmap(&self) -> HgCommandRes<HashMap<Vec<u8>, HashSet<NodeHash>>> {
         let repo = Arc::clone(&self.repo);
         async move {
-            let mut heads = repo
-                .hgrepo()
-                .get_heads()
-                .map_err(hgproto::Error::from)
-                .try_collect::<HashSet<_>>()
-                .await?;
-            heads.remove(&NULL_HASH);
-            let mut map = HashMap::new();
-            // An empty repository has no branches, and hg cannot parse a branch without heads.
-            if !heads.is_empty() {
-                map.insert("default".to_string(), heads);
+            tokio::task::spawn_blocking(move || {
+                repo.with_branches(|hg, cache| {
+                    let parents = names::changelog_parents(hg)?;
+                    let log = hg.changelog_revlog();
+                    cache
+                        .heads(&parents)
+                        .into_iter()
+                        .map(|(name, revisions)| {
+                            let nodes = revisions
+                                .into_iter()
+                                .map(|r| log.get_entry(RevIdx::from(r)).map(|e| e.nodeid))
+                                .collect::<std::result::Result<HashSet<_>, _>>()?;
+                            Ok((name, nodes))
+                        })
+                        .collect()
+                })
+            })
+            .await
+            .map_err(|e| hgproto::Error::from(e.to_string()))?
+            .map_err(|e| hgproto::Error::from(e.to_string()))
+        }
+        .boxed()
+    }
+
+    fn branches(&self, mut nodes: Vec<NodeHash>) -> HgCommandRes<Vec<hgproto::BranchRes>> {
+        let repo = Arc::clone(&self.repo);
+        async move {
+            let log = repo.hgrepo().changelog_revlog();
+            if nodes.is_empty() {
+                let len = log.len()?;
+                nodes.push(if len == 0 {
+                    NULL_HASH
+                } else {
+                    log.get_entry(RevIdx::from(len - 1))?.nodeid
+                });
             }
-            Ok(map)
+            let mut result = Vec::new();
+            for top in nodes {
+                let mut node = top;
+                loop {
+                    let (p1, p2) = if node == NULL_HASH {
+                        (None, None)
+                    } else {
+                        let e = log.get_entry_by_nodeid(&node)?;
+                        (
+                            e.p1.map(|r| log.get_entry(r).map(|e| e.nodeid))
+                                .transpose()?,
+                            e.p2.map(|r| log.get_entry(r).map(|e| e.nodeid))
+                                .transpose()?,
+                        )
+                    };
+                    if p2.is_some() || p1.is_none() {
+                        result.push(hgproto::BranchRes::new(top, node, p1, p2));
+                        break;
+                    }
+                    node = p1.expect("linear parent");
+                }
+            }
+            Ok(result)
         }
         .boxed()
     }
@@ -634,16 +635,20 @@ impl HgCommands for RepoClient {
     }
 
     // @wireprotocommand('lookup', 'key')
-    fn lookup(&self, key: String) -> HgCommandRes<NodeHash> {
-        info!(self.logger, "lookup {}", key);
+    fn lookup(&self, key: Vec<u8>) -> HgCommandRes<NodeHash> {
+        info!(self.logger, "lookup {:?}", key);
         let repo = Arc::clone(&self.repo);
         async move {
             let bookmarks = bookmark_pairs(&repo).await?;
             // A hash prefix scans the changelog.
-            tokio::task::spawn_blocking(move || resolve_key(repo.hgrepo(), &bookmarks, &key))
-                .await
-                .map_err(|err| hgproto::Error::from(err.to_string()))?
-                .map_err(hgproto::Error::from)
+            tokio::task::spawn_blocking(move || {
+                repo.with_branches(|hg, cache| {
+                    names::resolve_key(hg, cache, &bookmarks, &key).map_err(Into::into)
+                })
+            })
+            .await
+            .map_err(|err| hgproto::Error::from(err.to_string()))?
+            .map_err(|e| hgproto::Error::from(e.to_string()))
         }
         .boxed()
     }

@@ -537,7 +537,7 @@ fn parse_request<'a>(input: &'a [u8], parse_params: ParamParser) -> ParseRes<'a,
     if let Some(val) = attempt(parse_named(input, b"lookup", parse_params, 1, |kv| {
         Ok(Request::Lookup {
             // A revision number, hash prefix or bookmark, not an identifier.
-            key: parseval(&kv, "key", value_string)?,
+            key: parseval(&kv, "key", |input| Ok((b"".as_slice(), input.to_vec())))?,
         })
     }))? {
         return Ok(val);
@@ -1335,7 +1335,7 @@ mod test_parse {
         test_parse(
             inp,
             Request::Lookup {
-                key: "bookmarks".to_string(),
+                key: b"bookmarks".to_vec(),
             },
         );
 
@@ -1345,10 +1345,21 @@ mod test_parse {
             test_parse(
                 inp.as_str(),
                 Request::Lookup {
-                    key: key.to_string(),
+                    key: key.as_bytes().to_vec(),
                 },
             );
         }
+    }
+
+    #[test]
+    fn lookup_preserves_non_utf8_bytes() {
+        let mut input = bytes::BytesMut::from(b"lookup\nkey 4\nraw\xff".as_slice());
+        assert_eq!(
+            parse(&mut input).unwrap(),
+            Some(Request::Lookup {
+                key: b"raw\xff".to_vec()
+            })
+        );
     }
 
     #[test]

@@ -430,7 +430,7 @@ git commit -m "push: accept changegroup 01 and bundle1 pushes"
   - `Repo` keeps a `BranchCache` behind a mutex: built in `warm_up` after the node map, extended before each `branchmap`/`lookup`, rebuilt when `hgrepo()` reloads.
   - `branchmap`: real branches; the response line is `quote(name) node node…`, joined by `\n` with no trailing newline (fix the current encoder). `branches(nodes)`: `localrepo.branches` (empty → tip) encoded as `wireprototypes.encodelist` lines; HTTP framing for `branches nodes=`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `branch_heads_follow_mercurial` (names.rs): fixture with branches `default`, `stable` (two heads, one closed), `feature x` (with a space): `heads()` equals `hg heads --closed -T "{branch}:{rev}\n"`.
 
@@ -444,19 +444,19 @@ git commit -m "push: accept changegroup 01 and bundle1 pushes"
 
 `clone_r_tag_and_branch` (serve.rs): `hg clone -r v1.0` and `hg clone -r stable` get only the right ancestors.
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p mononoke --lib names:: && cargo test -p mononoke --test serve lookup branch -- --test-threads=1`
 Expected: failures.
 
-- [ ] **Step 3: Implement** as in Interfaces. Read `scmutil.py` `revsymbol`, `namespaces.py`, `tags.py`, `branchmap.py`, `localrepo.py` `branches`/`branchtip`, `dirstateutils/docket.py` first.
+- [x] **Step 3: Implement** as in Interfaces. Read `scmutil.py` `revsymbol`, `namespaces.py`, `tags.py`, `branchmap.py`, `localrepo.py` `branches`/`branchtip`, `dirstateutils/docket.py` first.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test --workspace && cargo test -p mononoke --test serve -- --test-threads=1`
 Expected: pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add hgproto server
