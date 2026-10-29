@@ -844,6 +844,10 @@ impl RevlogInner {
             }
         }
 
+        // Mercurial reports the null node as the head of an empty revlog.
+        if heads.is_empty() {
+            return Ok(HashSet::from([mercurial_types::NULL_HASH]));
+        }
         // Convert to a set of nodeids
         Ok(heads.values().map(|n| n.nodeid).collect())
     }

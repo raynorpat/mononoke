@@ -507,14 +507,18 @@ impl HgCommands for RepoClient {
         info!(self.logger, "branchmap");
         let repo = Arc::clone(&self.repo);
         async move {
-            let heads = repo
+            let mut heads = repo
                 .hgrepo()
                 .get_heads()
                 .map_err(hgproto::Error::from)
                 .try_collect::<HashSet<_>>()
                 .await?;
+            heads.remove(&NULL_HASH);
             let mut map = HashMap::new();
-            map.insert("default".to_string(), heads);
+            // An empty repository has no branches, and hg cannot parse a branch without heads.
+            if !heads.is_empty() {
+                map.insert("default".to_string(), heads);
+            }
             Ok(map)
         }
         .boxed()
@@ -663,6 +667,7 @@ impl HgCommands for RepoClient {
     fn unbundle(&self, heads: Vec<NodeHash>, bundle: Bytes) -> HgCommandRes<Bytes> {
         info!(self.logger, "unbundle heads {:?}", heads);
         let repo = Arc::clone(&self.repo);
+        let logger = self.logger.clone();
         async move {
             let mut listing = repo.store_listing.lock().await;
             // Cleared before writing, so even a failed push lists the store again.
@@ -671,10 +676,14 @@ impl HgCommands for RepoClient {
             // `hgrepo()` again under the locks, to see anything hg wrote while we waited.
             let applied = crate::push::apply_repo(repo.hgrepo(), &heads, &bundle);
             repo.note_own_write();
-            let applied = applied.map_err(|err| hgproto::Error::from(err.to_string()))?;
-            crate::push::reply_bundle(&applied)
-                .await
-                .map_err(|err| hgproto::Error::from(err.to_string()))
+            let reply = match applied {
+                Ok(applied) => crate::push::reply_bundle(&applied).await,
+                Err(err) => {
+                    warn!(logger, "push failed: {}", err);
+                    crate::push::abort_bundle(&err.to_string()).await
+                }
+            };
+            reply.map_err(|err| hgproto::Error::from(err.to_string()))
         }
         .boxed()
     }

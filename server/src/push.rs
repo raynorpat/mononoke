@@ -74,6 +74,9 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
                 cg_part = kind == "changegroup";
                 if cg_part {
                     changegroup_ids.push(header.part_id());
+                    if param(&header, "treemanifest").is_ok() {
+                        use_treemanifest(repo)?;
+                    }
                 } else if kind == "pushkey" {
                     apply_pushkey(repo, &header)?;
                 }
@@ -127,14 +130,24 @@ pub(crate) async fn reply_bundle(applied: &Applied) -> Result<Bytes> {
 }
 
 async fn push_raced_bundle() -> Result<Bytes> {
-    let mut bundle = mercurial_bundles::Bundle2EncodeBuilder::new(Cursor::new(Vec::new()));
-    bundle.set_compressor_type(CompressorType::Uncompressed);
-    let mut part = PartEncodeBuilder::mandatory("error:pushraced").map_err(bundle_err)?;
-    part.add_mparam(
-        "message",
+    error_bundle(
+        "error:pushraced",
         "remote repository changed while pushing - please try again",
     )
-    .map_err(bundle_err)?;
+    .await
+}
+
+/// Reply to a push that failed, so the client shows `message`.
+pub(crate) async fn abort_bundle(message: &str) -> Result<Bytes> {
+    error_bundle("error:abort", message).await
+}
+
+async fn error_bundle(kind: &str, message: &str) -> Result<Bytes> {
+    let mut bundle = mercurial_bundles::Bundle2EncodeBuilder::new(Cursor::new(Vec::new()));
+    bundle.set_compressor_type(CompressorType::Uncompressed);
+    let mut part = PartEncodeBuilder::mandatory(kind).map_err(bundle_err)?;
+    part.add_mparam("message", message.to_string())
+        .map_err(bundle_err)?;
     bundle.add_part(part);
     let cursor = bundle.build().await.map_err(bundle_err)?;
     Ok(Bytes::from(cursor.into_inner()))
@@ -233,12 +246,12 @@ fn append_group(
     section: &Section,
     chunks: Vec<CgDeltaChunk>,
 ) -> Result<()> {
+    let mut revlog = revlog_for(repo, section)?;
     let mut left = chunks;
     while !left.is_empty() {
         let batch = std::mem::take(&mut left);
         let mut progress = false;
         for chunk in batch {
-            let mut revlog = revlog_for(repo, section)?;
             if revlog.index_of(&chunk.node).is_ok() {
                 progress = true;
                 continue;
@@ -278,10 +291,24 @@ fn append_group(
             return Err("changegroup revision has no parent in the revlog".into());
         }
     }
-    if let Section::Filelog(path) = section {
-        repo.record_file_data(path)?;
+    match section {
+        Section::Filelog(path) => repo.record_file_data(path)?,
+        Section::Treemanifest(dir) => repo.record_dir_data(dir)?,
+        Section::Changeset | Section::Manifest => {}
     }
     Ok(())
+}
+
+/// A changegroup with directory manifests needs a treemanifest repository.
+/// An empty flat one becomes one, as Mercurial does.
+fn use_treemanifest(repo: &RevlogRepo) -> Result<()> {
+    if repo.is_treemanifest() {
+        return Ok(());
+    }
+    if repo.changelog_revlog().len()? != 0 {
+        return Err("bundle contains tree manifests, but local repo is non-empty and does not use tree manifests".into());
+    }
+    Ok(repo.add_requirement(Required::Treemanifest)?)
 }
 
 fn revlog_for(repo: &RevlogRepo, section: &Section) -> Result<Revlog> {
@@ -289,7 +316,7 @@ fn revlog_for(repo: &RevlogRepo, section: &Section) -> Result<Revlog> {
         Section::Changeset => Ok(repo.changelog_revlog()),
         Section::Manifest => Ok(repo.manifest_revlog()),
         Section::Filelog(path) => Ok(repo.file_revlog_for_append(path)?),
-        Section::Treemanifest(_) => Err("directory manifests are not accepted yet".into()),
+        Section::Treemanifest(dir) => Ok(repo.dir_revlog_for_append(dir)?),
     }
 }
 

@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 
 use futures::future::{self, BoxFuture, FutureExt};
@@ -121,7 +121,7 @@ impl FromStr for Required {
 #[derive(Debug, Clone)]
 pub struct RevlogRepo {
     basepath: PathBuf, // path to .hg directory
-    requirements: HashSet<Required>, // requirements
+    requirements: Arc<RwLock<HashSet<Required>>>, // requirements, shared by clones
     inner: Arc<Mutex<RevlogInner>>, // Inner parts
 }
 
@@ -135,7 +135,7 @@ struct RevlogInner {
 impl PartialEq<Self> for RevlogRepo {
     fn eq(&self, other: &Self) -> bool {
         self.basepath == other.basepath
-            && self.requirements == other.requirements
+            && Arc::ptr_eq(&self.requirements, &other.requirements)
             && Arc::ptr_eq(&self.inner, &other.inner)
     }
 }
@@ -146,26 +146,16 @@ impl RevlogRepo {
         let base = base.into();
         let store = base.as_path().join("store");
 
+        let req = read_requirements(&base)?;
+        // `hg init` writes no store revlogs until the first commit or push.
+        for name in ["00changelog.i", "00manifest.i"] {
+            if !store.join(name).exists() {
+                fs::write(store.join(name), [])?;
+            }
+        }
         let changelog = Revlog::from_idx_data(store.join("00changelog.i"), None as Option<String>)?;
         let manifest = Revlog::from_idx_data(store.join("00manifest.i"), None as Option<String>)?;
 
-        let mut req = HashSet::new();
-        let file = fs::File::open(base.join("requires")).chain_err(|| "Can't open `requires`")?;
-        for line in BufReader::new(file).lines() {
-            req.insert(line.chain_err(|| "Line read failed")?.parse()?);
-        }
-        if req.contains(&Required::ShareSafe) {
-            let file = match fs::File::open(store.join("requires")) {
-                Ok(file) => file,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Err("share-safe is set but `.hg/store/requires` is missing".into());
-                }
-                Err(err) => return Err(err.into()),
-            };
-            for line in BufReader::new(file).lines() {
-                req.insert(line.chain_err(|| "Line read failed")?.parse()?);
-            }
-        }
         if req.contains(&Required::PersistentNodemap) {
             changelog.use_persistent_nodemap()?;
             manifest.use_persistent_nodemap()?;
@@ -173,7 +163,7 @@ impl RevlogRepo {
 
         Ok(RevlogRepo {
             basepath: base,
-            requirements: req,
+            requirements: Arc::new(RwLock::new(req)),
             inner: Arc::new(Mutex::new(RevlogInner {
                 changelog: changelog,
                 manifest: manifest,
@@ -239,8 +229,36 @@ impl RevlogRepo {
         .boxed()
     }
 
-    pub fn get_requirements(&self) -> &HashSet<Required> {
-        &self.requirements
+    pub fn get_requirements(&self) -> HashSet<Required> {
+        self.requirements.read().expect("poisoned lock").clone()
+    }
+
+    fn has_requirement(&self, req: Required) -> bool {
+        self.requirements.read().expect("poisoned lock").contains(&req)
+    }
+
+    /// Record `req` in `.hg/store/requires` under share-safe, else in
+    /// `.hg/requires`, as Mercurial does for store requirements.
+    pub fn add_requirement(&self, req: Required) -> Result<()> {
+        let mut reqs = self.requirements.write().expect("poisoned lock");
+        if reqs.contains(&req) {
+            return Ok(());
+        }
+        let path = if reqs.contains(&Required::ShareSafe) {
+            self.store_path().join("requires")
+        } else {
+            self.basepath.join("requires")
+        };
+        let mut bytes = fs::read(&path)?;
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        bytes.extend_from_slice(format!("{}\n", req).as_bytes());
+        let tmp = path.with_extension("tmp");
+        fs::write(&tmp, &bytes)?;
+        fs::rename(&tmp, &path)?;
+        reqs.insert(req);
+        Ok(())
     }
 
     /// Live changelog. Clones share the revlog the repo is already serving.
@@ -261,6 +279,7 @@ impl RevlogRepo {
         inner.changelog.reload()?;
         inner.manifest.reload()?;
         inner.filelogcache.clear();
+        *self.requirements.write().expect("poisoned lock") = read_requirements(&self.basepath)?;
         Ok(())
     }
 
@@ -270,7 +289,7 @@ impl RevlogRepo {
     }
 
     fn file_store_path(&self, path: &Path, ext: &[u8]) -> PathBuf {
-        let dotencode = self.requirements.contains(&Required::Dotencode);
+        let dotencode = self.has_requirement(Required::Dotencode);
         self.basepath
             .join("store")
             .join(path.store_filelog(dotencode, ext))
@@ -278,11 +297,11 @@ impl RevlogRepo {
 
     /// Whether manifests are stored per directory, under `meta/`.
     pub fn is_treemanifest(&self) -> bool {
-        self.requirements.contains(&Required::Treemanifest)
+        self.has_requirement(Required::Treemanifest)
     }
 
     fn dir_store_path(&self, dir: &Path, ext: &[u8]) -> PathBuf {
-        let dotencode = self.requirements.contains(&Required::Dotencode);
+        let dotencode = self.has_requirement(Required::Dotencode);
         self.store_path().join(dir.store_dirlog(dotencode, ext))
     }
 
@@ -358,7 +377,7 @@ impl RevlogRepo {
                 fs::create_dir_all(dir)?;
             }
             fs::write(&index, [])?;
-            self.record_fncache(path, b"i")?;
+            self.record_fncache(b"data/", path, b".i")?;
         }
         self.get_file_revlog(path)
     }
@@ -366,21 +385,41 @@ impl RevlogRepo {
     /// Add the filelog's `.d` to fncache once appends have split it out of the index.
     pub fn record_file_data(&self, path: &Path) -> Result<()> {
         if self.file_store_path(path, b"d").exists() {
-            self.record_fncache(path, b"d")?;
+            self.record_fncache(b"data/", path, b".d")?;
         }
         Ok(())
     }
 
-    fn record_fncache(&self, path: &Path, ext: &[u8]) -> Result<()> {
-        if !self.requirements.contains(&Required::Fncache) {
+    /// Directory manifest revlog used for appends. Creates an empty index when new.
+    pub fn dir_revlog_for_append(&self, dir: &Path) -> Result<Revlog> {
+        let index = self.dir_store_path(dir, b"i");
+        if !index.exists() {
+            if let Some(parent) = index.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&index, [])?;
+            self.record_fncache(b"meta/", dir, b"/00manifest.i")?;
+        }
+        self.read_dir_revlog(dir)
+    }
+
+    /// Add the directory revlog's `.d` to fncache once appends have split it out.
+    pub fn record_dir_data(&self, dir: &Path) -> Result<()> {
+        if self.dir_store_path(dir, b"d").exists() {
+            self.record_fncache(b"meta/", dir, b"/00manifest.d")?;
+        }
+        Ok(())
+    }
+
+    fn record_fncache(&self, prefix: &[u8], path: &Path, suffix: &[u8]) -> Result<()> {
+        if !self.has_requirement(Required::Fncache) {
             return Ok(());
         }
         // Mercurial keeps the file name with only directory encoding, not the
         // case-folded or hashed store path.
-        let mut name = b"data/".to_vec();
+        let mut name = prefix.to_vec();
         name.extend_from_slice(path.as_slice());
-        name.push(b'.');
-        name.extend_from_slice(ext);
+        name.extend_from_slice(suffix);
         let rel = encodedir(&name);
         let fncache = self.basepath.join("store").join("fncache");
         let mut bytes = match fs::read(&fncache) {
@@ -405,6 +444,28 @@ impl RevlogRepo {
         let inner = self.inner.lock().expect("poisoned lock");
         ChangesetStream::new(&inner.changelog)
     }
+}
+
+/// Lines of `.hg/requires`, plus `.hg/store/requires` under share-safe.
+fn read_requirements(base: &std::path::Path) -> Result<HashSet<Required>> {
+    let mut req = HashSet::new();
+    let file = fs::File::open(base.join("requires")).chain_err(|| "Can't open `requires`")?;
+    for line in BufReader::new(file).lines() {
+        req.insert(line.chain_err(|| "Line read failed")?.parse()?);
+    }
+    if req.contains(&Required::ShareSafe) {
+        let file = match fs::File::open(base.join("store").join("requires")) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err("share-safe is set but `.hg/store/requires` is missing".into());
+            }
+            Err(err) => return Err(err.into()),
+        };
+        for line in BufReader::new(file).lines() {
+            req.insert(line.chain_err(|| "Line read failed")?.parse()?);
+        }
+    }
+    Ok(req)
 }
 
 pub struct ChangesetBlobFiller(RevlogRepo);
@@ -477,6 +538,14 @@ mod test {
         outer: &[&str],
         store: Option<&[&str]>,
     ) -> crate::errors::Result<RevlogRepo> {
+        let dir = make_split(label, outer, store);
+        let opened = RevlogRepo::open(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        opened
+    }
+
+    /// A minimal `.hg` directory the caller removes.
+    fn make_split(label: &str, outer: &[&str], store: Option<&[&str]>) -> std::path::PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -500,9 +569,86 @@ mod test {
         let empty = include_bytes!("revlog/empty.i.bin");
         fs::write(dir.join("store").join("00changelog.i"), empty).expect("changelog");
         fs::write(dir.join("store").join("00manifest.i"), empty).expect("manifest");
-        let opened = RevlogRepo::open(&dir);
+        dir
+    }
+
+    fn lines(path: &std::path::Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn add_requirement_writes_store_requires_when_share_safe() {
+        let dir = make_split("addtree", &["share-safe"], Some(&["store", "revlogv1"]));
+        let repo = RevlogRepo::open(&dir).expect("open");
+        let before = repo.clone();
+        repo.add_requirement(Required::Treemanifest).expect("add");
+        let store = lines(&dir.join("store").join("requires"));
+        let outer = lines(&dir.join("requires"));
+        let reopened = RevlogRepo::open(&dir).expect("reopen");
         let _ = fs::remove_dir_all(&dir);
-        opened
+        assert!(store.iter().any(|l| l == "treemanifest"), "{store:?}");
+        assert!(!outer.iter().any(|l| l == "treemanifest"), "{outer:?}");
+        assert!(before.is_treemanifest());
+        assert!(reopened.is_treemanifest());
+    }
+
+    #[test]
+    fn add_requirement_writes_outer_requires_without_share_safe() {
+        let dir = make_split("addtree-outer", &["store", "revlogv1"], None);
+        let repo = RevlogRepo::open(&dir).expect("open");
+        let before = repo.clone();
+        repo.add_requirement(Required::Treemanifest).expect("add");
+        repo.add_requirement(Required::Treemanifest).expect("add again");
+        let outer = lines(&dir.join("requires"));
+        let reopened = RevlogRepo::open(&dir).expect("reopen");
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(outer, ["store", "revlogv1", "treemanifest"]);
+        assert!(before.is_treemanifest());
+        assert!(reopened.is_treemanifest());
+    }
+
+    #[test]
+    fn reload_sees_requirement_added_by_hg() {
+        let dir = make_split("reload-tree", &["store", "revlogv1"], None);
+        let repo = RevlogRepo::open(&dir).expect("open");
+        fs::write(dir.join("requires"), "store\nrevlogv1\ntreemanifest\n").expect("requires");
+        let reloaded = repo.reload();
+        let _ = fs::remove_dir_all(&dir);
+        reloaded.expect("reload");
+        assert!(repo.get_requirements().contains(&Required::Treemanifest));
+    }
+
+    #[test]
+    fn dir_revlog_for_append_records_fncache() {
+        let dir = make_split("dirappend", &["store", "fncache", "dotencode", "revlogv1"], None);
+        let repo = RevlogRepo::open(&dir).expect("open");
+        let sub = mercurial_types::Path::new(b"Sub/Dir").expect("path");
+        let revlog = repo.dir_revlog_for_append(&sub).map(|_| ());
+        let fncache = lines(&dir.join("store").join("fncache"));
+        let index = dir
+            .join("store")
+            .join(sub.store_dirlog(true, b"i"))
+            .exists();
+        let dirs = repo.manifest_dirs();
+        let _ = fs::remove_dir_all(&dir);
+        revlog.expect("dir revlog");
+        assert_eq!(fncache, ["meta/Sub/Dir/00manifest.i"]);
+        assert!(index);
+        assert_eq!(dirs.expect("dirs"), [sub]);
+    }
+
+    #[test]
+    fn open_empty_repo_without_revlogs() {
+        let dir = make_split("empty", &["store", "revlogv1"], None);
+        fs::remove_file(dir.join("store").join("00changelog.i")).expect("rm changelog");
+        fs::remove_file(dir.join("store").join("00manifest.i")).expect("rm manifest");
+        let repo = RevlogRepo::open(&dir).map(|repo| repo.changelog_revlog().len());
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(repo.expect("open").expect("len"), 0);
     }
 
     fn hg(repo: &std::path::Path, args: &[&str]) -> process::Output {

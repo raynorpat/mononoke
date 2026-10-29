@@ -1777,3 +1777,212 @@ fn flat_repo_still_offers_02() {
     assert_hg(&hg(&temp.0.join("dest"), &["verify"]), "verify");
     drop(server);
 }
+
+/// Stock `hg serve` on a free port, killed on drop. Push is allowed over plain HTTP.
+struct HgServe {
+    child: Child,
+    port: u16,
+}
+
+impl HgServe {
+    fn start(repo: &Path) -> Self {
+        let _guard = lock_ports();
+        let port = free_port();
+        let mut child = Command::new("hg")
+            .current_dir(repo)
+            .args(["serve", "-a", "127.0.0.1", "-p", &port.to_string()])
+            .args(["--config", "web.push_ssl=false"])
+            .args(["--config", "web.allow-push=*"])
+            .env("HGPLAIN", "1")
+            .env("HGRCPATH", "")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn hg serve");
+        let started = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            if started.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                panic!("hg serve did not listen on {port}");
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("hg serve exited {status}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        HgServe { child, port }
+    }
+}
+
+impl Drop for HgServe {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn assert_ok_with_log(output: &Output, what: &str, log: &Path) {
+    assert!(
+        output.status.success(),
+        "{what} failed:\n{}\n{}\nmononoke:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        read_log(log)
+    );
+}
+
+/// The served repo verifies and has the client's tip files and contents.
+fn assert_same_tip(served: &Path, client: &Path) {
+    assert_hg(&hg(served, &["verify"]), "served verify");
+    let files = hg(client, &["files", "-r", "tip"]);
+    assert_hg(&files, "client files");
+    let got = hg(served, &["files", "-r", "tip"]);
+    assert_hg(&got, "served files");
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout),
+        String::from_utf8_lossy(&files.stdout)
+    );
+    for file in String::from_utf8_lossy(&files.stdout).lines() {
+        let want = hg(client, &["cat", "-r", "tip", file]);
+        assert_hg(&want, "client cat");
+        let got = hg(served, &["cat", "-r", "tip", file]);
+        assert_hg(&got, "served cat");
+        assert_eq!(got.stdout, want.stdout, "{file}");
+    }
+}
+
+/// Serves `init_tree_repo` over ssh, clones it to `dest`, lets `edit` change
+/// the clone, then commits and pushes. Returns the server, its ssh shim and log.
+fn push_tree_edit(temp: &TempDir, edit: impl FnOnce(&Path)) -> (Running, PathBuf, PathBuf) {
+    let repo = init_tree_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let clone = hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "dest"], &shim);
+    assert_ok_with_log(&clone, "clone", &log);
+    let dest = temp.0.join("dest");
+    edit(&dest);
+    assert_hg(
+        &hg(&dest, &["commit", "-Aqm", "edit", "-u", "test"]),
+        "commit edit",
+    );
+    assert_ok_with_log(&hg_ssh(&dest, &["push"], &shim), "push", &log);
+    (server, shim, log)
+}
+
+#[test]
+fn tree_repo_push_round_trips() {
+    let temp = TempDir::new("tp");
+    let server = push_tree_edit(&temp, |dest| {
+        fs::create_dir_all(dest.join("new").join("inner")).expect("mkdir new");
+        fs::write(dest.join("new").join("inner").join("n"), b"n\n").expect("write n");
+        fs::write(dest.join("a").join("deep").join("z"), b"3\n").expect("write z");
+        assert_hg(&hg(dest, &["rm", "-q", "B"]), "hg rm B");
+    });
+    assert_same_tip(&temp.0.join("repo"), &temp.0.join("dest"));
+    drop(server);
+}
+
+#[test]
+fn tree_repo_with_encoded_dir_names_round_trips() {
+    let temp = TempDir::new("te");
+    let long: String = std::iter::once('L')
+        .chain(std::iter::repeat('o').take(199))
+        .collect();
+    let (server, shim, log) = push_tree_edit(&temp, |dest| {
+        fs::create_dir_all(dest.join("Upper").join("Case")).expect("mkdir Upper/Case");
+        fs::write(dest.join("Upper").join("Case").join("f"), b"u\n").expect("write u");
+        fs::create_dir_all(dest.join(&long)).expect("mkdir long");
+        fs::write(dest.join(&long).join("f"), b"l\n").expect("write long");
+    });
+    let dest = temp.0.join("dest");
+    assert_same_tip(&temp.0.join("repo"), &dest);
+    let clone = hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "again"], &shim);
+    assert_ok_with_log(&clone, "stream clone", &log);
+    let stdout = String::from_utf8_lossy(&clone.stdout);
+    assert!(stdout.contains("streaming all changes"), "{stdout}");
+    assert_same_tip(&temp.0.join("again"), &dest);
+    drop(server);
+}
+
+#[test]
+fn tree_push_into_empty_flat_repo_adds_requirement() {
+    let temp = TempDir::new("tf");
+    fs::create_dir_all(temp.0.join("src")).expect("mkdir src");
+    let source = init_tree_repo(&temp.0.join("src"));
+    assert_hg(&hg(&temp.0, &["init", "empty"]), "hg init");
+    let repo = temp.0.join("empty");
+    let store_requires = repo.join(".hg").join("store").join("requires");
+    let before = fs::read_to_string(&store_requires).expect("store requires");
+    assert!(!requirements(&repo).lines().any(|line| line == "treemanifest"));
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let push = hg_ssh(&source, &["push", "ssh://user@dummy/empty"], &shim);
+    assert_ok_with_log(&push, "push", &log);
+    let after = fs::read_to_string(&store_requires).expect("store requires");
+    assert_eq!(after, format!("{before}treemanifest\n"));
+    assert_same_tip(&repo, &source);
+    drop(server);
+}
+
+#[test]
+fn tree_push_into_flat_repo_is_refused() {
+    let temp = TempDir::new("tr");
+    fs::create_dir_all(temp.0.join("src")).expect("mkdir src");
+    let source = init_tree_repo(&temp.0.join("src"));
+    let repo = init_share_safe_repo(&temp.0);
+    let changelog = repo.join(".hg").join("store").join("00changelog.i");
+    let before = fs::read(&changelog).expect("changelog");
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let push = hg_ssh(&source, &["push", "-f", "ssh://user@dummy/repo"], &shim);
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    assert!(!push.status.success(), "push succeeded:\n{stderr}");
+    assert!(
+        stderr.contains(
+            "bundle contains tree manifests, but local repo is non-empty and does not use tree manifests"
+        ),
+        "{stderr}\nmononoke:\n{}",
+        read_log(&log)
+    );
+    assert!(fs::read(&changelog).expect("changelog") == before, "changelog changed");
+    drop(server);
+}
+
+#[test]
+fn flat_client_push_into_tree_repo_matches_hg() {
+    let temp = TempDir::new("tc");
+    init_share_safe_repo(&temp.0);
+    assert_hg(&hg(&temp.0, &["clone", "-q", "repo", "client"]), "flat clone");
+    let client = temp.0.join("client");
+    for name in ["mono", "stock"] {
+        assert_hg(
+            &hg(&temp.0, &["init", name, "--config", "experimental.treemanifest=1"]),
+            "hg init tree",
+        );
+    }
+    let log = temp.0.join("mononoke.log");
+    let mono = Running::start(&temp.0.join("mono"), &log);
+    let stock = HgServe::start(&temp.0.join("stock"));
+    for port in [mono.port, stock.port] {
+        let url = format!("http://127.0.0.1:{port}/");
+        assert_ok_with_log(&hg(&client, &["push", &url]), "push", &log);
+    }
+    drop(mono);
+    drop(stock);
+    let mut outputs = Vec::new();
+    for name in ["mono", "stock"] {
+        let repo = temp.0.join(name);
+        let verify = hg(&repo, &["verify"]);
+        assert_hg(&verify, &format!("{name} verify"));
+        let index = hg(&repo, &["debugindex", "-m"]);
+        assert_hg(&index, &format!("{name} debugindex"));
+        outputs.push((
+            String::from_utf8_lossy(&verify.stdout).into_owned(),
+            String::from_utf8_lossy(&index.stdout).into_owned(),
+        ));
+    }
+    assert_eq!(outputs[0], outputs[1]);
+}
