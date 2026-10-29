@@ -8,6 +8,7 @@
 
 pub mod changeset;
 pub mod file;
+pub mod lock;
 pub mod manifest;
 pub mod revlog;
 pub mod revlogrepo;

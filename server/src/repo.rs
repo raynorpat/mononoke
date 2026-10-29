@@ -13,6 +13,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use async_compression::CompressorType;
 use bookmarks::{Bookmarks, ListBookmarks};
@@ -21,6 +22,7 @@ use futures::future::BoxFuture;
 use futures::{future, stream, FutureExt, Stream, StreamExt, TryStreamExt};
 use hgproto::{self, BundleStream, GetbundleArgs, HgCommandRes, HgCommands};
 use mercurial::changeset::RevlogChangeset;
+use mercurial::lock::RepoLock;
 use mercurial::revlog::RevIdx;
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{parts, Bundle2EncodeBuilder};
@@ -109,6 +111,7 @@ impl Repo {
         if stream_requirements(&self.hgrepo).is_some() {
             let mut listing = self.store_listing.blocking_lock();
             if listing.is_none() {
+                let _lock = store_lock(&self.hgrepo)?;
                 *listing = Some(Arc::new(list_store(&self.hgrepo)?));
             }
         }
@@ -229,6 +232,50 @@ async fn create_bundle(repo: &Arc<Repo>, args: GetbundleArgs) -> hgproto::Result
     })
 }
 
+/// How long a writer waits for `hg` to release a lock, Mercurial's default `ui.timeout`.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(600);
+const LOCK_POLL: Duration = Duration::from_millis(100);
+
+/// Take the Mercurial lock at `path`, waiting while someone else holds it.
+/// Blocks; the server's runtime has no timer, so run it off the runtime thread.
+fn wait_for_lock(path: &Path) -> Result<RepoLock> {
+    let started = Instant::now();
+    loop {
+        if let Some(lock) = RepoLock::try_acquire(path)? {
+            return Ok(lock);
+        }
+        if started.elapsed() >= LOCK_TIMEOUT {
+            let holder = RepoLock::holder(path).unwrap_or_else(|| "someone".to_owned());
+            return Err(format!(
+                "{} is held by {holder}; if neither hg nor this server holds it, remove it with `hg debuglocks --force-lock`",
+                path.display()
+            )
+            .into());
+        }
+        std::thread::sleep(LOCK_POLL);
+    }
+}
+
+/// The store lock, which `hg` takes for any change under `.hg/store`.
+fn store_lock(repo: &mercurial::RevlogRepo) -> Result<RepoLock> {
+    wait_for_lock(&repo.store_path().join("lock"))
+}
+
+/// `.hg/wlock` then `.hg/store/lock`, in Mercurial's order, for a push or a
+/// bookmark change. Waits on the blocking pool so other requests keep going.
+async fn write_locks(repo: &mercurial::RevlogRepo) -> hgproto::Result<(RepoLock, RepoLock)> {
+    let store = repo.store_path();
+    tokio::task::spawn_blocking(move || -> Result<(RepoLock, RepoLock)> {
+        let hg_dir = store.parent().expect("store is under .hg");
+        let wlock = wait_for_lock(&hg_dir.join("wlock"))?;
+        let lock = wait_for_lock(&store.join("lock"))?;
+        Ok((wlock, lock))
+    })
+    .await
+    .map_err(|err| hgproto::Error::from(err.to_string()))?
+    .map_err(|err| hgproto::Error::from(err.to_string()))
+}
+
 async fn stream_clone_part(repo: &Arc<Repo>) -> hgproto::Result<PartEncodeBuilder> {
     let requirements = stream_requirements(&repo.hgrepo).ok_or_else(|| {
         hgproto::Error::from(
@@ -241,6 +288,7 @@ async fn stream_clone_part(repo: &Arc<Repo>) -> hgproto::Result<PartEncodeBuilde
         if let Some(files) = listing.as_ref() {
             return Ok(Arc::clone(files));
         }
+        let _lock = store_lock(&lister.hgrepo)?;
         let files = Arc::new(list_store(&lister.hgrepo)?);
         *listing = Some(Arc::clone(&files));
         Ok(files)
@@ -517,6 +565,7 @@ impl HgCommands for RepoClient {
         let repo = Arc::clone(&self.repo);
         let key = key.into_bytes();
         async move {
+            let _locks = write_locks(&repo.hgrepo).await?;
             crate::push::pushkey_bookmark(&repo.hgrepo, &key, old, new)
                 .map_err(|err| hgproto::Error::from(err.to_string()))
         }
@@ -531,6 +580,7 @@ impl HgCommands for RepoClient {
             let mut listing = repo.store_listing.lock().await;
             // Cleared before writing, so even a failed push lists the store again.
             *listing = None;
+            let _locks = write_locks(&repo.hgrepo).await?;
             let applied = crate::push::apply_repo(&repo.hgrepo, &heads, &bundle)
                 .map_err(|err| hgproto::Error::from(err.to_string()))?;
             crate::push::reply_bundle(&applied)

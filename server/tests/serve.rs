@@ -1399,3 +1399,48 @@ fn pushed_revision_is_stored_as_a_delta() {
     assert_hg(&hg(&repo, &["update", "-C"]), "update served repo");
     assert_eq!(fs::read(repo.join("big.bin")).expect("served big.bin"), big);
 }
+
+#[test]
+fn push_waits_while_hg_holds_the_store_lock() {
+    let temp = TempDir::new("lw");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    assert_hg(
+        &hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "dest"], &shim),
+        "clone",
+    );
+    let dest = temp.0.join("dest");
+    fs::write(dest.join("a.txt"), b"beta\n").expect("write beta");
+    assert_hg(
+        &hg(&dest, &["commit", "-m", "second", "-u", "test"]),
+        "commit",
+    );
+
+    // Hold the store lock the way `hg` does while it writes.
+    let lock = repo.join(".hg").join("store").join("lock");
+    fs::write(&lock, b"otherhost:12345").expect("write lock");
+    let before = changelog_len(&repo);
+    let push = {
+        let (dest, shim) = (dest.clone(), shim.clone());
+        thread::spawn(move || hg_ssh(&dest, &["push"], &shim))
+    };
+    thread::sleep(Duration::from_secs(3));
+    assert!(!push.is_finished(), "push finished while the lock was held");
+    assert_eq!(
+        changelog_len(&repo),
+        before,
+        "push wrote while the lock was held"
+    );
+
+    fs::remove_file(&lock).expect("release lock");
+    assert_hg(&push.join().expect("push thread"), "push");
+    assert!(changelog_len(&repo) > before, "push did not land");
+    assert!(!lock.exists(), "server left the store lock behind");
+    assert!(
+        !repo.join(".hg").join("wlock").exists(),
+        "server left the wlock behind"
+    );
+    drop(server);
+}
