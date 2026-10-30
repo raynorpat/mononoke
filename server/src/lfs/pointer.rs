@@ -10,10 +10,7 @@ use std::fmt;
 
 use crate::errors::Result;
 
-const VERSIONS: [&str; 2] = [
-    "https://git-lfs.github.com/spec/v1",
-    "https://hawser.github.com/spec/v1",
-];
+const VERSION: &str = "https://git-lfs.github.com/spec/v1";
 
 /// A sha256 object id: 64 lowercase hex characters, so it is safe in paths.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -61,7 +58,7 @@ impl Pointer {
         let mut lines = text.split_terminator('\n');
 
         let version = lines.next().and_then(|l| l.strip_prefix("version "));
-        if !version.map_or(false, |v| VERSIONS.contains(&v)) {
+        if version != Some(VERSION) {
             return Err(bad("missing or unknown version").into());
         }
 
@@ -78,6 +75,7 @@ impl Pointer {
             }
             prev = key;
             match key {
+                "version" => return Err(bad("repeated version").into()),
                 "oid" => {
                     let hex = value.strip_prefix("sha256:").ok_or_else(|| bad("bad oid"))?;
                     oid = Some(Oid::parse(hex)?);
@@ -128,6 +126,8 @@ mod tests {
             format!("{}oid sha256:{}\nsize 12a\n", v, OID),
             format!("{}oid sha256:{}\n", v, OID),
             format!("{}oid sha256:{}\nsize 12\nbad_key 1\n", v, OID),
+            format!("version https://hawser.github.com/spec/v1\noid sha256:{}\nsize 12\n", OID),
+            format!("{}oid sha256:{}\nsize 12\n{}", v, OID, v),
             String::new(),
         ];
         for c in &cases {
