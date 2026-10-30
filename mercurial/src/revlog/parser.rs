@@ -36,6 +36,16 @@ pub enum ParseError {
     BadZlib(String),
     BadLz4(String),
     BadZstd(String),
+    BadFlags(u16),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::BadFlags(bits) => write!(f, "unknown revision flags {:#06x}", bits),
+            other => write!(f, "{:?}", other),
+        }
+    }
 }
 
 pub type ParseResult<'a, T> = Result<(&'a [u8], T), ParseError>;
@@ -56,6 +66,7 @@ bitflags! {
     /// Per-revision flags
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub struct IdxFlags: u16 {
+        const EXTSTORED = 1 << 13;
         const CENSORED = 1 << 15;
     }
 }
@@ -162,9 +173,11 @@ pub fn indexng(input: &[u8]) -> ParseResult<'_, Entry> {
         return Err(ParseError::Incomplete);
     }
     let hash = &input[32..64];
+    let bits = read_u16(&input[6..8]);
+    let flags = IdxFlags::from_bits(bits).ok_or(ParseError::BadFlags(bits))?;
     let entry = Entry {
         offset: read_u48(&input[0..6]),
-        flags: IdxFlags::from_bits(read_u16(&input[6..8])).expect("bad rev idx flags"),
+        flags,
         compressed_len: read_u32(&input[8..12]),
         len: Some(read_u32(&input[12..16])),
         baserev: optional_idx(read_u32(&input[16..20])),

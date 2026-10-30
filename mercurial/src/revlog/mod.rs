@@ -28,7 +28,7 @@ mod nodemap;
 #[cfg(test)]
 mod test;
 
-use self::parser::{Entry, Header, Version};
+use self::parser::{Entry, Header, IdxFlags, Version};
 pub use self::nodemap::docket_uid;
 pub use self::revidx::RevIdx;
 
@@ -320,7 +320,7 @@ impl Revlog {
         compression: RevlogCompression,
     ) -> Result<u32> {
         let mut inner = self.inner.lock().expect("lock poisoned");
-        inner.append_revision(rev, None, compression)
+        inner.append_revision(rev, None, compression, IdxFlags::empty())
     }
 
     /// Append a revision stored as `delta` against the `base` node when that
@@ -332,8 +332,19 @@ impl Revlog {
         delta: Option<(NodeHash, delta::Delta)>,
         compression: RevlogCompression,
     ) -> Result<u32> {
+        self.append_revision_flagged(rev, delta, compression, IdxFlags::empty())
+    }
+
+    /// `append_revision` that also stores `flags` (such as `EXTSTORED`) in the index entry.
+    pub fn append_revision_flagged(
+        &mut self,
+        rev: RevlogAppend,
+        delta: Option<(NodeHash, delta::Delta)>,
+        compression: RevlogCompression,
+        flags: IdxFlags,
+    ) -> Result<u32> {
         let mut inner = self.inner.lock().expect("lock poisoned");
-        inner.append_revision(rev, delta, compression)
+        inner.append_revision(rev, delta, compression, flags)
     }
 
     pub fn len(&self) -> Result<u32> {
@@ -421,7 +432,7 @@ impl RevlogInner {
             }
             Err(err) => {
                 return Err(
-                    ErrorKind::Revlog(format!("failed to parse entry offset {}: {:?}", off, err))
+                    ErrorKind::Revlog(format!("failed to parse entry offset {}: {}", off, err))
                         .into(),
                 )
             }
@@ -880,6 +891,7 @@ impl RevlogInner {
         rev: RevlogAppend,
         delta: Option<(NodeHash, delta::Delta)>,
         compression: RevlogCompression,
+        flags: IdxFlags,
     ) -> Result<u32> {
         if self.header.version != Version::RevlogNG {
             return Err(ErrorKind::Revlog("append_snapshot requires revlog v1".into()).into());
@@ -929,6 +941,7 @@ impl RevlogInner {
                 linkrev,
                 rev.text.len() as u32,
                 &compressed,
+                flags,
             )?;
             self.persist()?;
             Ok(rev_idx)
@@ -1044,7 +1057,7 @@ impl RevlogInner {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     return Err(ErrorKind::Revlog(format!(
-                        "failed to parse entry offset {}: {:?}",
+                        "failed to parse entry offset {}: {}",
                         off, err
                     ))
                     .into())
@@ -1106,6 +1119,7 @@ impl RevlogInner {
         linkrev: u32,
         uncompressed_len: u32,
         compressed: &[u8],
+        flags: IdxFlags,
     ) -> Result<()> {
         let inline = self.header.features.contains(parser::INLINE);
         let fixed = self.fixed_entry_size();
@@ -1130,7 +1144,7 @@ impl RevlogInner {
         };
         let mut packed = pack_indexng(
             data_off,
-            0,
+            flags.bits(),
             compressed.len() as u32,
             uncompressed_len,
             baserev,
