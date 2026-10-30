@@ -168,11 +168,11 @@ fn history_stream(
 
 /// Raw changegroup 01, without a bundle header or bundle2 framing.
 pub fn legacy_changegroup(repo: RevlogRepo, selection: Selection) -> Result<hgproto::BundleStream> {
-    if repo.is_treemanifest() {
-        return Err("cannot produce changegroup 01 for a treemanifest repository".into());
-    }
     if repo.get_requirements().contains(&Required::Lfs) {
         return Err(LFS_REQUIRED.into());
+    }
+    if repo.is_treemanifest() {
+        return Err("cannot produce changegroup 01 for a treemanifest repository".into());
     }
     let parts = history_stream(repo, selection, CgVersion::V1);
     let body = Cg2Packer::with_version(parts, CgVersion::V1)
@@ -610,6 +610,16 @@ fn v1_revision(
         None => (NULL_HASH, Vec::new()),
     };
     let text = full_text(&revlog.get_rev(idx)?)?;
+    // hg patches a base's non-raw text, unless the delta replaces all of it.
+    let delta = match base_idx {
+        Some(base) if !revlog.get_entry(base)?.flags.is_empty() => Delta::new(vec![Fragment {
+            start: 0,
+            end: base_text.len(),
+            content: text,
+        }])
+        .map_err(|err| Error::from(err.to_string()))?,
+        _ => textdiff(&base_text, &text),
+    };
     Ok(Part::CgChunk(
         section,
         CgDeltaChunk {
@@ -619,7 +629,7 @@ fn v1_revision(
             base,
             linknode,
             flags: 0,
-            delta: textdiff(&base_text, &text),
+            delta,
         },
     ))
 }
@@ -1231,14 +1241,19 @@ mod tests {
         let [_, second, _] = append_flagged_revisions(&temp.repo);
         let repo = open_repo(&temp.repo);
         let log = repo.read_file_revlog(&Path::new(b"a.txt").expect("path")).expect("filelog");
-        // cg1 has no base field, so a whole text would be applied to the base.
+        // cg1 has no base field, and hg patches a base's non-raw text, so only
+        // a delta replacing the whole base, which hg never decodes, is valid.
         let base = log.get_rev(RevIdx::from(2u32)).expect("rev 2");
         let section = Section::Filelog(Path::new(b"a.txt").expect("path"));
         let idx = RevIdx::from(3u32);
         match v1_revision(&log, section, idx, Some(RevIdx::from(2u32)), NULL_HASH).expect("part") {
             Part::CgChunk(_, chunk) => assert_eq!(
-                mercurial_types::delta::apply(&full_text(&base).expect("text"), chunk.delta),
-                second
+                chunk.delta.fragments(),
+                &[Fragment {
+                    start: 0,
+                    end: full_text(&base).expect("text").len(),
+                    content: second,
+                }]
             ),
             _ => panic!("expected a chunk"),
         }
@@ -1249,6 +1264,7 @@ mod tests {
         let temp = init_share_safe_repo();
         let repo = open_repo(&temp.repo);
         repo.add_requirement(Required::Lfs).expect("requirement");
+        repo.add_requirement(Required::Treemanifest).expect("requirement");
         let selection = Selection::Common { common: vec![], heads: vec![] };
         let err = legacy_changegroup(repo, selection).err().expect("refused");
         assert_eq!(err.to_string(), LFS_REQUIRED);
