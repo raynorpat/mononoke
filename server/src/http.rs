@@ -24,6 +24,7 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 
 use crate::errors::{Error, Result};
+use crate::lfs;
 use crate::repo::{Repo, RepoClient};
 
 const MAX_HEADERS: usize = 2 * 1024 * 1024;
@@ -38,7 +39,7 @@ pub async fn serve_http(listener: TcpListener, repo: Arc<Repo>) -> Result<()> {
         let repo = Arc::clone(&repo);
         let log = log.clone();
         tokio::spawn(async move {
-            if let Err(err) = connection(sock, repo, log.clone()).await {
+            if let Err(err) = connection(sock, repo, log.clone(), "http").await {
                 error!(log, "HTTP connection failed: {}", err);
             }
         });
@@ -79,7 +80,7 @@ pub async fn serve_https(
                     return;
                 }
             };
-            if let Err(err) = connection(sock, repo, log.clone()).await {
+            if let Err(err) = connection(sock, repo, log.clone(), "https").await {
                 error!(log, "HTTPS connection failed: {}", err);
             }
         });
@@ -123,18 +124,33 @@ fn http_logger() -> Logger {
     Logger::root(drain, o!("proto" => "http"))
 }
 
-async fn connection<S>(mut sock: S, repo: Arc<Repo>, log: Logger) -> Result<()>
+pub(crate) async fn connection<S>(
+    mut sock: S,
+    repo: Arc<Repo>,
+    log: Logger,
+    scheme: &'static str,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let client = RepoClient::new(repo, &log);
+    let client = RepoClient::new(Arc::clone(&repo), &log);
     let service = HgService::new_with_logger(client, &log);
     let mut buf = Vec::new();
     loop {
-        let incoming = match read_request(&mut sock, &mut buf).await? {
-            Some(incoming) => incoming,
+        let head = match read_head(&mut sock, &mut buf).await? {
+            Some(head) => head,
             None => return Ok(()),
         };
+        if let Some(route) = lfs::http::route(&head.target) {
+            let serving = repo.lfs();
+            let close =
+                lfs::http::serve(&mut sock, &mut buf, &head, route, serving, scheme, &log).await?;
+            if close {
+                return Ok(());
+            }
+            continue;
+        }
+        let incoming = read_incoming(&mut sock, &mut buf, head).await?;
         if incoming.method != "GET" && incoming.method != "POST" {
             let msg = format!("unsupported HTTP method {}", incoming.method);
             write_hg(&mut sock, "application/hg-error", msg.as_bytes(), true).await?;
@@ -235,9 +251,17 @@ fn command_name(incoming: &Incoming) -> Result<String> {
     Ok(cmd.to_string())
 }
 
-async fn read_request<S>(sock: &mut S, buf: &mut Vec<u8>) -> Result<Option<Incoming>>
+/// A request line and its headers, with the body still unread.
+pub(crate) struct Head {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) version: String,
+    pub(crate) headers: HashMap<String, String>,
+}
+
+async fn read_head<S>(sock: &mut S, buf: &mut Vec<u8>) -> Result<Option<Head>>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + Unpin,
 {
     let header = loop {
         if let Some(end) = find_double_crlf(buf) {
@@ -253,17 +277,10 @@ where
             return Err("client closed during HTTP headers".into());
         }
     };
-    parse_request(sock, buf, &header).await
+    parse_head(&header).map(Some)
 }
 
-async fn parse_request<S>(
-    sock: &mut S,
-    buf: &mut Vec<u8>,
-    header: &[u8],
-) -> Result<Option<Incoming>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+fn parse_head(header: &[u8]) -> Result<Head> {
     let text =
         std::str::from_utf8(header).map_err(|_| Error::from("HTTP headers are not utf-8"))?;
     let mut lines = text.split("\r\n");
@@ -280,62 +297,108 @@ where
         .next()
         .ok_or_else(|| Error::from("missing HTTP target"))?
         .to_string();
-    let version = parts.next().unwrap_or("HTTP/1.1");
+    let version = parts.next().unwrap_or("HTTP/1.1").to_string();
 
-    let mut headers = HashMap::new();
+    let mut headers = HashMap::<String, String>::new();
     for line in lines {
         if line.is_empty() {
             continue;
         }
         if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            let (name, value) = (name.trim().to_ascii_lowercase(), value.trim());
+            match headers.get_mut(&name) {
+                // Joined, conflicting lengths fail to parse instead of the last one winning.
+                Some(length) if name == "content-length" && length != value => {
+                    length.push(',');
+                    length.push_str(value);
+                }
+                _ => {
+                    headers.insert(name, value.to_string());
+                }
+            }
         }
     }
+    Ok(Head {
+        method,
+        target,
+        version,
+        headers,
+    })
+}
 
+async fn read_incoming<S>(sock: &mut S, buf: &mut Vec<u8>, head: Head) -> Result<Incoming>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Head {
+        method,
+        target,
+        version,
+        headers,
+    } = head;
     let length = match headers.get("content-length") {
         Some(value) => value
             .parse::<usize>()
             .map_err(|_| Error::from("bad content-length"))?,
         None => 0,
     };
-    if length > MAX_BODY {
-        return Err("HTTP body too large".into());
-    }
-
-    let expects_continue = headers
-        .get("expect")
-        .map(|value| value.eq_ignore_ascii_case("100-continue"))
-        .unwrap_or(false);
-    if expects_continue && buf.len() < length {
-        sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-    }
-    let body = if length == 0 {
-        Vec::new()
-    } else {
-        read_exact(sock, buf, length).await?
-    };
+    let body = read_body(sock, buf, &headers, length).await?;
 
     let query_text = match target.split_once('?') {
         Some((_, query)) => query.split('#').next().unwrap_or("").to_string(),
         None => String::new(),
     };
-    let close = connection_closes(version, headers.get("connection").map(String::as_str));
+    let close = connection_closes(&version, headers.get("connection").map(String::as_str));
     // Mercurial splits a long `X-HgProto` value across `X-HgProto-1`, `-2`, ...
     let protocaps = (1..)
         .map_while(|n| headers.get(&format!("x-hgproto-{n}")))
         .map(String::as_str)
         .collect();
-    Ok(Some(Incoming {
+    Ok(Incoming {
         method,
         target,
         query: parse_query(&query_text)?,
         body,
         close,
         protocaps,
-    }))
+    })
 }
 
-fn connection_closes(version: &str, connection: Option<&str>) -> bool {
+/// A body held in memory, so capped at `MAX_BODY`.
+pub(crate) async fn read_body<S>(
+    sock: &mut S,
+    buf: &mut Vec<u8>,
+    headers: &HashMap<String, String>,
+    length: usize,
+) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if length > MAX_BODY {
+        return Err("HTTP body too large".into());
+    }
+    if buf.len() < length {
+        write_continue(sock, headers).await?;
+    }
+    read_exact(sock, buf, length).await
+}
+
+/// Tell a client waiting on `Expect: 100-continue` to send its body.
+pub(crate) async fn write_continue<S>(sock: &mut S, headers: &HashMap<String, String>) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let expects_continue = headers
+        .get("expect")
+        .map(|value| value.eq_ignore_ascii_case("100-continue"))
+        .unwrap_or(false);
+    if expects_continue {
+        sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn connection_closes(version: &str, connection: Option<&str>) -> bool {
     let connection = connection.unwrap_or("").to_ascii_lowercase();
     let tokens = connection.split(',').map(str::trim);
     if tokens.clone().any(|token| token == "close") {
@@ -434,9 +497,23 @@ async fn write_hg<S>(sock: &mut S, content_type: &str, body: &[u8], close: bool)
 where
     S: AsyncWrite + Unpin,
 {
+    write_status(sock, 200, "OK", content_type, body, close).await
+}
+
+pub(crate) async fn write_status<S>(
+    sock: &mut S,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+    close: bool,
+) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let connection = if close { "close" } else { "keep-alive" };
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
         body.len()
     );
     sock.write_all(header.as_bytes()).await?;

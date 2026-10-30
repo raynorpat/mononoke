@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+pub mod http;
 pub mod pointer;
 pub mod store;
 
