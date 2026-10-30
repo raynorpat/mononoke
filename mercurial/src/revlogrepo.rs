@@ -51,6 +51,7 @@ pub enum Required {
     /// Working-copy formats only. The server never reads a dirstate.
     DirstateV2,
     DirstateTrackedKeyV1,
+    Lfs,
 }
 
 impl Display for Required {
@@ -73,6 +74,7 @@ impl Display for Required {
             Required::PersistentNodemap => "persistent-nodemap",
             Required::DirstateV2 => "dirstate-v2",
             Required::DirstateTrackedKeyV1 => "dirstate-tracked-key-v1",
+            Required::Lfs => "lfs",
         };
         write!(fmt, "{}", s)
     }
@@ -100,6 +102,7 @@ impl FromStr for Required {
             "persistent-nodemap" => Ok(Required::PersistentNodemap),
             "dirstate-v2" => Ok(Required::DirstateV2),
             "dirstate-tracked-key-v1" => Ok(Required::DirstateTrackedKeyV1),
+            "lfs" => Ok(Required::Lfs),
             unk => Err(ErrorKind::UnknownReq(unk.into()).into()),
         }
     }
@@ -799,6 +802,49 @@ mod test {
     fn treemanifest_opens() {
         let repo = open_requires("tree", &["store", "revlogv1", "treemanifest"]).expect("open");
         assert!(repo.is_treemanifest());
+    }
+
+    #[test]
+    fn lfs_requirement_opens() {
+        let repo = open_requires("lfs", &["store", "revlogv1", "lfs"]).expect("open");
+        assert!(repo.get_requirements().contains(&Required::Lfs));
+    }
+
+    #[test]
+    fn add_lfs_requirement_writes_store_requires_when_share_safe() {
+        let dir = make_split("addlfs", &["share-safe"], Some(&["store", "revlogv1"]));
+        let repo = RevlogRepo::open(&dir).expect("open");
+        let before = repo.clone();
+        repo.add_requirement(Required::Lfs).expect("add");
+        let store = lines(&dir.join("store").join("requires"));
+        let outer = lines(&dir.join("requires"));
+        let reopened = RevlogRepo::open(&dir).expect("reopen");
+        let _ = fs::remove_dir_all(&dir);
+        assert!(store.iter().any(|l| l == "lfs"), "{store:?}");
+        assert!(!outer.iter().any(|l| l == "lfs"), "{outer:?}");
+        assert!(before.get_requirements().contains(&Required::Lfs));
+        assert!(reopened.get_requirements().contains(&Required::Lfs));
+    }
+
+    #[test]
+    fn add_lfs_requirement_writes_outer_requires_without_share_safe() {
+        let dir = make_split("addlfs-outer", &["store", "revlogv1"], None);
+        let repo = RevlogRepo::open(&dir).expect("open");
+        repo.add_requirement(Required::Lfs).expect("add");
+        let outer = lines(&dir.join("requires"));
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(outer, ["store", "revlogv1", "lfs"]);
+    }
+
+    #[test]
+    fn reload_sees_lfs_requirement_added_by_hg() {
+        let dir = make_split("reload-lfs", &["store", "revlogv1"], None);
+        let repo = RevlogRepo::open(&dir).expect("open");
+        fs::write(dir.join("requires"), "store\nrevlogv1\nlfs\n").expect("requires");
+        let reloaded = repo.reload();
+        let _ = fs::remove_dir_all(&dir);
+        reloaded.expect("reload");
+        assert!(repo.get_requirements().contains(&Required::Lfs));
     }
 
     #[test]
