@@ -32,7 +32,7 @@ fn init_repo<P: AsRef<Path>>(parent_logger: &Logger, repopath: P) -> Result<(Pat
     let mut sock = PathBuf::from(repopath);
     sock.push(".hg");
 
-    let repo = repo::Repo::new(parent_logger, &sock)
+    let repo = repo::Repo::new(parent_logger, &sock, repo::RepoOptions::default())
         .chain_err(|| format!("Failed to initialize repo {:?}", repopath))?;
 
     sock.push("mononoke.sock");

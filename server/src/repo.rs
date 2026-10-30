@@ -25,6 +25,7 @@ use hgproto::{self, BundleStream, GetbundleArgs, HgCommandRes, HgCommands};
 use mercurial::changeset::RevlogChangeset;
 use mercurial::lock::RepoLock;
 use mercurial::revlog::RevIdx;
+use mercurial::revlogrepo::Required;
 use mercurial_bundles::changegroup::CgVersion;
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{parts, Bundle2EncodeBuilder};
@@ -32,10 +33,25 @@ use mercurial_types::{percent_decode, percent_encode, Changeset, NodeHash, Paren
 use slog::{info, o, warn, Logger};
 use tokio_util::io::ReaderStream;
 
-use crate::bundle::{history_part, legacy_changegroup, Selection};
+use crate::bundle::{history_part, legacy_changegroup, Selection, LFS_REQUIRED};
 use crate::errors::Result;
+use crate::lfs::LfsServing;
 use crate::names::{self, BranchCache};
 use crate::stream::{list_store, stream_part, stream_requirements, StoreFile};
+
+pub struct RepoOptions {
+    pub lfs: Option<LfsServing>,
+    pub max_plain_file_size: u64,
+}
+
+impl Default for RepoOptions {
+    fn default() -> Self {
+        RepoOptions {
+            lfs: None,
+            max_plain_file_size: 10485760,
+        }
+    }
+}
 
 pub struct Repo {
     path: String,
@@ -48,6 +64,7 @@ pub struct Repo {
     /// later stream clones. A push clears it.
     store_listing: tokio::sync::Mutex<Option<(ChangelogStamp, Arc<Vec<StoreFile>>)>>,
     branch_cache: std::sync::Mutex<BranchCache>,
+    options: RepoOptions,
     logger: Logger,
 }
 
@@ -120,7 +137,7 @@ fn client_cg_versions(bundlecaps: &[Vec<u8>]) -> Vec<CgVersion> {
 }
 
 /// The changegroup version `getbundle` sends: 03 when the client takes it,
-/// else 02 or 01. A treemanifest repository can only be sent as 03.
+/// else 02 or 01. A treemanifest or LFS repository can only be sent as 03.
 fn send_cg_version(
     repo: &mercurial::RevlogRepo,
     args: &GetbundleArgs,
@@ -128,6 +145,8 @@ fn send_cg_version(
     let client = client_cg_versions(&args.bundlecaps);
     if client.contains(&CgVersion::V3) {
         Ok(CgVersion::V3)
+    } else if repo.get_requirements().contains(&Required::Lfs) {
+        Err(hgproto::Error::from(LFS_REQUIRED.to_string()))
     } else if repo.is_treemanifest() {
         Err(hgproto::Error::from(
             "no common changegroup version".to_string(),
@@ -143,7 +162,8 @@ fn send_cg_version(
     }
 }
 
-fn advertised_caps(repo: &mercurial::RevlogRepo) -> Vec<String> {
+fn advertised_caps(server: &Repo) -> Vec<String> {
+    let repo = server.hgrepo();
     let mut caps = wireprotocaps();
     let streamreqs = stream_requirements(repo);
     if let Some(reqs) = &streamreqs {
@@ -163,6 +183,12 @@ fn advertised_caps(repo: &mercurial::RevlogRepo) -> Vec<String> {
         .exists()
     {
         caps.extend(["clonebundles".into(), "clonebundles_manifest".into()]);
+    }
+    if server.lfs().is_some() {
+        caps.push("lfs".to_string());
+        if repo.get_requirements().contains(&Required::Lfs) {
+            caps.push("lfs-serve".to_string());
+        }
     }
     caps.push(format!("bundle2={}", bundle2caps(streamreqs.is_some())));
     caps
@@ -189,7 +215,11 @@ fn clone_manifest(repo: &mercurial::RevlogRepo, legacy: bool) -> Result<String> 
 }
 
 impl Repo {
-    pub fn new<P: AsRef<Path>>(parent_logger: &Logger, path: P) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(
+        parent_logger: &Logger,
+        path: P,
+        options: RepoOptions,
+    ) -> Result<Self> {
         let path = path.as_ref();
         // Stamp before opening: a change in between only causes one extra reload.
         let changelog_seen = std::sync::Mutex::new(changelog_stamp(&path.join("store")));
@@ -200,8 +230,17 @@ impl Repo {
             changelog_seen,
             branch_cache: std::sync::Mutex::new(BranchCache::default()),
             store_listing: tokio::sync::Mutex::new(None),
+            options,
             logger: parent_logger.new(o!("repo" => format!("{:?}", path))),
         })
+    }
+
+    pub fn lfs(&self) -> Option<&LfsServing> {
+        self.options.lfs.as_ref()
+    }
+
+    pub fn options(&self) -> &RepoOptions {
+        &self.options
     }
 
     /// Load what the first requests would otherwise wait for: the changelog
@@ -758,7 +797,7 @@ impl HgCommands for RepoClient {
     // @wireprotocommand('capabilities')
     fn capabilities(&self) -> HgCommandRes<Vec<String>> {
         info!(self.logger, "capabilities");
-        future::ok(advertised_caps(self.repo.hgrepo())).boxed()
+        future::ok(advertised_caps(&self.repo)).boxed()
     }
 
     // @wireprotocommand('hello')
@@ -766,10 +805,7 @@ impl HgCommands for RepoClient {
         info!(self.logger, "Hello -> capabilities");
 
         let mut res = HashMap::new();
-        res.insert(
-            "capabilities".to_string(),
-            advertised_caps(self.repo.hgrepo()),
-        );
+        res.insert("capabilities".to_string(), advertised_caps(&self.repo));
 
         future::ok(res).boxed()
     }
@@ -844,6 +880,7 @@ impl HgCommands for RepoClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lfs::store::{LfsStore, StoreSpec};
 
     #[test]
     fn warm_up_does_not_read_changeset_text() {
@@ -851,7 +888,7 @@ mod tests {
         fs::create_dir_all(root.join("store")).unwrap();
         fs::write(root.join("requires"), b"store\nrevlogv1\n").unwrap();
         let logger = Logger::root(slog::Discard, slog::o!());
-        let repo = Repo::new(&logger, &root).unwrap();
+        let repo = Repo::new(&logger, &root, RepoOptions::default()).unwrap();
         repo.hgrepo().changelog_revlog().append_snapshot(
             mercurial::revlog::RevlogAppend {
                 node: NodeHash::from_bytes(&[1; 20]).unwrap(), p1: None, p2: None,
@@ -884,11 +921,80 @@ mod tests {
             ("store\nfncache\nrevlogv1\ngeneraldelta\n", "streamreqs=generaldelta,revlogv1"),
         ] {
             fs::write(root.join("requires"), requirements).unwrap();
-            let repo = mercurial::RevlogRepo::open(&root).unwrap();
+            let logger = Logger::root(slog::Discard, slog::o!());
+            let repo = Repo::new(&logger, &root, RepoOptions::default()).unwrap();
             let caps = advertised_caps(&repo);
             assert!(caps.iter().any(|cap| cap == expected), "{caps:?}");
             assert_eq!(caps.iter().filter(|cap| *cap == "stream" || cap.starts_with("streamreqs=")).count(), 1);
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn caps_advertise_lfs_only_when_serving() {
+        fn bundle2(caps: &[String]) -> String {
+            let cap = caps.iter().find_map(|cap| cap.strip_prefix("bundle2=")).unwrap();
+            percent_decode(cap)
+        }
+        let root = std::env::temp_dir().join(format!("lfs-caps-{}", std::process::id()));
+        fs::create_dir_all(root.join("store")).unwrap();
+        fs::write(root.join("requires"), b"store\nrevlogv1\n").unwrap();
+        let logger = Logger::root(slog::Discard, slog::o!());
+
+        let plain = Repo::new(&logger, &root, RepoOptions::default()).unwrap();
+        assert_eq!(plain.options().max_plain_file_size, 10485760);
+        assert!(plain.lfs().is_none());
+        let caps = advertised_caps(&plain);
+        assert!(!caps.iter().any(|cap| cap == "lfs" || cap == "lfs-serve"), "{caps:?}");
+        assert!(bundle2(&caps).lines().any(|line| line == "changegroup=01,02,03"));
+
+        let store = LfsStore::open(&StoreSpec::Repo, None, &root.join("store"), &logger).unwrap();
+        let options = RepoOptions {
+            lfs: Some(LfsServing { store: Arc::new(store), public_url: None }),
+            ..RepoOptions::default()
+        };
+        let serving = Repo::new(&logger, &root, options).unwrap();
+        let caps = advertised_caps(&serving);
+        assert!(caps.iter().any(|cap| cap == "lfs"), "{caps:?}");
+        assert!(!caps.iter().any(|cap| cap == "lfs-serve"), "{caps:?}");
+        assert!(bundle2(&caps).lines().any(|line| line == "changegroup=01,02,03"));
+
+        serving.hgrepo().add_requirement(Required::Lfs).unwrap();
+        let caps = advertised_caps(&serving);
+        assert!(caps.iter().any(|cap| cap == "lfs") && caps.iter().any(|cap| cap == "lfs-serve"), "{caps:?}");
+        drop((plain, serving));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn getbundle_args(bundlecaps: Vec<Vec<u8>>) -> GetbundleArgs {
+        GetbundleArgs {
+            heads: Vec::new(),
+            common: Vec::new(),
+            listkeys: Vec::new(),
+            stream: false,
+            cg: true,
+            bundlecaps,
+        }
+    }
+
+    #[test]
+    fn lfs_repo_takes_only_changegroup_03() {
+        let root = std::env::temp_dir().join(format!("cg-lfs-{}", std::process::id()));
+        fs::create_dir_all(root.join("store")).unwrap();
+        fs::write(root.join("requires"), b"store\nrevlogv1\nlfs\n").unwrap();
+        let repo = mercurial::RevlogRepo::open(&root).unwrap();
+        let caps = |versions: &str| {
+            getbundle_args(vec![
+                b"HG20".to_vec(),
+                format!("bundle2=HG20%0Achangegroup%3D{versions}").into_bytes(),
+            ])
+        };
+        assert_eq!(send_cg_version(&repo, &caps("01,02,03")).ok(), Some(CgVersion::V3));
+        for args in [caps("01,02"), caps("02"), caps("01"), caps("04"), getbundle_args(vec![b"HG20".to_vec()])] {
+            let err = send_cg_version(&repo, &args).unwrap_err();
+            assert!(err.to_string().contains(LFS_REQUIRED), "{err}");
+        }
+        drop(repo);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -905,6 +1011,8 @@ mod tests {
         fs::create_dir_all(root.join("store")).unwrap();
         fs::write(root.join("requires"), b"store\nrevlogv1\n").unwrap();
         let repo = mercurial::RevlogRepo::open(&root).unwrap();
+        let no_bundle2 = getbundle_args(vec![b"HG20".to_vec()]);
+        assert_eq!(send_cg_version(&repo, &no_bundle2).ok(), Some(CgVersion::V1));
         for (versions, expected) in [
             ("", Some(CgVersion::V1)),
             ("01", Some(CgVersion::V1)),
@@ -912,17 +1020,10 @@ mod tests {
             ("01,02,03", Some(CgVersion::V3)),
             ("04", None),
         ] {
-            let args = GetbundleArgs {
-                heads: Vec::new(),
-                common: Vec::new(),
-                listkeys: Vec::new(),
-                stream: false,
-                cg: true,
-                bundlecaps: vec![
-                    b"HG20".to_vec(),
-                    format!("bundle2=HG20%0Achangegroup%3D{versions}").into_bytes(),
-                ],
-            };
+            let args = getbundle_args(vec![
+                b"HG20".to_vec(),
+                format!("bundle2=HG20%0Achangegroup%3D{versions}").into_bytes(),
+            ]);
             assert_eq!(send_cg_version(&repo, &args).ok(), expected, "{versions}");
         }
         drop(repo);

@@ -13,7 +13,8 @@ use std::task::{Context, Poll};
 
 use futures::Future;
 use futures::{StreamExt, TryStreamExt};
-use mercurial::revlog::{Chunk, RevIdx, Revlog};
+use mercurial::revlog::{Chunk, IdxFlags, RevIdx, Revlog};
+use mercurial::revlogrepo::Required;
 use mercurial::RevlogRepo;
 use mercurial_bundles::changegroup::packer::Cg2Packer;
 use mercurial_bundles::changegroup::{CgDeltaChunk, CgVersion, Part, Section};
@@ -25,6 +26,10 @@ use mercurial_types::textdiff::textdiff;
 use mercurial_types::{BlobNode, Changeset, NodeHash, Parents, Path, NULL_HASH};
 
 use crate::errors::{Error, Result};
+
+/// Why changegroup 01 or 02 cannot carry an LFS repository: only 03 has revision flags.
+pub const LFS_REQUIRED: &str =
+    "this repository uses LFS; enable the lfs extension (hg --config extensions.lfs= ...)";
 
 /// Changelog nodes in revision order, and for each whether to send it: an
 /// ancestor of a `heads` node (every changeset when `heads` is empty) that is
@@ -166,6 +171,9 @@ pub fn legacy_changegroup(repo: RevlogRepo, selection: Selection) -> Result<hgpr
     if repo.is_treemanifest() {
         return Err("cannot produce changegroup 01 for a treemanifest repository".into());
     }
+    if repo.get_requirements().contains(&Required::Lfs) {
+        return Err(LFS_REQUIRED.into());
+    }
     let parts = history_stream(repo, selection, CgVersion::V1);
     let body = Cg2Packer::with_version(parts, CgVersion::V1)
         .and_then(|chunk| futures::future::ready(chunk.into_bytes()))
@@ -206,7 +214,7 @@ fn history_parts(
         if !missing[rev] {
             continue;
         }
-        check_flags(&repo.changelog_revlog(), RevIdx::from(rev))?;
+        check_flags(&repo.changelog_revlog(), &Section::Changeset, RevIdx::from(rev), version)?;
         let cs = ready(repo.get_changeset_by_nodeid(node))??;
         files.extend(cs.files().iter().cloned());
         if restricted && *cs.manifestid() != NULL_HASH {
@@ -225,6 +233,7 @@ fn history_parts(
             &parents,
             renamed,
             *node,
+            0,
             text,
         )?)?;
     }
@@ -440,6 +449,7 @@ fn referenced_revisions(
             )?
         } else {
             // A stored base may itself belong to the unselected sibling.
+            let flags = check_flags(revlog, &section, idx, version)?;
             let (parents, renamed) = indexed_parents(revlog, idx)?;
             fulltext_chunk(
                 section.clone(),
@@ -447,6 +457,7 @@ fn referenced_revisions(
                 &parents,
                 renamed,
                 linknode,
+                flags,
                 full_text(&revlog.get_rev(idx)?)?,
             )?
         };
@@ -560,7 +571,7 @@ fn linked_revisions(
             let base = previous.or(entry.p1);
             v1_revision(revlog, section.clone(), idx, base, nodes[linkrev])?
         } else {
-            stored_revision(revlog, section.clone(), idx, entry.nodeid, nodes[linkrev])?
+            stored_revision(revlog, section.clone(), idx, entry.nodeid, nodes[linkrev], version)?
         };
         emit(part)?;
         previous = Some(idx);
@@ -576,14 +587,16 @@ fn v1_revision(
     base_idx: Option<RevIdx>,
     linknode: NodeHash,
 ) -> Result<Part> {
+    check_flags(revlog, &section, idx, CgVersion::V1)?;
     if let Chunk::Deltas(stored_base, _) = revlog.get_chunk(idx)? {
-        if Some(stored_base) == base_idx {
+        if Some(stored_base) == base_idx && revlog.get_entry(stored_base)?.flags.is_empty() {
             return stored_revision(
                 revlog,
                 section,
                 idx,
                 revlog.get_entry(idx)?.nodeid,
                 linknode,
+                CgVersion::V1,
             );
         }
     }
@@ -612,7 +625,6 @@ fn v1_revision(
 }
 
 fn indexed_parents(revlog: &Revlog, idx: RevIdx) -> Result<(Parents, bool)> {
-    check_flags(revlog, idx)?;
     let entry = revlog.get_entry(idx)?;
     let p1 = match entry.p1 {
         Some(parent) => Some(revlog.get_entry(parent)?.nodeid),
@@ -626,12 +638,20 @@ fn indexed_parents(revlog: &Revlog, idx: RevIdx) -> Result<(Parents, bool)> {
     Ok((*blob.parents(), blob.maybe_renamed()))
 }
 
-fn check_flags(revlog: &Revlog, idx: RevIdx) -> Result<()> {
+/// The flags to send for a revision. Only EXTSTORED on a filelog revision is
+/// served, and only changegroup 03 can carry it.
+fn check_flags(revlog: &Revlog, section: &Section, idx: RevIdx, version: CgVersion) -> Result<u16> {
     let entry = revlog.get_entry(idx)?;
-    if !entry.flags.is_empty() {
+    if entry.flags.is_empty() {
+        return Ok(0);
+    }
+    if entry.flags != IdxFlags::EXTSTORED || !matches!(section, Section::Filelog(_)) {
         return Err(format!("unsupported revision flags {:#06x} for {}", entry.flags.bits(), entry.nodeid).into());
     }
-    Ok(())
+    if version != CgVersion::V3 {
+        return Err(LFS_REQUIRED.into());
+    }
+    Ok(entry.flags.bits())
 }
 
 fn stored_revision(
@@ -640,10 +660,23 @@ fn stored_revision(
     idx: RevIdx,
     node: NodeHash,
     linknode: NodeHash,
+    version: CgVersion,
 ) -> Result<Part> {
+    let flags = check_flags(revlog, &section, idx, version)?;
     let (parents, renamed) = indexed_parents(revlog, idx)?;
     match revlog.get_chunk(idx)? {
-        Chunk::Literal(text) => fulltext_chunk(section, node, &parents, renamed, linknode, text),
+        Chunk::Literal(text) => {
+            fulltext_chunk(section, node, &parents, renamed, linknode, flags, text)
+        }
+        // Like hg's `_candelta`: clients may hold a flagged revision's node with
+        // other raw text, so no delta goes out to or from one. The stored text
+        // is sent as it is, and for EXTSTORED that is the pointer.
+        Chunk::Deltas(base_idx, _)
+            if flags != 0 || !revlog.get_entry(base_idx)?.flags.is_empty() =>
+        {
+            let text = full_text(&revlog.get_rev(idx)?)?;
+            fulltext_chunk(section, node, &parents, renamed, linknode, flags, text)
+        }
         Chunk::Deltas(base_idx, deltas) => {
             let base = revlog.get_entry(base_idx)?.nodeid;
             let (p1, p2) = parent_nodes(&parents, renamed);
@@ -716,6 +749,7 @@ fn fulltext_chunk(
     parents: &Parents,
     renamed: bool,
     linknode: NodeHash,
+    flags: u16,
     text: Vec<u8>,
 ) -> Result<Part> {
     let (p1, p2) = parent_nodes(parents, renamed);
@@ -727,7 +761,7 @@ fn fulltext_chunk(
             p2,
             base: NULL_HASH,
             linknode,
-            flags: 0,
+            flags,
             delta: fulltext_delta(text)?,
         },
     ))
@@ -737,7 +771,7 @@ fn fulltext_chunk(
 mod tests {
     use std::str::FromStr;
 
-    use mercurial::revlog::{RevIdx, Revlog};
+    use mercurial::revlog::{RevIdx, Revlog, RevlogAppend, RevlogCompression};
 
     use super::*;
 
@@ -753,6 +787,7 @@ mod tests {
             blob.parents(),
             blob.maybe_renamed(),
             NULL_HASH,
+            0,
             text,
         )
         .expect("chunk")
@@ -1108,6 +1143,115 @@ mod tests {
             assert!(result.is_err(), "nonzero flags lost for {version:?}");
             assert!(result.unwrap_err().to_string().contains("flags"));
         }
+    }
+
+    #[test]
+    fn flags_on_changelog_and_manifest_revisions_are_rejected() {
+        for file in ["00changelog.i", "00manifest.i"] {
+            let temp = init_share_safe_repo();
+            let path = temp.repo.join(".hg/store").join(file);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[6..8].copy_from_slice(&IdxFlags::EXTSTORED.bits().to_be_bytes());
+            std::fs::write(&path, bytes).unwrap();
+            let repo = open_repo(&temp.repo);
+            let selection = Selection::Common { common: vec![], heads: vec![] };
+            let err = history_parts(&repo, &selection, CgVersion::V3, &mut |_| Ok(())).unwrap_err();
+            assert!(err.to_string().contains("unsupported revision flags"), "{file}: {err}");
+        }
+    }
+
+    /// `a.txt` gains rev 2 (EXTSTORED, snapshot), rev 3 (plain, stored as a delta
+    /// on rev 2) and rev 4 (EXTSTORED, stored as a delta on rev 3).
+    fn append_flagged_revisions(repo: &std::path::Path) -> [Vec<u8>; 3] {
+        let index = repo.join(".hg/store/data/a.txt.i");
+        let mut log = Revlog::from_idx_data(&index, None::<String>).expect("filelog");
+        let tip = log.get_entry(RevIdx::from(1u32)).expect("rev 1").nodeid;
+        let first: Vec<u8> = (1..400u64)
+            .flat_map(|i| format!("{:016x}\n", i.wrapping_mul(0x9E3779B97F4A7C15)).into_bytes())
+            .collect();
+        let second = [&first[..], b"second\n"].concat();
+        let third = [&second[..], b"third\n"].concat();
+        let mut parent = tip;
+        let mut base: Option<(NodeHash, &[u8])> = None;
+        for (fill, text, flags) in [
+            (0xa1, &first, IdxFlags::EXTSTORED),
+            (0xa2, &second, IdxFlags::empty()),
+            (0xa3, &third, IdxFlags::EXTSTORED),
+        ] {
+            let node = NodeHash::from_bytes(&[fill; 20]).expect("node");
+            let idx = log
+                .append_revision_flagged(
+                    RevlogAppend { node, p1: Some(parent), p2: None, linkrev: Some(1), text: text.clone() },
+                    base.map(|(base, old)| (base, textdiff(old, text))),
+                    RevlogCompression::Zstd,
+                    flags,
+                )
+                .expect("append");
+            if base.is_some() {
+                let chunk = log.get_chunk(RevIdx::from(idx)).expect("chunk");
+                assert!(matches!(chunk, Chunk::Deltas(..)), "rev {idx} is not a stored delta");
+            }
+            parent = node;
+            base = Some((node, text));
+        }
+        [first, second, third]
+    }
+
+    #[test]
+    fn flagged_filelog_revision_keeps_flag_in_cg3() {
+        let temp = init_share_safe_repo();
+        let [first, second, third] = append_flagged_revisions(&temp.repo);
+        let repo = open_repo(&temp.repo);
+        let parts = collect_version(&repo, &[], CgVersion::V3);
+        let chunks = filelog_chunks(&parts);
+        assert_eq!(chunks.len(), 5, "filelog chunks");
+        // As hg's `_candelta`, nothing deltas across EXTSTORED: every revision
+        // goes out whole, even the plain one stored as a delta on a flagged base.
+        for (chunk, flags, text) in [
+            (chunks[2], 1 << 13, &first),
+            (chunks[3], 0, &second),
+            (chunks[4], 1 << 13, &third),
+        ] {
+            assert_eq!(chunk.flags, flags);
+            assert_eq!(chunk.base, NULL_HASH);
+            assert_eq!(&mercurial_types::delta::apply(b"", chunk.delta.clone()), text);
+        }
+        assert!(chunks[..2].iter().all(|chunk| chunk.flags == 0));
+
+        for version in [CgVersion::V1, CgVersion::V2] {
+            let selection = Selection::Common { common: vec![], heads: vec![] };
+            let err = history_parts(&repo, &selection, version, &mut |_| Ok(())).unwrap_err();
+            assert_eq!(err.to_string(), LFS_REQUIRED, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn plain_revision_on_a_flagged_base_keeps_cg1_deltas_valid() {
+        let temp = init_share_safe_repo();
+        let [_, second, _] = append_flagged_revisions(&temp.repo);
+        let repo = open_repo(&temp.repo);
+        let log = repo.read_file_revlog(&Path::new(b"a.txt").expect("path")).expect("filelog");
+        // cg1 has no base field, so a whole text would be applied to the base.
+        let base = log.get_rev(RevIdx::from(2u32)).expect("rev 2");
+        let section = Section::Filelog(Path::new(b"a.txt").expect("path"));
+        let idx = RevIdx::from(3u32);
+        match v1_revision(&log, section, idx, Some(RevIdx::from(2u32)), NULL_HASH).expect("part") {
+            Part::CgChunk(_, chunk) => assert_eq!(
+                mercurial_types::delta::apply(&full_text(&base).expect("text"), chunk.delta),
+                second
+            ),
+            _ => panic!("expected a chunk"),
+        }
+    }
+
+    #[test]
+    fn lfs_repo_refuses_legacy_changegroups() {
+        let temp = init_share_safe_repo();
+        let repo = open_repo(&temp.repo);
+        repo.add_requirement(Required::Lfs).expect("requirement");
+        let selection = Selection::Common { common: vec![], heads: vec![] };
+        let err = legacy_changegroup(repo, selection).err().expect("refused");
+        assert_eq!(err.to_string(), LFS_REQUIRED);
     }
 
     #[test]

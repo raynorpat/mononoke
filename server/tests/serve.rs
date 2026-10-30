@@ -1538,6 +1538,73 @@ fn push_waits_while_hg_holds_the_store_lock() {
 }
 
 #[test]
+fn lfs_repo_clones_pointers_over_cg3_and_refuses_clients_without_it() {
+    let temp = TempDir::new("lfsc");
+    assert_hg(
+        &hg(&temp.0, &["init", "repo", "--config", "extensions.lfs="]),
+        "hg init",
+    );
+    let repo = temp.0.join("repo");
+    let lfs = ["--config", "extensions.lfs=", "--config", "lfs.track=all()"];
+    let hg_lfs = |dir: &Path, args: &[&str]| hg(dir, &[&lfs[..], args].concat());
+    // Two revisions of the file, a plain one between them, and a sibling so
+    // that `clone -r` takes the restricted path.
+    for (text, track) in [("one\n", true), ("two\n", false), ("three\n", true)] {
+        fs::write(repo.join("big.bin"), text).expect("write big.bin");
+        let args = ["commit", "-Aqm", text, "-u", "test"];
+        assert_hg(&if track { hg_lfs(&repo, &args) } else { hg(&repo, &args) }, "hg commit");
+    }
+    assert_hg(&hg(&repo, &["update", "-r", "0"]), "hg update");
+    fs::write(repo.join("big.bin"), "sibling\n").expect("write big.bin");
+    assert_hg(&hg_lfs(&repo, &["commit", "-Aqm", "sibling", "-u", "test"]), "hg commit");
+    let raw = |dir: &Path, rev: &str| {
+        let out = hg_lfs(dir, &["debugdata", "big.bin", rev]);
+        assert_hg(&out, "hg debugdata");
+        out.stdout
+    };
+    assert!(raw(&repo, "0").starts_with(b"version https://git-lfs"), "not a pointer");
+
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+
+    assert_hg(
+        &hg_lfs(&temp.0, &["clone", "-U", "--pull", &url, "whole"]),
+        "lfs clone",
+    );
+    let whole = temp.0.join("whole");
+    for rev in ["0", "1", "2", "3"] {
+        assert_eq!(raw(&whole, rev), raw(&repo, rev), "rev {rev}");
+    }
+    // `-r` on rev 2 skips the sibling, whose filelog revision is stored last.
+    assert_hg(
+        &hg_lfs(&temp.0, &["clone", "-U", "-r", "2", &url, "partial"]),
+        "lfs clone -r",
+    );
+    let partial = temp.0.join("partial");
+    for rev in ["0", "1", "2"] {
+        assert_eq!(raw(&partial, rev), raw(&repo, rev), "partial rev {rev}");
+    }
+    let flags = |dir: &Path| {
+        let out = hg_lfs(dir, &["debugrevlogindex", "-f", "1", "big.bin"]);
+        assert_hg(&out, "hg debugrevlogindex");
+        String::from_utf8_lossy(&out.stdout).lines().skip(1)
+            .map(|line| line.split_whitespace().nth(1).expect("flag column").to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(flags(&whole), flags(&repo), "flags in the clone");
+    assert_eq!(flags(&repo).iter().filter(|flag| *flag == "2000").count(), 3);
+
+    let refused = hg(
+        &temp.0,
+        &["--config", "experimental.changegroup3=false", "clone", "-U", "--pull", &url, "old"],
+    );
+    assert!(!refused.status.success(), "changegroup 02 clone of an lfs repo");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("this repository uses LFS"), "{stderr}");
+}
+
+#[test]
 fn commit_made_with_hg_while_serving_is_served() {
     let temp = TempDir::new("oc");
     let repo = init_zstd_repo(&temp.0);
