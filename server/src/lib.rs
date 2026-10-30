@@ -9,6 +9,7 @@
 pub mod bundle;
 pub mod errors;
 pub mod http;
+pub mod lfs;
 pub mod listener;
 pub mod names;
 pub mod push;
