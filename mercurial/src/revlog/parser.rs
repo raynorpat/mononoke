@@ -29,7 +29,7 @@ pub mod Badness {
 
 /// Failure while reading a revlog index entry or chunk.
 #[derive(Debug)]
-#[allow(dead_code)] // payload is only formatted with Debug
+#[allow(dead_code)] // payloads are only formatted, by Debug or Display
 pub enum ParseError {
     Incomplete,
     NoMatch,

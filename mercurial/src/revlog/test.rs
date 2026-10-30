@@ -925,3 +925,46 @@ fn docket_parses_mercurial_bytes() {
     assert!(nodemap::parse_docket(&bytes[..5]).is_none());
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+#[test]
+fn append_keeps_extstored_flag() {
+    let dir = std::env::temp_dir().join(format!("extstored-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let idx_path = dir.join("f.i");
+    std::fs::write(&idx_path, b"").expect("empty index");
+    let mut revlog = Revlog::from_idx(&idx_path).expect("open");
+    let text = b"version https://git-lfs.github.com/spec/v1\n".to_vec();
+    let idx = revlog
+        .append_revision_flagged(
+            RevlogAppend {
+                node: node_with_tail(1),
+                p1: None,
+                p2: None,
+                linkrev: None,
+                text: text.clone(),
+            },
+            None,
+            RevlogCompression::Zstd,
+            IdxFlags::EXTSTORED,
+        )
+        .expect("append");
+
+    let reopened = Revlog::from_idx(&idx_path).expect("reopen");
+    let entry = reopened.get_entry(RevIdx::from(idx)).expect("entry");
+    assert_eq!(entry.flags, IdxFlags::EXTSTORED);
+    let got = reopened.get_rev(RevIdx::from(idx)).expect("rev");
+    assert_eq!(got.as_blob().as_slice(), Some(text.as_slice()));
+    drop((revlog, reopened));
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn unknown_index_flag_is_an_error() {
+    let mut entry = ng_entry(0, 0, u32::MAX);
+    // Features 0, version NG, then entry 0's flags field.
+    entry[3] = 1;
+    entry[6..8].copy_from_slice(&0x0400u16.to_be_bytes());
+    let revlog = Revlog::new(entry.to_vec(), Some(Vec::new())).expect("revlog");
+    let err = revlog.get_entry(RevIdx::from(0u32)).expect_err("bad flags");
+    assert!(err.to_string().contains("0x0400"), "{}", err);
+}

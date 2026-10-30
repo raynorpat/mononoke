@@ -28,7 +28,8 @@ mod nodemap;
 #[cfg(test)]
 mod test;
 
-use self::parser::{Entry, Header, IdxFlags, Version};
+use self::parser::{Header, Version};
+pub use self::parser::{Entry, IdxFlags};
 pub use self::nodemap::docket_uid;
 pub use self::revidx::RevIdx;
 
