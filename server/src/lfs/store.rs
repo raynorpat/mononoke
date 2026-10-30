@@ -112,6 +112,17 @@ fn scrub(logger: &Logger, op: &str, err: object_store::Error) -> Error {
     format!("{} failed: {}", op, kind).into()
 }
 
+fn s3_builder(bucket: &str, endpoint: Option<&str>) -> AmazonS3Builder {
+    let builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
+    match endpoint {
+        Some(endpoint) => builder
+            .with_endpoint(endpoint)
+            .with_virtual_hosted_style_request(false)
+            .with_allow_http(endpoint.starts_with("http://")),
+        None => builder,
+    }
+}
+
 impl LfsStore {
     /// `logger` receives full backend errors, so it must not be a client-facing one.
     pub fn open(
@@ -132,19 +143,11 @@ impl LfsStore {
 
         let (primary, fallback, prefix): (Arc<dyn ObjectStore>, _, _) = match spec {
             StoreSpec::Repo => (repo, None, ""),
-            StoreSpec::S3 { bucket, prefix } => {
-                let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-                if let Some(endpoint) = s3_endpoint {
-                    builder = builder
-                        .with_endpoint(endpoint)
-                        .with_virtual_hosted_style_request(false);
-                }
-                (
-                    Arc::new(builder.build().map_err(opened)?),
-                    Some(repo),
-                    &prefix[..],
-                )
-            }
+            StoreSpec::S3 { bucket, prefix } => (
+                Arc::new(s3_builder(bucket, s3_endpoint).build().map_err(opened)?),
+                Some(repo),
+                &prefix[..],
+            ),
             StoreSpec::Azure {
                 account,
                 container,
@@ -307,8 +310,9 @@ mod tests {
 
     use bytes::Bytes;
     use futures::TryStreamExt;
+    use object_store::aws::AmazonS3ConfigKey;
     use object_store::local::LocalFileSystem;
-    use object_store::ObjectStore;
+    use object_store::{ClientConfigKey, ObjectStore};
     use sha2::{Digest, Sha256};
     use slog::{o, Discard, Logger};
     use tokio_util::io::StreamReader;
@@ -466,6 +470,20 @@ mod tests {
         let dir = temp_dir("endpoint");
         assert!(LfsStore::open(&StoreSpec::Repo, Some("http://x"), &dir, &logger()).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_http_endpoint_is_allowed() {
+        let allow_http = |endpoint| {
+            let key = AmazonS3ConfigKey::Client(ClientConfigKey::AllowHttp);
+            let builder = s3_builder("b", Some(endpoint));
+            builder.get_config_value(&key).unwrap()
+        };
+        assert_eq!(allow_http("http://127.0.0.1:9000"), "true");
+        assert_eq!(allow_http("https://s3.example.com"), "false");
+        s3_builder("b", Some("http://127.0.0.1:9000"))
+            .build()
+            .unwrap();
     }
 
     #[test]
