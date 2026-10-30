@@ -16,6 +16,8 @@ hgproto = { path = "../hgproto" }
 mercurial = { path = "../mercurial" }
 mercurial-bundles = { path = "../mercurial-bundles" }
 mercurial-types = { path = "../mercurial-types" }
+object_store = { version = "0.12", features = ["aws", "azure"] }
+sha2 = "0.10"
 slog = "2"
 slog-term = "2"
 sshrelay = { path = "../sshrelay" }

@@ -5,3 +5,4 @@
 // GNU General Public License version 2 or any later version.
 
 pub mod pointer;
+pub mod store;
