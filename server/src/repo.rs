@@ -69,13 +69,21 @@ pub struct Repo {
     logger: Logger,
 }
 
-/// Size and modification time of `00changelog.i` and `00changelog.d`. Every
-/// commit, push or strip changes one of them.
-type ChangelogStamp = [Option<(u64, SystemTime)>; 2];
+/// Size and modification time of `00changelog.i` and `00changelog.d`, which
+/// every commit, push or strip changes, and of both `requires` files: hg's lfs
+/// extension adds its requirement after the commit's transaction closes.
+type ChangelogStamp = [Option<(u64, SystemTime)>; 4];
 
 fn changelog_stamp(store: &Path) -> ChangelogStamp {
-    ["00changelog.i", "00changelog.d"].map(|name| {
-        let meta = fs::metadata(store.join(name)).ok()?;
+    let hg_dir = store.parent().expect("store is under .hg");
+    [
+        store.join("00changelog.i"),
+        store.join("00changelog.d"),
+        store.join("requires"),
+        hg_dir.join("requires"),
+    ]
+    .map(|path| {
+        let meta = fs::metadata(path).ok()?;
         Some((meta.len(), meta.modified().ok()?))
     })
 }
@@ -985,6 +993,20 @@ mod tests {
         let caps = advertised_caps(&serving);
         assert!(caps.iter().any(|cap| cap == "lfs") && caps.iter().any(|cap| cap == "lfs-serve"), "{caps:?}");
         drop((plain, serving));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn requirement_written_outside_the_server_is_noticed() {
+        let root = std::env::temp_dir().join(format!("outside-reqs-{}", std::process::id()));
+        fs::create_dir_all(root.join("store")).unwrap();
+        fs::write(root.join("requires"), b"store\nrevlogv1\n").unwrap();
+        let logger = Logger::root(slog::Discard, slog::o!());
+        let repo = Repo::new(&logger, &root, RepoOptions::default()).unwrap();
+        assert!(!repo.hgrepo().get_requirements().contains(&Required::Lfs));
+        fs::write(root.join("requires"), b"store\nrevlogv1\nlfs\n").unwrap();
+        assert!(repo.hgrepo().get_requirements().contains(&Required::Lfs));
+        drop(repo);
         fs::remove_dir_all(root).unwrap();
     }
 
