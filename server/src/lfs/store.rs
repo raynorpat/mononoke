@@ -7,8 +7,10 @@
 //! LFS blob storage on the repo's disk, an S3-compatible bucket or Azure Blob.
 
 use std::collections::HashSet;
-use std::path::Path as FsPath;
+use std::io;
+use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -95,6 +97,10 @@ pub struct LfsStore {
     /// The repo store, read-only, for blobs `hg` wrote on the server.
     fallback: Option<Arc<dyn ObjectStore>>,
     prefix: String,
+    /// Set when the primary is the repo store: `LocalFileSystem` never syncs, so
+    /// uploads are staged in `tmp/`, which hg's blob walk skips, and published here.
+    repo_dir: Option<PathBuf>,
+    staged: AtomicU64,
     warned: Mutex<HashSet<Oid>>,
     logger: Logger,
 }
@@ -112,6 +118,10 @@ fn scrub(logger: &Logger, op: &str, err: object_store::Error) -> Error {
     format!("{} failed: {}", op, kind).into()
 }
 
+fn verified(hasher: Sha256, count: u64, size: u64, oid: &Oid) -> bool {
+    count == size && sha256_oid(&hasher.finalize().into()) == *oid
+}
+
 fn s3_builder(bucket: &str, endpoint: Option<&str>) -> AmazonS3Builder {
     let builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
     match endpoint {
@@ -121,6 +131,41 @@ fn s3_builder(bucket: &str, endpoint: Option<&str>) -> AmazonS3Builder {
             .with_allow_http(endpoint.starts_with("http://")),
         None => builder,
     }
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &FsPath) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+// Windows cannot open a directory for sync.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &FsPath) -> io::Result<()> {
+    Ok(())
+}
+
+/// Moves a verified blob to its final name durably. `Created` means it is on disk.
+fn publish(staged: &FsPath, dest: &FsPath, size: u64) -> io::Result<PutOutcome> {
+    let published = (|| {
+        let file = std::fs::OpenOptions::new().write(true).open(staged)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::create_dir_all(dest.parent().expect("blob paths have a parent"))?;
+        if let Err(err) = std::fs::rename(staged, dest) {
+            // Windows refuses while another upload of this oid holds the name.
+            return match std::fs::metadata(dest) {
+                Ok(meta) if meta.len() == size => Ok(PutOutcome::Existed),
+                _ => Err(err),
+            };
+        }
+        // The fan-out directory may be new, so its own entry needs syncing too.
+        for dir in dest.ancestors().skip(1).take(2) {
+            sync_dir(dir)?;
+        }
+        Ok(PutOutcome::Created)
+    })();
+    let _ = std::fs::remove_file(staged);
+    published
 }
 
 impl LfsStore {
@@ -141,6 +186,7 @@ impl LfsStore {
         let repo: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(&repo_dir).map_err(opened)?);
 
+        let primary_dir = matches!(spec, StoreSpec::Repo).then(|| repo_dir.clone());
         let (primary, fallback, prefix): (Arc<dyn ObjectStore>, _, _) = match spec {
             StoreSpec::Repo => (repo, None, ""),
             StoreSpec::S3 { bucket, prefix } => (
@@ -166,6 +212,8 @@ impl LfsStore {
             primary,
             fallback,
             prefix: prefix.to_owned(),
+            repo_dir: primary_dir,
+            staged: AtomicU64::new(0),
             warned: Mutex::new(HashSet::new()),
             logger: logger.clone(),
         })
@@ -177,6 +225,8 @@ impl LfsStore {
             primary,
             fallback,
             prefix: String::new(),
+            repo_dir: None,
+            staged: AtomicU64::new(0),
             warned: Mutex::new(HashSet::new()),
             logger: Logger::root(slog::Discard, slog::o!()),
         }
@@ -251,7 +301,8 @@ impl LfsStore {
     }
 
     /// Streams `body` into the primary store. The final key never holds unverified
-    /// bytes: a multipart upload is invisible until finished on all three backends.
+    /// bytes: a multipart upload is invisible until finished, and the repo store
+    /// finishes it in `tmp/` first. A blob of the wrong stored size is replaced.
     pub async fn put<R: AsyncRead + Unpin + Send>(
         &self,
         oid: &Oid,
@@ -259,17 +310,40 @@ impl LfsStore {
         mut body: R,
     ) -> Result<PutOutcome> {
         let key = self.key(oid);
-        if self.found("head", self.primary.head(&key).await)?.is_some() {
-            tokio::io::copy(&mut body, &mut tokio::io::sink()).await?;
-            return Ok(PutOutcome::Existed);
-        }
-
-        let upload = self.primary.put_multipart(&key).await;
-        let upload = upload.map_err(|err| scrub(&self.logger, "put", err))?;
-        let mut upload = WriteMultipart::new_with_chunk_size(upload, PART_SIZE);
         let mut hasher = Sha256::new();
         let mut count = 0;
         let mut buf = vec![0; READ_SIZE];
+
+        let present = self.found("head", self.primary.head(&key).await)?;
+        if present.is_some_and(|meta| meta.size == size) {
+            loop {
+                let n = body.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                count += n as u64;
+                hasher.update(&buf[..n]);
+            }
+            return Ok(if verified(hasher, count, size, oid) {
+                PutOutcome::Existed
+            } else {
+                PutOutcome::Corrupt
+            });
+        }
+
+        let name = format!(
+            "{}-{}-{}",
+            oid,
+            std::process::id(),
+            self.staged.fetch_add(1, Ordering::Relaxed)
+        );
+        let target = match self.repo_dir {
+            Some(_) => Path::from(format!("tmp/{}", name)),
+            None => key,
+        };
+        let upload = self.primary.put_multipart(&target).await;
+        let upload = upload.map_err(|err| scrub(&self.logger, "put", err))?;
+        let mut upload = WriteMultipart::new_with_chunk_size(upload, PART_SIZE);
         loop {
             let n = match body.read(&mut buf).await {
                 Ok(0) => break,
@@ -292,13 +366,26 @@ impl LfsStore {
             upload.write(&buf[..n]);
         }
 
-        if count != size || sha256_oid(&hasher.finalize().into()) != *oid {
+        if !verified(hasher, count, size, oid) {
             self.abort(upload).await;
             return Ok(PutOutcome::Corrupt);
         }
+        // `finish` alone would leave the upload open when an earlier part failed.
+        if let Err(err) = upload.wait_for_capacity(0).await {
+            self.abort(upload).await;
+            return Err(scrub(&self.logger, "put", err));
+        }
         let finished = upload.finish().await;
         finished.map_err(|err| scrub(&self.logger, "put", err))?;
-        Ok(PutOutcome::Created)
+
+        let Some(repo_dir) = &self.repo_dir else {
+            return Ok(PutOutcome::Created);
+        };
+        let staged = repo_dir.join("tmp").join(name);
+        let (fanout, rest) = oid.as_str().split_at(2);
+        let dest = repo_dir.join(fanout).join(rest);
+        let published = tokio::task::spawn_blocking(move || publish(&staged, &dest, size));
+        Ok(published.await.map_err(io::Error::other)??)
     }
 }
 
@@ -339,6 +426,19 @@ mod tests {
         Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap())
     }
 
+    fn files_under(dir: &PathBuf) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(files_under(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
     async fn read_body(blob: Blob) -> Vec<u8> {
         let chunks: Vec<Bytes> = blob.body.try_collect().await.unwrap();
         chunks.concat()
@@ -355,7 +455,9 @@ mod tests {
         assert_eq!(outcome, PutOutcome::Created);
         let path = dir
             .join("lfs/objects/ba/7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        assert_eq!(std::fs::read(path).unwrap(), b"abc");
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert_eq!(files_under(&dir.join("lfs/objects")), [path]);
+        store.check().await.unwrap();
 
         assert_eq!(store.size(&oid).await.unwrap(), Some(3));
         let blob = store.get(&oid).await.unwrap().unwrap();
@@ -387,14 +489,79 @@ mod tests {
         let store = LfsStore::open(&StoreSpec::Repo, None, &dir, &logger()).unwrap();
         let oid = oid_of(b"abc");
 
-        // Wrong bytes, too many bytes, too few bytes.
-        for body in [&b"abd"[..], b"abcd", b"ab"] {
-            let outcome = store.put(&oid, 3, body).await.unwrap();
+        let big = vec![7u8; 9 * 1024 * 1024];
+
+        // Wrong bytes, too many, too few, then the same with whole parts written.
+        for (size, body) in [
+            (3, &b"abd"[..]),
+            (3, b"abcd"),
+            (3, b"ab"),
+            (big.len() as u64, &big[..]),
+            (big.len() as u64 - 1, &big[..]),
+            (big.len() as u64 + 1, &big[..]),
+        ] {
+            let outcome = store.put(&oid, size, body).await.unwrap();
             assert_eq!(outcome, PutOutcome::Corrupt);
             assert_eq!(store.size(&oid).await.unwrap(), None);
-            let path = dir.join("lfs/objects").join(oid.store_path());
-            assert!(!path.exists());
+            assert_eq!(files_under(&dir.join("lfs/objects")), Vec::<PathBuf>::new());
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrong_body_for_a_stored_blob_is_corrupt() {
+        let dir = temp_dir("present");
+        let store = LfsStore::open(&StoreSpec::Repo, None, &dir, &logger()).unwrap();
+        let oid = oid_of(b"abc");
+        store.put(&oid, 3, &b"abc"[..]).await.unwrap();
+
+        let outcome = store.put(&oid, 3, &b"abd"[..]).await.unwrap();
+        assert_eq!(outcome, PutOutcome::Corrupt);
+        let outcome = store.put(&oid, 3, &b"abcd"[..]).await.unwrap();
+        assert_eq!(outcome, PutOutcome::Corrupt);
+        let blob = store.get(&oid).await.unwrap().unwrap();
+        assert_eq!(read_body(blob).await, b"abc");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn torn_blob_is_replaced() {
+        let dir = temp_dir("torn");
+        let store = LfsStore::open(&StoreSpec::Repo, None, &dir, &logger()).unwrap();
+        let oid = oid_of(b"abc");
+        let path = dir.join("lfs/objects").join(oid.store_path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"ab").unwrap();
+
+        let outcome = store.put(&oid, 3, &b"abc"[..]).await.unwrap();
+        assert_eq!(outcome, PutOutcome::Created);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert_eq!(files_under(&dir.join("lfs/objects")).len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn losing_the_rename_to_a_held_blob_is_existed() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = temp_dir("lost-rename");
+        let (staged, dest) = (dir.join("staged"), dir.join("dest"));
+        std::fs::write(&staged, b"abc").unwrap();
+        std::fs::write(&dest, b"abc").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&dest)
+            .unwrap();
+
+        assert_eq!(publish(&staged, &dest, 3).unwrap(), PutOutcome::Existed);
+        assert!(!staged.exists());
+
+        std::fs::write(&staged, b"abcd").unwrap();
+        assert!(publish(&staged, &dest, 4).is_err());
+        assert!(!staged.exists());
+        drop(held);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
