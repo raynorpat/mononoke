@@ -409,7 +409,7 @@ where
 
                 let t = thread::spawn(move || {
                     let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_io()
+                        .enable_all()
                         .build()
                     {
                         Ok(rt) => rt,

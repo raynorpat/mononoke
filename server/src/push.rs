@@ -4,6 +4,7 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2 or any later version.
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -12,7 +13,7 @@ use async_compression::{CompressorType, Decompressor, DecompressorType};
 use bookmarks::{Bookmarks, BookmarksMut, Version};
 use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, Stream};
-use mercurial::revlog::{Revlog, RevlogAppend, RevlogCompression};
+use mercurial::revlog::{IdxFlags, Revlog, RevlogAppend, RevlogCompression};
 use mercurial::revlogrepo::Required;
 use mercurial::RevlogRepo;
 use mercurial_bundles::bundle2::Bundle2Stream;
@@ -21,11 +22,22 @@ use mercurial_bundles::changegroup::{
 };
 use mercurial_bundles::part_encode::PartEncodeBuilder;
 use mercurial_bundles::{Bundle2Item, InnerPart, PartHeader};
-use mercurial_types::delta::Delta;
-use mercurial_types::{NodeHash, NULL_HASH};
+use mercurial_types::delta::{self, Delta};
+use mercurial_types::{NodeHash, Path as MPath, NULL_HASH};
 use tokio_util::codec::Decoder;
 
 use crate::errors::{Error, Result};
+use crate::lfs::pointer::Pointer;
+use crate::lfs::store::LfsStore;
+
+/// Hg pointers are about 130 bytes; a longer EXTSTORED revision is not a pointer.
+const MAX_POINTER_LEN: usize = 4096;
+
+pub(crate) struct PushPolicy<'a> {
+    pub lfs: Option<&'a LfsStore>,
+    /// `0` disables the limit.
+    pub max_plain_file_size: u64,
+}
 
 pub(crate) struct Applied {
     pub(crate) body: Vec<u8>,
@@ -36,7 +48,8 @@ pub(crate) struct Applied {
 
 pub fn apply_unbundle(repo_path: &std::path::Path, heads: &[NodeHash], bundle: &[u8]) -> Result<Vec<u8>> {
     let repo = RevlogRepo::open(repo_path)?;
-    Ok(apply_repo(&repo, heads, bundle)?.body)
+    let policy = PushPolicy { lfs: None, max_plain_file_size: 0 };
+    Ok(apply_repo(&repo, heads, bundle, &policy)?.body)
 }
 
 pub(crate) fn heads_match(repo: &RevlogRepo, heads: &[NodeHash]) -> Result<bool> {
@@ -49,26 +62,60 @@ pub(crate) fn heads_match(repo: &RevlogRepo, heads: &[NodeHash]) -> Result<bool>
     Ok(current == offered)
 }
 
-pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -> Result<Applied> {
+pub(crate) fn apply_repo(
+    repo: &RevlogRepo,
+    heads: &[NodeHash],
+    bundle: &[u8],
+    policy: &PushPolicy,
+) -> Result<Applied> {
+    match plan_push(repo, heads, bundle, policy)? {
+        Planned::Done(applied) => Ok(applied),
+        Planned::Write(plan) => write_push(repo, plan),
+    }
+}
+
+pub(crate) enum Planned {
+    /// Nothing to write: the push lost a race.
+    Done(Applied),
+    Write(PushPlan),
+}
+
+/// A bundle that passed every check.
+pub(crate) struct PushPlan {
+    groups: Vec<(Section, Vec<CgDeltaChunk>)>,
+    pushkeys: Vec<PartHeader>,
+    changegroup_ids: Vec<u32>,
+    tree: bool,
+    adds_lfs: bool,
+    bundle1: bool,
+}
+
+/// Parse and validate the entire input, writing nothing. With `policy.lfs` set
+/// this must run on the blocking pool, which is where `RepoClient::unbundle` puts it.
+pub(crate) fn plan_push(
+    repo: &RevlogRepo,
+    heads: &[NodeHash],
+    bundle: &[u8],
+    policy: &PushPolicy,
+) -> Result<Planned> {
     let bundle1 = is_bundle1(bundle);
     if !heads_match(repo, heads)? {
-        return Ok(Applied {
+        return Ok(Planned::Done(Applied {
             body: b"0\n".to_vec(),
             changegroup_ids: Vec::new(),
             push_raced: false,
             bundle1,
-        });
+        }));
     }
     if !bundle1 && !check_heads_agree(repo, bundle)? {
-        return Ok(Applied {
+        return Ok(Planned::Done(Applied {
             body: Vec::new(),
             changegroup_ids: Vec::new(),
             push_raced: true,
             bundle1,
-        });
+        }));
     }
 
-    let compression = compression_of(repo);
     let mut groups: Vec<(Section, Vec<CgDeltaChunk>)> = Vec::new();
     let mut changegroup_ids = Vec::new();
     let mut cg_part = false;
@@ -108,11 +155,118 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
     }
 
     // Validate the entire input before requirements, bookmarks or history change.
-    for (_, chunks) in &groups {
-        if let Some(chunk) = chunks.iter().find(|chunk| chunk.flags != 0) {
-            return Err(format!("unsupported revision flags {:#06x} for {}", chunk.flags, chunk.node).into());
+    let adds_lfs = check_groups(repo, &groups, policy)?;
+    Ok(Planned::Write(PushPlan { groups, pushkeys, changegroup_ids, tree, adds_lfs, bundle1 }))
+}
+
+fn unsupported_flags(chunk: &CgDeltaChunk) -> Error {
+    format!("unsupported revision flags {:#06x} for {}", chunk.flags, chunk.node).into()
+}
+
+/// Result length of `delta` on a base of `base_len` bytes. The range check is
+/// what makes `delta::apply` safe on client deltas; `Delta::new` already keeps
+/// fragments sorted and apart, so the removed lengths cannot exceed `base_len`.
+fn delta_result_len(base_len: usize, delta: &Delta) -> Result<usize> {
+    let mut len = base_len;
+    for frag in delta.fragments() {
+        if frag.start > frag.end || frag.end > base_len {
+            return Err("changegroup delta is outside its base".into());
+        }
+        len = (len - (frag.end - frag.start)) + frag.content.len();
+    }
+    Ok(len)
+}
+
+/// Check every revision the push would add. Returns whether any is EXTSTORED.
+fn check_groups(
+    repo: &RevlogRepo,
+    groups: &[(Section, Vec<CgDeltaChunk>)],
+    policy: &PushPolicy,
+) -> Result<bool> {
+    let dotencode = repo.get_requirements().contains(&Required::Dotencode);
+    // By path as well as node: a bundle can repeat a file's section.
+    let mut lens: HashMap<(&MPath, NodeHash), usize> = HashMap::new();
+    let mut pointers: HashMap<(&MPath, NodeHash), Vec<u8>> = HashMap::new();
+    let mut adds_lfs = false;
+    for (section, chunks) in groups {
+        let Section::Filelog(path) = section else {
+            if let Some(chunk) = chunks.iter().find(|chunk| chunk.flags != 0) {
+                return Err(unsupported_flags(chunk));
+            }
+            continue;
+        };
+        let name = String::from_utf8_lossy(path.as_slice());
+        let exists = repo.store_path().join(path.store_filelog(dotencode, b"i")).exists();
+        let stored = if exists { Some(repo.read_file_revlog(path)?) } else { None };
+        for chunk in chunks {
+            if chunk.flags & !IdxFlags::EXTSTORED.bits() != 0 {
+                return Err(unsupported_flags(chunk));
+            }
+            // `append_group` skips revisions the repository has.
+            if stored.as_ref().is_some_and(|log| log.index_of(&chunk.node).is_ok()) {
+                continue;
+            }
+            let base = (path, chunk.base);
+            let base_len = if chunk.base == NULL_HASH {
+                0
+            } else if let Some(len) = lens.get(&base) {
+                *len
+            } else {
+                // Raw stored length, a pointer's own for an EXTSTORED base.
+                let entry = stored.as_ref().and_then(|log| log.get_entry_by_nodeid(&chunk.base).ok());
+                let len = entry.and_then(|entry| entry.len);
+                len.ok_or_else(|| Error::from(format!("{name}: delta base {} is not known", chunk.base)))? as usize
+            };
+            let len = delta_result_len(base_len, &chunk.delta)?;
+            // Appends can reorder chunks, so a repeat could differ from what was measured.
+            if lens.insert((path, chunk.node), len).is_some() {
+                return Err(format!("{name}: duplicate revision {}", chunk.node).into());
+            }
+            if chunk.flags != 0 {
+                let Some(store) = policy.lfs else {
+                    return Err("this repository does not serve LFS".into());
+                };
+                let malformed = || Error::from(format!("{name}: malformed LFS pointer"));
+                if len > MAX_POINTER_LEN {
+                    return Err(malformed());
+                }
+                let text = if chunk.base == NULL_HASH {
+                    delta::apply(&[], chunk.delta.clone())
+                } else if let Some(text) = pointers.get(&base) {
+                    delta::apply(text, chunk.delta.clone())
+                } else if let (false, Some(log)) = (lens.contains_key(&base), &stored) {
+                    full_text(log, chunk.base, chunk.delta.clone())?
+                } else {
+                    // Hg never deltas across the flag, and plain texts of this push are not kept.
+                    return Err(malformed());
+                };
+                let pointer = Pointer::parse(&text).map_err(|_| malformed())?;
+                let size = tokio::runtime::Handle::current().block_on(store.size(&pointer.oid))?;
+                if size != Some(pointer.size) {
+                    return Err(format!(
+                        "{name}: LFS blob {} is not on the server; push again so hg uploads it",
+                        pointer.oid
+                    )
+                    .into());
+                }
+                pointers.insert((path, chunk.node), text);
+                adds_lfs = true;
+            } else if policy.max_plain_file_size > 0 && len as u64 > policy.max_plain_file_size {
+                return Err(format!(
+                    "{name} is {} MB, over the server's {} MB limit for files not stored in LFS; track it in .hglfs",
+                    len as u64 / 1_000_000,
+                    policy.max_plain_file_size / 1_000_000
+                )
+                .into());
+            }
         }
     }
+    Ok(adds_lfs)
+}
+
+pub(crate) fn write_push(repo: &RevlogRepo, plan: PushPlan) -> Result<Applied> {
+    let PushPlan { groups, pushkeys, changegroup_ids, tree, adds_lfs, bundle1 } = plan;
+    let compression = compression_of(repo);
     let mut transaction = PushTransaction::new(repo)?;
     let applied = (|| -> Result<()> {
         if tree { use_treemanifest(repo)?; }
@@ -121,6 +275,8 @@ pub(crate) fn apply_repo(repo: &RevlogRepo, heads: &[NodeHash], bundle: &[u8]) -
             append_group(repo, compression, &section, chunks)?;
         }
         for header in pushkeys { apply_pushkey(repo, &header)?; }
+        // Last, so no step can fail with it set; a rollback restores `requires` anyway.
+        if adds_lfs { repo.add_requirement(Required::Lfs)?; }
         Ok(())
     })();
     if let Err(err) = applied {
@@ -452,13 +608,13 @@ fn append_group(
                 p2,
                 base,
                 linknode: _,
-                flags: _,
+                flags,
                 delta,
             } = chunk;
             // Keep the client's delta when it is against a revision we have.
             let stored_delta = (base != NULL_HASH).then(|| (base, delta.clone()));
             let text = full_text(&revlog, base, delta)?;
-            revlog.append_revision(
+            revlog.append_revision_flagged(
                 RevlogAppend {
                     node,
                     p1: parent_opt(p1),
@@ -468,6 +624,8 @@ fn append_group(
                 },
                 stored_delta,
                 compression,
+                // `check_groups` let only known flags through.
+                IdxFlags::from_bits_truncate(flags),
             )?;
             progress = true;
         }
@@ -643,9 +801,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lfs::pointer::{sha256_oid, Oid};
+    use crate::lfs::store::{LfsStore, StoreSpec};
+    use crate::lfs::LfsServing;
+    use crate::repo::{Repo, RepoClient, RepoOptions};
+    use hgproto::HgCommands;
+    use mercurial_types::delta::Fragment;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct Fixture(PathBuf);
@@ -715,7 +880,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .collect();
-            let applied = apply_repo(&repo, &heads, bundle).unwrap();
+            let applied = apply_repo(&repo, &heads, bundle, &NO_POLICY).unwrap();
             assert_eq!(applied.body, b"1\n");
             assert_eq!(repo.changelog_revlog().len().unwrap(), 2);
             hg(&self.0.join("target"), &["verify"]);
@@ -763,7 +928,7 @@ mod tests {
         let file = repo.get_file_revlog(&mercurial_types::Path::new(b"a").unwrap()).unwrap();
         let heads: Vec<_> = log.clone().get_heads().unwrap().into_iter().collect();
         let bundle = fixture.bundle("none-v2");
-        assert!(apply_repo(&repo, &heads, &bundle).is_err());
+        assert!(apply_repo(&repo, &heads, &bundle, &NO_POLICY).is_err());
         assert_eq!(log.len().unwrap(), 1, "failed push remained in shared changelog");
         assert_eq!(file.len().unwrap(), 1, "failed push remained in shared filelog");
         assert!(!target.join(".hg/store/data/a.d").exists(), "split data file survived rollback");
@@ -773,7 +938,7 @@ mod tests {
         assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated temporary file");
         hg(&target, &["verify"]);
         fs::remove_file(obstruction).unwrap();
-        apply_repo(&repo, &heads, &bundle).unwrap();
+        apply_repo(&repo, &heads, &bundle, &NO_POLICY).unwrap();
         assert_eq!(log.len().unwrap(), 3);
         hg(&target, &["verify"]);
     }
@@ -812,7 +977,7 @@ mod tests {
         let mut builder = mercurial_bundles::Bundle2EncodeBuilder::new(Cursor::new(Vec::new()));
         builder.add_part(part);
         let bytes = futures::executor::block_on(builder.build()).unwrap().into_inner();
-        assert!(apply_repo(&repo, &[NULL_HASH], &bytes).is_err());
+        assert!(apply_repo(&repo, &[NULL_HASH], &bytes, &NO_POLICY).is_err());
         assert_eq!(clone.get_requirements(), requirements);
         assert_eq!(fs::read(target.join(".hg/store/requires")).unwrap(), before);
         assert_eq!(clone.changelog_revlog().len().unwrap(), 0);
@@ -850,7 +1015,7 @@ mod tests {
         let bytes = futures::executor::block_on(builder.build()).unwrap().into_inner();
         let repo = fixture.repo();
         let heads: Vec<_> = repo.changelog_revlog().get_heads().unwrap().into_iter().collect();
-        let err = apply_repo(&repo, &heads, &bytes).err().expect("invalid second bookmark part");
+        let err = apply_repo(&repo, &heads, &bytes, &NO_POLICY).err().expect("invalid second bookmark part");
         assert!(err.to_string().contains("pushkey missing key"), "{err}");
         assert_eq!(fs::read(target.join(".hg/bookmarks")).unwrap(), before);
         assert_eq!(repo.changelog_revlog().len().unwrap(), 1);
@@ -882,11 +1047,428 @@ mod tests {
         let bytes = futures::executor::block_on(builder.build()).unwrap().into_inner();
         let repo = fixture.repo();
         let heads: Vec<_> = repo.changelog_revlog().get_heads().unwrap().into_iter().collect();
-        let result = apply_repo(&repo, &heads, &bytes);
+        let result = apply_repo(&repo, &heads, &bytes, &NO_POLICY);
         assert!(result.is_err(), "unsupported flags were silently stripped");
         assert!(result.err().unwrap().to_string().contains("flags"));
         assert_eq!(repo.changelog_revlog().len().unwrap(), 1);
         hg(&fixture.0.join("target"), &["verify"]);
+    }
+
+    const NO_POLICY: PushPolicy = PushPolicy { lfs: None, max_plain_file_size: 0 };
+    const EXT: u16 = IdxFlags::EXTSTORED.bits();
+
+    fn oid_of(data: &[u8]) -> Oid {
+        use sha2::{Digest, Sha256};
+        sha256_oid(&Sha256::digest(data).into())
+    }
+
+    fn pointer(data: &[u8]) -> Vec<u8> {
+        format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+            oid_of(data),
+            data.len()
+        )
+        .into_bytes()
+    }
+
+    fn insert(text: &[u8]) -> Delta {
+        Delta::new(vec![Fragment { start: 0, end: 0, content: text.to_vec() }]).unwrap()
+    }
+
+    fn replace_all(base_len: usize, text: &[u8]) -> Delta {
+        Delta::new(vec![Fragment { start: 0, end: base_len, content: text.to_vec() }]).unwrap()
+    }
+
+    fn cg_parts(raw: &[u8]) -> Vec<Part> {
+        let mut parts = Vec::new();
+        drain_bundle(raw, |item| {
+            if let Bundle2Item::Inner(inner) = item {
+                parts.push(inner.cg2_part());
+            }
+            Ok(())
+        }).unwrap();
+        parts
+    }
+
+    fn cg03_builder(parts: Vec<Part>) -> mercurial_bundles::Bundle2EncodeBuilder<Cursor<Vec<u8>>> {
+        let part = mercurial_bundles::parts::changegroup_part_version(
+            futures::stream::iter(parts.into_iter().map(Ok::<_, mercurial_bundles::Error>)),
+            CgVersion::V3,
+        ).unwrap();
+        let mut builder = mercurial_bundles::Bundle2EncodeBuilder::new(Cursor::new(Vec::new()));
+        builder.add_part(part);
+        builder
+    }
+
+    /// The second file revision on top of `chunk`, with its own node.
+    fn next_rev(chunk: &CgDeltaChunk, flags: u16, delta: Delta) -> CgDeltaChunk {
+        CgDeltaChunk {
+            node: NodeHash::from_bytes(&[7; 20]).unwrap(),
+            p1: chunk.node,
+            base: chunk.node,
+            flags,
+            delta,
+            ..chunk.clone()
+        }
+    }
+
+    fn as_pointer(mut chunk: CgDeltaChunk, data: &[u8]) -> CgDeltaChunk {
+        chunk.flags = EXT;
+        chunk.base = NULL_HASH;
+        chunk.delta = insert(&pointer(data));
+        chunk
+    }
+
+    impl Fixture {
+        fn store(&self) -> Arc<LfsStore> {
+            let logger = slog::Logger::root(slog::Discard, slog::o!());
+            let dir = self.0.join("target/.hg/store");
+            Arc::new(LfsStore::open(&StoreSpec::Repo, None, &dir, &logger).unwrap())
+        }
+
+        /// The cg03 bundle of the source's second commit, with the filelog
+        /// chunk replaced by what `edit` makes of it.
+        fn cg03_parts(&self, edit: impl FnOnce(CgDeltaChunk) -> Vec<CgDeltaChunk>) -> Vec<Part> {
+            let mut parts = cg_parts(&self.bundle("none-v2;cg.version=03"));
+            let at = parts.iter().position(|part| matches!(part, Part::CgChunk(Section::Filelog(_), _))).unwrap();
+            let Part::CgChunk(section, chunk) = parts.remove(at) else { unreachable!() };
+            for (i, chunk) in edit(chunk).into_iter().enumerate() {
+                parts.insert(at + i, Part::CgChunk(section.clone(), chunk));
+            }
+            parts
+        }
+
+        fn cg03(&self, edit: impl FnOnce(CgDeltaChunk) -> Vec<CgDeltaChunk>) -> Vec<u8> {
+            let builder = cg03_builder(self.cg03_parts(edit));
+            futures::executor::block_on(builder.build()).unwrap().into_inner()
+        }
+
+        /// Push the way `unbundle` does: on the blocking pool of a current-thread runtime.
+        fn push(&self, bundle: &[u8], store: Option<&Arc<LfsStore>>, limit: u64) -> Result<Applied> {
+            let path = self.0.join("target/.hg");
+            let bundle = bundle.to_vec();
+            let store = store.cloned();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async move {
+                tokio::task::spawn_blocking(move || {
+                    let repo = RevlogRepo::open(path)?;
+                    let heads: Vec<_> = repo.changelog_revlog().get_heads()?.into_iter().collect();
+                    let policy = PushPolicy { lfs: store.as_deref(), max_plain_file_size: limit };
+                    apply_repo(&repo, &heads, &bundle, &policy)
+                }).await
+            }).unwrap()
+        }
+
+        fn put(&self, store: &LfsStore, data: &[u8]) {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(store.put(&oid_of(data), data.len() as u64, data)).unwrap();
+        }
+
+        fn assert_rejected(&self, result: Result<Applied>, needle: &str) {
+            let err = result.err().expect("push must be rejected").to_string();
+            assert!(err.contains(needle), "{err}");
+            let repo = self.repo();
+            assert_eq!(repo.changelog_revlog().len().unwrap(), 1, "nothing is written");
+            assert_eq!(repo.manifest_revlog().len().unwrap(), 1, "nothing is written");
+            assert!(!repo.get_requirements().contains(&Required::Lfs));
+            let backups = fs::read_dir(self.0.join("target/.hg/store")).unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().starts_with("push-backup"))
+                .count();
+            assert_eq!(backups, 0);
+            hg(&self.0.join("target"), &["verify"]);
+        }
+    }
+
+    #[test]
+    fn plain_limit_rejects_large_file() {
+        let fixture = Fixture::new();
+        let bundle = fixture.cg03(|mut chunk| {
+            chunk.base = NULL_HASH;
+            chunk.delta = insert(b"12345678901");
+            vec![chunk]
+        });
+        fixture.assert_rejected(
+            fixture.push(&bundle, None, 10),
+            "a is 0 MB, over the server's 0 MB limit for files not stored in LFS; track it in .hglfs",
+        );
+    }
+
+    #[test]
+    fn plain_limit_counts_delta_against_base_in_same_push() {
+        let fixture = Fixture::new();
+        let bundle = fixture.cg03(|mut chunk| {
+            chunk.base = NULL_HASH;
+            chunk.delta = insert(b"123456");
+            let next = next_rev(&chunk, 0, insert(b"abcde"));
+            vec![chunk, next]
+        });
+        fixture.assert_rejected(fixture.push(&bundle, None, 10), "over the server's");
+        fixture.push(&bundle, None, 11).map(drop).unwrap();
+    }
+
+    #[test]
+    fn plain_limit_counts_delta_against_stored_base() {
+        let fixture = Fixture::new();
+        // "first\n" is stored; growing it by five is 11 bytes.
+        let bundle = fixture.cg03(|mut chunk| {
+            chunk.base = chunk.p1;
+            chunk.delta = insert(b"12345");
+            vec![chunk]
+        });
+        fixture.assert_rejected(fixture.push(&bundle, None, 10), "over the server's");
+    }
+
+    #[test]
+    fn plain_limit_applies_to_every_changegroup_format() {
+        // "second\n" is 7 bytes.
+        let fixture = Fixture::new();
+        let v1 = fixture.bundle("none-v1");
+        let bundles = [
+            ("bundle1", v1.clone()),
+            ("headerless", v1[6..].to_vec()),
+            ("bundle2 cg01", bundle2_v1(&v1, true)),
+            ("cg02", fixture.bundle("none-v2;cg.version=02")),
+            ("cg03", fixture.bundle("none-v2;cg.version=03")),
+        ];
+        for (kind, bundle) in bundles {
+            let err = fixture.push(&bundle, None, 6).err().unwrap_or_else(|| panic!("{kind} passed the limit"));
+            assert!(err.to_string().contains("over the server's"), "{kind}: {err}");
+            assert_eq!(fixture.repo().changelog_revlog().len().unwrap(), 1, "{kind}");
+        }
+    }
+
+    #[test]
+    fn revisions_already_stored_are_not_checked() {
+        let fixture = Fixture::new();
+        let bundle = fixture.cg03(|chunk| vec![chunk]);
+        fixture.push(&bundle, None, 0).map(drop).unwrap();
+        fixture.push(&bundle, None, 1).map(drop).unwrap();
+    }
+
+    #[test]
+    fn duplicate_revision_in_a_push_is_rejected() {
+        let fixture = Fixture::new();
+        let bundle = fixture.cg03(|chunk| vec![chunk.clone(), chunk]);
+        fixture.assert_rejected(fixture.push(&bundle, None, 0), "a: duplicate revision");
+    }
+
+    #[test]
+    fn delta_result_len_rejects_hostile_ranges() {
+        let frag = |start, end, content: &[u8]| Fragment { start, end, content: content.to_vec() };
+        let delta = Delta::new(vec![frag(1, 3, b"xyz"), frag(4, 5, b"")]).unwrap();
+        assert_eq!(delta_result_len(6, &delta).unwrap(), 6);
+        assert_eq!(delta_result_len(0, &Delta::default()).unwrap(), 0);
+        assert!(delta_result_len(4, &delta).is_err(), "end past the base");
+        let huge = Delta::new(vec![frag(usize::MAX - 1, usize::MAX, b"")]).unwrap();
+        assert!(delta_result_len(10, &huge).is_err());
+    }
+
+    #[test]
+    fn delta_past_its_base_is_rejected_without_a_panic() {
+        let fixture = Fixture::new();
+        let bundle = fixture.cg03(|mut chunk| {
+            chunk.base = chunk.p1;
+            chunk.delta = Delta::new(vec![Fragment { start: 100, end: 200, content: Vec::new() }]).unwrap();
+            vec![chunk]
+        });
+        fixture.assert_rejected(fixture.push(&bundle, None, 0), "outside its base");
+    }
+
+    #[test]
+    fn unknown_delta_base_is_rejected() {
+        let fixture = Fixture::new();
+        let bundle = fixture.cg03(|mut chunk| {
+            chunk.base = NodeHash::from_bytes(&[9; 20]).unwrap();
+            vec![chunk]
+        });
+        fixture.assert_rejected(fixture.push(&bundle, None, 0), "a: delta base");
+    }
+
+    #[test]
+    fn push_rejects_missing_blob() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let bundle = fixture.cg03(|chunk| vec![as_pointer(chunk, b"blob")]);
+        let expected = format!("a: LFS blob {} is not on the server; push again so hg uploads it", oid_of(b"blob"));
+        fixture.assert_rejected(fixture.push(&bundle, Some(&store), 0), &expected);
+    }
+
+    #[test]
+    fn push_rejects_blob_of_the_wrong_size() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        fixture.put(&store, b"blob");
+        let text = String::from_utf8(pointer(b"blob")).unwrap().replace("size 4", "size 5");
+        let bundle = fixture.cg03(|chunk| {
+            let mut chunk = as_pointer(chunk, b"blob");
+            chunk.delta = insert(text.as_bytes());
+            vec![chunk]
+        });
+        fixture.assert_rejected(fixture.push(&bundle, Some(&store), 0), "is not on the server");
+    }
+
+    #[test]
+    fn push_accepts_present_blob_and_adds_requirement() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        fixture.put(&store, b"blob");
+        let mut node = NULL_HASH;
+        // The chunk keeps the node hg gave it, a hash of other text: an
+        // LFS node hashes the real content, never the pointer.
+        let bundle = fixture.cg03(|chunk| {
+            node = chunk.node;
+            vec![as_pointer(chunk, b"blob")]
+        });
+        // The plain limit does not apply to the pointer.
+        assert_eq!(fixture.push(&bundle, Some(&store), 1).unwrap().body, b"1\n");
+        let repo = fixture.repo();
+        let log = repo.get_file_revlog(&mercurial_types::Path::new(b"a").unwrap()).unwrap();
+        assert_eq!(log.get_entry_by_nodeid(&node).unwrap().flags, IdxFlags::EXTSTORED);
+        assert!(repo.get_requirements().contains(&Required::Lfs));
+        let requires = fs::read_to_string(fixture.0.join("target/.hg/store/requires")).unwrap()
+            + &fs::read_to_string(fixture.0.join("target/.hg/requires")).unwrap();
+        assert!(requires.lines().any(|line| line == "lfs"), "{requires}");
+    }
+
+    #[test]
+    fn pointer_deltas_chain_inside_a_push() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        fixture.put(&store, b"blob");
+        fixture.put(&store, b"blob two");
+        let (first, second) = (pointer(b"blob"), pointer(b"blob two"));
+        let bundle = fixture.cg03(|chunk| {
+            let chunk = as_pointer(chunk, b"blob");
+            let next = next_rev(&chunk, EXT, replace_all(first.len(), &second));
+            // A plain revision measures a pointer base by its raw length.
+            let mut plain = next_rev(&next, 0, replace_all(second.len(), b"x"));
+            plain.node = NodeHash::from_bytes(&[8; 20]).unwrap();
+            vec![chunk, next, plain]
+        });
+        assert_eq!(fixture.push(&bundle, Some(&store), 1).unwrap().body, b"1\n");
+    }
+
+    #[test]
+    fn pointer_delta_against_plain_revision_in_the_push_is_rejected() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let bundle = fixture.cg03(|chunk| {
+            let next = next_rev(&chunk, EXT, Delta::default());
+            vec![chunk, next]
+        });
+        fixture.assert_rejected(fixture.push(&bundle, Some(&store), 0), "malformed LFS pointer");
+    }
+
+    #[test]
+    fn push_rejects_malformed_pointer() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let bundle = fixture.cg03(|chunk| {
+            let mut chunk = as_pointer(chunk, b"blob");
+            chunk.delta = insert(b"hello");
+            vec![chunk]
+        });
+        fixture.assert_rejected(fixture.push(&bundle, Some(&store), 0), "a: malformed LFS pointer");
+    }
+
+    #[test]
+    fn oversized_pointer_is_rejected_before_building_its_text() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        fixture.put(&store, b"blob");
+        // A valid pointer but for its length.
+        let mut text = pointer(b"blob");
+        text.extend_from_slice(format!("x-pad {}\n", "x".repeat(MAX_POINTER_LEN)).as_bytes());
+        let bundle = fixture.cg03(|chunk| {
+            let mut chunk = as_pointer(chunk, b"blob");
+            chunk.delta = insert(&text);
+            vec![chunk]
+        });
+        fixture.assert_rejected(fixture.push(&bundle, Some(&store), 0), "malformed LFS pointer");
+    }
+
+    #[test]
+    fn push_rejects_lfs_without_lfs_serving() {
+        let fixture = Fixture::new();
+        let bundle = fixture.cg03(|chunk| vec![as_pointer(chunk, b"blob")]);
+        fixture.assert_rejected(fixture.push(&bundle, None, 0), "this repository does not serve LFS");
+    }
+
+    #[test]
+    fn extstored_outside_filelogs_is_rejected() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let mut parts = cg_parts(&fixture.bundle("none-v2;cg.version=03"));
+        for part in &mut parts {
+            if let Part::CgChunk(Section::Manifest, chunk) = part {
+                chunk.flags = EXT;
+            }
+        }
+        let bytes = futures::executor::block_on(cg03_builder(parts).build()).unwrap().into_inner();
+        fixture.assert_rejected(fixture.push(&bytes, Some(&store), 0), "unsupported revision flags");
+    }
+
+    #[test]
+    fn censored_and_mixed_flags_on_a_filelog_are_rejected() {
+        for flags in [IdxFlags::CENSORED.bits(), EXT | 1] {
+            let fixture = Fixture::new();
+            let store = fixture.store();
+            let bundle = fixture.cg03(|mut chunk| {
+                chunk.flags = flags;
+                vec![chunk]
+            });
+            fixture.assert_rejected(fixture.push(&bundle, Some(&store), 0), "unsupported revision flags");
+        }
+    }
+
+    #[test]
+    fn failure_after_lfs_append_leaves_no_requirement() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        fixture.put(&store, b"blob");
+        let mut builder = cg03_builder(fixture.cg03_parts(|chunk| vec![as_pointer(chunk, b"blob")]));
+        let mut bad = PartEncodeBuilder::mandatory("pushkey").unwrap();
+        bad.add_mparam("namespace", "bookmarks").unwrap();
+        builder.add_part(bad);
+        let bytes = futures::executor::block_on(builder.build()).unwrap().into_inner();
+        let requires = [".hg/requires", ".hg/store/requires"].map(|file| fixture.0.join("target").join(file));
+        let before = requires.clone().map(|path| fs::read(path).unwrap());
+        let err = fixture.push(&bytes, Some(&store), 0).err().expect("bad pushkey part");
+        assert!(err.to_string().contains("pushkey missing key"), "{err}");
+        assert_eq!(requires.map(|path| fs::read(path).unwrap()), before);
+        let repo = fixture.repo();
+        assert!(!repo.get_requirements().contains(&Required::Lfs));
+        assert_eq!(repo.changelog_revlog().len().unwrap(), 1);
+        hg(&fixture.0.join("target"), &["verify"]);
+    }
+
+    /// The real entry point on the server's kind of runtime: every wire
+    /// protocol ends in `RepoClient::unbundle`.
+    #[test]
+    fn unbundle_checks_blobs_from_a_current_thread_runtime() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let bundle = fixture.cg03(|chunk| vec![as_pointer(chunk, b"blob")]);
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        let options = RepoOptions {
+            lfs: Some(LfsServing { store: Arc::clone(&store), public_url: None }),
+            ..RepoOptions::default()
+        };
+        let repo = Arc::new(Repo::new(&logger, &fixture.0.join("target/.hg"), options).unwrap());
+        let heads: Vec<_> = repo.hgrepo().changelog_revlog().get_heads().unwrap().into_iter().collect();
+        let client = RepoClient::new(Arc::clone(&repo), &logger);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let refused = runtime.block_on(client.unbundle(heads.clone(), Bytes::from(bundle.clone()))).unwrap();
+        let hgproto::Response::Unbundle(reply) = refused else { panic!("not a bundle2 reply") };
+        assert!(reply.windows(14).any(|bytes| bytes == b"is not on the "), "{reply:?}");
+        assert_eq!(repo.hgrepo().changelog_revlog().len().unwrap(), 1);
+
+        fixture.put(&store, b"blob");
+        let pushed = runtime.block_on(client.unbundle(heads, Bytes::from(bundle))).unwrap();
+        assert!(matches!(pushed, hgproto::Response::Unbundle(_)));
+        assert_eq!(repo.hgrepo().changelog_revlog().len().unwrap(), 2);
+        assert!(repo.hgrepo().get_requirements().contains(&Required::Lfs));
     }
 
     #[test]
@@ -955,7 +1537,7 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .collect();
-            assert!(apply_repo(&repo, &heads, &bundle).is_err(), "{kind}");
+            assert!(apply_repo(&repo, &heads, &bundle, &NO_POLICY).is_err(), "{kind}");
             assert_eq!(repo.changelog_revlog().len().unwrap(), 1);
         }
     }

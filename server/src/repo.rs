@@ -37,6 +37,7 @@ use crate::bundle::{history_part, legacy_changegroup, Selection, LFS_REQUIRED};
 use crate::errors::Result;
 use crate::lfs::LfsServing;
 use crate::names::{self, BranchCache};
+use crate::push::{Planned, PushPolicy};
 use crate::stream::{list_store, stream_part, stream_requirements, StoreFile};
 
 pub struct RepoOptions {
@@ -479,6 +480,28 @@ async fn write_locks(repo: &mercurial::RevlogRepo) -> hgproto::Result<(RepoLock,
     .map_err(|err| hgproto::Error::from(err.to_string()))
 }
 
+fn apply_push(repo: &Repo, heads: &[NodeHash], bundle: &[u8]) -> Result<crate::push::Applied> {
+    let policy = PushPolicy {
+        lfs: repo.lfs().map(|lfs| lfs.store.as_ref()),
+        max_plain_file_size: repo.options().max_plain_file_size,
+    };
+    // Validation stays outside the stamp lock: `hgrepo()` takes that lock on the
+    // runtime thread, and the LFS store's IO needs that thread to make progress.
+    let plan = match crate::push::plan_push(&repo.revlogs, heads, bundle, &policy)? {
+        Planned::Done(applied) => return Ok(applied),
+        Planned::Write(plan) => plan,
+    };
+    // Match with_branches' lock order. No branch reader can cache
+    // changesets from a transaction that is subsequently rolled back.
+    let mut stamp = repo.changelog_seen.lock().expect("changelog stamp lock");
+    let applied = crate::push::write_push(&repo.revlogs, plan);
+    if applied.is_err() {
+        *repo.branch_cache.lock().expect("branch cache lock") = BranchCache::default();
+    }
+    *stamp = changelog_stamp(&repo.revlogs.store_path());
+    applied
+}
+
 async fn stream_clone_part(repo: &Arc<Repo>) -> hgproto::Result<PartEncodeBuilder> {
     let requirements = stream_requirements(repo.hgrepo()).ok_or_else(|| {
         hgproto::Error::from(
@@ -841,25 +864,24 @@ impl HgCommands for RepoClient {
             let mut listing = repo.store_listing.lock().await;
             // Cleared before writing, so even a failed push lists the store again.
             *listing = None;
-            let _locks = write_locks(repo.hgrepo()).await?;
+            let locks = write_locks(repo.hgrepo()).await?;
             // `hgrepo()` again under the locks, to see anything hg wrote while we waited.
             repo.hgrepo();
-            let applied = {
-                // Match with_branches' lock order. No branch reader can cache
-                // changesets from a transaction that is subsequently rolled back.
-                let mut stamp = repo.changelog_seen.lock().expect("changelog stamp lock");
-                let applied = crate::push::apply_repo(&repo.revlogs, &heads, &bundle);
-                if applied.is_err() {
-                    *repo.branch_cache.lock().expect("branch cache lock") = BranchCache::default();
-                }
-                *stamp = changelog_stamp(&repo.revlogs.store_path());
-                applied
-            };
+            let bundle1 = crate::push::is_bundle1(&bundle);
+            let pushing = Arc::clone(&repo);
+            // The blocking pool, as LFS checks wait on the store. The task owns
+            // the locks: it outlives this future if the client goes away.
+            let applied = tokio::task::spawn_blocking(move || {
+                let _locks = locks;
+                apply_push(&pushing, &heads, &bundle)
+            })
+            .await
+            .map_err(|err| hgproto::Error::from(err.to_string()))?;
             let reply = match applied {
                 Ok(applied) => crate::push::reply(&applied).await,
                 Err(err) => {
                     warn!(logger, "push failed: {}", err);
-                    if crate::push::is_bundle1(&bundle) {
+                    if bundle1 {
                         Ok(hgproto::Response::Pushres {
                             ret: 0,
                             output: Bytes::new(),
