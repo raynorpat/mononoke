@@ -220,7 +220,7 @@ impl LfsStore {
     }
 
     #[cfg(test)]
-    fn with_stores(primary: Arc<dyn ObjectStore>, fallback: Option<Arc<dyn ObjectStore>>) -> Self {
+    pub(crate) fn with_stores(primary: Arc<dyn ObjectStore>, fallback: Option<Arc<dyn ObjectStore>>) -> Self {
         LfsStore {
             primary,
             fallback,

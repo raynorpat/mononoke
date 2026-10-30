@@ -294,12 +294,21 @@ impl Cg2Unpacker {
             // new length: i32
             // content (new length bytes)
             // ---
+            if remaining < 12 {
+                bail!(ErrorKind::Cg2Decode(format!(
+                    "expected a fragment header, {} bytes remaining",
+                    remaining
+                )));
+            }
             let start = buf.drain_i32();
             let end = buf.drain_i32();
             let new_len = buf.drain_i32();
-            // TODO: handle negative values for all the above
+            // TODO: handle negative values for start and end
 
-            let delta_len = (new_len + 12) as usize;
+            let delta_len = match usize::try_from(new_len).ok().and_then(|len| len.checked_add(12)) {
+                Some(delta_len) => delta_len,
+                None => bail!(ErrorKind::Cg2Decode(format!("invalid fragment length {}", new_len))),
+            };
             if remaining < delta_len {
                 bail!(ErrorKind::Cg2Decode(format!(
                     "expected {} bytes, {} remaining",
@@ -371,5 +380,31 @@ enum State {
 impl State {
     pub fn take(&mut self) -> Self {
         mem::replace(self, State::Invalid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frag(start: i32, end: i32, new_len: i32) -> Vec<u8> {
+        [start.to_be_bytes(), end.to_be_bytes(), new_len.to_be_bytes()].concat()
+    }
+
+    #[test]
+    fn decode_delta_rejects_bad_lengths() {
+        for raw in [frag(0, 0, -1), frag(0, 0, -12), frag(0, 0, -13), frag(0, 0, i32::MIN), frag(0, 0, i32::MAX), vec![0; 5]] {
+            let remaining = raw.len();
+            let mut buf = BytesMut::from(raw.as_slice());
+            assert!(Cg2Unpacker::decode_delta(&mut buf, remaining).is_err(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn decode_delta_reads_a_fragment() {
+        let raw = [frag(1, 2, 3), b"abc".to_vec()].concat();
+        let mut buf = BytesMut::from(raw.as_slice());
+        let delta = Cg2Unpacker::decode_delta(&mut buf, raw.len()).unwrap();
+        assert_eq!(delta.fragments()[0].content, b"abc");
     }
 }

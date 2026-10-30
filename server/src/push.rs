@@ -202,8 +202,10 @@ fn check_groups(
             if chunk.flags & !IdxFlags::EXTSTORED.bits() != 0 {
                 return Err(unsupported_flags(chunk));
             }
-            // `append_group` skips revisions the repository has.
-            if stored.as_ref().is_some_and(|log| log.index_of(&chunk.node).is_ok()) {
+            // `append_group` skips revisions the repository has. One flagged here
+            // still counts: a crash can leave it there without the requirement.
+            if let Some(entry) = stored.as_ref().and_then(|log| log.get_entry_by_nodeid(&chunk.node).ok()) {
+                adds_lfs |= entry.flags.contains(IdxFlags::EXTSTORED);
                 continue;
             }
             let base = (path, chunk.base);
@@ -241,7 +243,10 @@ fn check_groups(
                     return Err(malformed());
                 };
                 let pointer = Pointer::parse(&text).map_err(|_| malformed())?;
-                let size = tokio::runtime::Handle::current().block_on(store.size(&pointer.oid))?;
+                // `size` has logged the detail, which clients must not see.
+                let size = tokio::runtime::Handle::current()
+                    .block_on(store.size(&pointer.oid))
+                    .map_err(|_| Error::from("LFS storage error"))?;
                 if size != Some(pointer.size) {
                     return Err(format!(
                         "{name}: LFS blob {} is not on the server; push again so hg uploads it",
@@ -706,7 +711,8 @@ fn full_text(revlog: &Revlog, base: NodeHash, delta: Delta) -> Result<Vec<u8>> {
             .ok_or_else(|| Error::from("revision is missing text"))?
             .to_vec()
     };
-    Ok(mercurial_types::delta::apply(&base_text, delta))
+    delta_result_len(base_text.len(), &delta)?;
+    Ok(delta::apply(&base_text, delta))
 }
 
 fn apply_pushkey(repo: &RevlogRepo, header: &PartHeader) -> Result<()> {
@@ -1469,6 +1475,58 @@ mod tests {
         assert!(matches!(pushed, hgproto::Response::Unbundle(_)));
         assert_eq!(repo.hgrepo().changelog_revlog().len().unwrap(), 2);
         assert!(repo.hgrepo().get_requirements().contains(&Required::Lfs));
+    }
+
+    #[test]
+    fn hostile_manifest_delta_rolls_back() {
+        let fixture = Fixture::new();
+        let mut parts = cg_parts(&fixture.bundle("none-v2;cg.version=03"));
+        for part in &mut parts {
+            if let Part::CgChunk(Section::Manifest, chunk) = part {
+                chunk.base = chunk.p1;
+                chunk.delta = Delta::new(vec![Fragment { start: 1000, end: 2000, content: Vec::new() }]).unwrap();
+            }
+        }
+        let bytes = futures::executor::block_on(cg03_builder(parts).build()).unwrap().into_inner();
+        fixture.assert_rejected(fixture.push(&bytes, None, 0), "outside its base");
+    }
+
+    #[test]
+    fn store_failure_reaches_the_client_as_a_fixed_message() {
+        let fixture = Fixture::new();
+        // Nothing listens there; this also runs a real HTTP client under the
+        // blocking pool's `block_on`.
+        let s3 = object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("region")
+            .with_endpoint("http://127.0.0.1:1")
+            .with_allow_http(true)
+            .with_skip_signature(true)
+            .with_retry(object_store::RetryConfig { max_retries: 0, ..Default::default() })
+            .build()
+            .unwrap();
+        let store = Arc::new(LfsStore::with_stores(Arc::new(s3), None));
+        let bundle = fixture.cg03(|chunk| vec![as_pointer(chunk, b"blob")]);
+        fixture.assert_rejected(fixture.push(&bundle, Some(&store), 0), "LFS storage error");
+    }
+
+    #[test]
+    fn retry_after_crash_adds_the_missing_requirement() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        fixture.put(&store, b"blob");
+        let bundle = fixture.cg03(|chunk| vec![as_pointer(chunk, b"blob")]);
+        fixture.push(&bundle, Some(&store), 0).map(drop).unwrap();
+        // The state a crash between the appends and `add_requirement` leaves.
+        for file in [".hg/requires", ".hg/store/requires"] {
+            let path = fixture.0.join("target").join(file);
+            let kept: Vec<_> = fs::read_to_string(&path).unwrap().lines()
+                .filter(|line| *line != "lfs").map(|line| format!("{line}\n")).collect();
+            fs::write(path, kept.concat()).unwrap();
+        }
+        assert!(!fixture.repo().get_requirements().contains(&Required::Lfs));
+        fixture.push(&bundle, Some(&store), 0).map(drop).unwrap();
+        assert!(fixture.repo().get_requirements().contains(&Required::Lfs));
     }
 
     #[test]

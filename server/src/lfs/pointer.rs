@@ -54,19 +54,21 @@ pub struct Pointer {
 impl Pointer {
     pub fn parse(text: &[u8]) -> Result<Pointer> {
         let bad = |why: &str| format!("invalid lfs pointer: {}", why);
-        let text = std::str::from_utf8(text).map_err(|_| bad("not utf-8"))?;
-        let mut lines = text.split_terminator('\n');
+        // Bytes: hg stores a copy source's raw path in `x-hg-copy`.
+        let mut lines = text.strip_suffix(b"\n").unwrap_or(text).split(|b| *b == b'\n');
 
-        let version = lines.next().and_then(|l| l.strip_prefix("version "));
-        if version != Some(VERSION) {
+        let version = lines.next().and_then(|l| l.strip_prefix(b"version "));
+        if version != Some(VERSION.as_bytes()) {
             return Err(bad("missing or unknown version").into());
         }
 
-        let (mut oid, mut size, mut prev) = (None, None, "");
+        let (mut oid, mut size, mut prev) = (None, None, &b""[..]);
         for line in lines {
-            let (key, value) = line.split_once(' ').ok_or_else(|| bad("line without value"))?;
+            let space = line.iter().position(|b| *b == b' ');
+            let space = space.ok_or_else(|| bad("line without value"))?;
+            let (key, value) = (&line[..space], &line[space + 1..]);
             if key.is_empty()
-                || !key.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-'))
+                || !key.iter().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-'))
             {
                 return Err(bad("bad key").into());
             }
@@ -75,16 +77,18 @@ impl Pointer {
             }
             prev = key;
             match key {
-                "version" => return Err(bad("repeated version").into()),
-                "oid" => {
-                    let hex = value.strip_prefix("sha256:").ok_or_else(|| bad("bad oid"))?;
+                b"version" => return Err(bad("repeated version").into()),
+                b"oid" => {
+                    let hex = value.strip_prefix(b"sha256:").ok_or_else(|| bad("bad oid"))?;
+                    let hex = std::str::from_utf8(hex).map_err(|_| bad("bad oid"))?;
                     oid = Some(Oid::parse(hex)?);
                 }
-                "size" => {
-                    if !value.bytes().all(|b| b.is_ascii_digit()) {
+                b"size" => {
+                    if !value.iter().all(|b| b.is_ascii_digit()) {
                         return Err(bad("bad size").into());
                     }
-                    size = Some(value.parse().map_err(|_| bad("bad size"))?);
+                    let digits = std::str::from_utf8(value).map_err(|_| bad("bad size"))?;
+                    size = Some(digits.parse().map_err(|_| bad("bad size"))?);
                 }
                 _ => {}
             }
@@ -111,6 +115,29 @@ mod tests {
         let p = Pointer::parse(text.as_bytes()).unwrap();
         assert_eq!(p.oid, Oid::parse(OID).unwrap());
         assert_eq!(p.size, 12);
+    }
+
+    #[test]
+    fn pointer_keeps_raw_bytes_in_other_values() {
+        let mut text = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 12\nx-hg-copy ",
+            OID
+        )
+        .into_bytes();
+        text.extend_from_slice(b"caf\xe9.bin\nx-hg-copyrev 00\n");
+        let p = Pointer::parse(&text).unwrap();
+        assert_eq!(p.oid, Oid::parse(OID).unwrap());
+        assert_eq!(p.size, 12);
+    }
+
+    #[test]
+    fn pointer_needs_ascii_where_it_matters() {
+        let v = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\n", OID);
+        for tail in [b"size 1\xe9\n".as_slice(), b"size 12\nk\xe9y 1\n"] {
+            assert!(Pointer::parse(&[v.as_bytes(), tail].concat()).is_err(), "{tail:?}");
+        }
+        let bad_oid = b"version https://git-lfs.github.com/spec/v1\noid sha256:\xe9\nsize 1\n";
+        assert!(Pointer::parse(bad_oid).is_err());
     }
 
     #[test]

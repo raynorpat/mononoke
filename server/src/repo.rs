@@ -449,7 +449,7 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(600);
 const LOCK_POLL: Duration = Duration::from_millis(100);
 
 /// Take the Mercurial lock at `path`, waiting while someone else holds it.
-/// Blocks; the server's runtime has no timer, so run it off the runtime thread.
+/// Blocks, so run it off the runtime thread.
 fn wait_for_lock(path: &Path) -> Result<RepoLock> {
     let started = Instant::now();
     loop {
