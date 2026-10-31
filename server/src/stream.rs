@@ -83,11 +83,17 @@ pub fn stream_requirements(repo: &RevlogRepo) -> Option<String> {
 pub fn list_store(repo: &RevlogRepo) -> Result<Vec<StoreFile>> {
     let store = repo.store_path();
     let mut sizes = HashMap::new();
+    // Not `lfs`: clients fetch blobs through the batch API, never in a stream clone.
     for top in ["data", "meta", "dh"] {
         walk(&store, &store.join(top), &mut sizes)?;
     }
 
-    let fncache = fs::read(store.join("fncache"))?;
+    let fncache = match fs::read(store.join("fncache")) {
+        Ok(fncache) => fncache,
+        // `hg init` writes none until the first file is stored.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
     // Revlog names without the extension: `data/<file>` or `meta/<dir>/00manifest`.
     let mut revlogs = BTreeSet::new();
     for line in fncache
@@ -470,6 +476,35 @@ mod tests {
         })
         .expect_err("short piece");
         assert!(err.to_string().starts_with("clone could only read 3 bytes"));
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn lfs_repo_streams_its_revlogs_but_never_its_blobs() {
+        let dir = std::env::temp_dir().join(format!("mononoke-stream-lfs-{}", std::process::id()));
+        let store = dir.join("store");
+        fs::create_dir_all(store.join("data")).expect("data");
+        fs::create_dir_all(store.join("lfs").join("objects").join("aa")).expect("lfs");
+        fs::write(dir.join("requires"), "store\nfncache\nrevlogv1\nlfs\n").expect("requires");
+        fs::write(store.join("00changelog.i"), b"").expect("changelog");
+        fs::write(store.join("00manifest.i"), b"").expect("manifest");
+        fs::write(store.join("fncache"), "data/big.bin.i\n").expect("fncache");
+        fs::write(store.join("data").join("big.bin.i"), b"pointer").expect("filelog");
+        let blob = store.join("lfs").join("objects").join("aa").join("bb");
+        fs::write(blob, b"blob").expect("blob");
+
+        let repo = RevlogRepo::open(&dir).expect("open");
+        assert_eq!(stream_requirements(&repo).as_deref(), Some("lfs,revlogv1"));
+        let files = Arc::new(list_store(&repo).expect("list"));
+        let names: Vec<&[u8]> = files.iter().map(|file| &file.name[..]).collect();
+        assert_eq!(names, [&b"data/big.bin.i"[..]]);
+
+        let mut body = stream_v1(Arc::clone(&files)).body;
+        let mut legacy = Vec::new();
+        while let Some(piece) = body.next().await {
+            legacy.extend_from_slice(&piece.unwrap());
+        }
+        assert_eq!(legacy, b"0\n1 7\ndata/big.bin.i\x007\npointer");
         fs::remove_dir_all(&dir).expect("cleanup");
     }
 

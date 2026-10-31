@@ -1595,11 +1595,13 @@ fn lfs_repo_clones_pointers_over_cg3_and_refuses_clients_without_it() {
     assert_eq!(flags(&whole), flags(&repo), "flags in the clone");
     assert_eq!(flags(&repo).iter().filter(|flag| *flag == "2000").count(), 3);
 
+    // A pull, because `hg clone` sees `lfs-serve` and turns lfs on, and with it 03.
+    assert_hg(&hg(&temp.0, &["init", "old"]), "hg init old");
     let refused = hg(
-        &temp.0,
-        &["--config", "experimental.changegroup3=false", "clone", "-U", "--pull", &url, "old"],
+        &temp.0.join("old"),
+        &["--config", "experimental.changegroup3=false", "pull", &url],
     );
-    assert!(!refused.status.success(), "changegroup 02 clone of an lfs repo");
+    assert!(!refused.status.success(), "changegroup 02 pull of an lfs repo");
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("this repository uses LFS"), "{stderr}");
 }
@@ -3081,4 +3083,330 @@ fn inline_clone_bundle_clones() {
     );
     let missing = raw_command(mono.port, "cmd=get_cached_bundle_inline&path=absent.hg");
     assert!(String::from_utf8_lossy(&missing).contains("clonebundle absent.hg does not exist"));
+}
+
+/// Tracked by `lfs_config`'s size rule.
+fn lfs_blob() -> Vec<u8> {
+    (0..64 * 1024u32).map(|i| (i ^ (i >> 8)) as u8).collect()
+}
+
+/// Client config with a blob cache of its own, so that a clone with its own
+/// `cache` can only have its blobs from the server.
+fn lfs_config(cache: &Path) -> Vec<String> {
+    [
+        "extensions.lfs=".to_string(),
+        "lfs.track=size(\">1KB\")".to_string(),
+        format!("lfs.usercache={}", cfg_path(cache)),
+    ]
+    .into_iter()
+    .flat_map(|config| ["--config".to_string(), config])
+    .collect()
+}
+
+fn hg_lfs(dir: &Path, cache: &Path, args: &[&str]) -> Output {
+    let config = lfs_config(cache);
+    let config: Vec<&str> = config.iter().map(String::as_str).collect();
+    hg(dir, &[&config[..], args].concat())
+}
+
+fn hg_lfs_ssh(dir: &Path, cache: &Path, args: &[&str], shim: &Path) -> Output {
+    let config = lfs_config(cache);
+    let config: Vec<&str> = config.iter().map(String::as_str).collect();
+    hg_ssh(dir, &[&config[..], args].concat(), shim)
+}
+
+fn assert_requires_lfs(repo: &Path) {
+    let all = requirements(repo);
+    assert!(all.lines().any(|line| line == "lfs"), "{all}");
+}
+
+/// A clone of `url` with an LFS commit to push.
+fn lfs_client(temp: &TempDir, url: &str) -> PathBuf {
+    let cache = temp.0.join("client-cache");
+    assert_hg(&hg_lfs(&temp.0, &cache, &["clone", url, "client"]), "clone");
+    let client = temp.0.join("client");
+    fs::write(client.join("big.bin"), lfs_blob()).expect("write big.bin");
+    let commit = ["commit", "-Aqm", "big", "-u", "test"];
+    assert_hg(&hg_lfs(&client, &cache, &commit), "commit big.bin");
+    client
+}
+
+fn init_empty_repo(root: &Path) -> PathBuf {
+    assert_hg(&hg(root, &["init", "repo"]), "hg init");
+    root.join("repo")
+}
+
+#[test]
+fn http_lfs_push_and_clone() {
+    let temp = TempDir::new("lh");
+    let repo = init_empty_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let (cert, key) = write_test_cert(&temp.0);
+    let (server, https_port) = Running::start_https(&repo, &log, &cert, &key);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let https_url = format!("https://127.0.0.1:{https_port}/");
+
+    let client = lfs_client(&temp, &url);
+    let cache = temp.0.join("client-cache");
+    let push = hg_lfs(&client, &cache, &["push", &url]);
+    assert_ok_with_log(&push, "lfs push", &log);
+    assert_requires_lfs(&repo);
+    assert_ok_with_log(&hg(&repo, &["verify"]), "served hg verify", &log);
+
+    let cacerts = format!("web.cacerts={}", cfg_path(&cert));
+    let clones = [
+        ("pull", vec!["clone", "--pull", url.as_str(), "pull"]),
+        (
+            "https",
+            vec!["clone", "--config", &cacerts, https_url.as_str(), "https"],
+        ),
+    ];
+    for (dir, args) in clones {
+        let cache = temp.0.join(format!("{dir}-cache"));
+        assert_ok_with_log(&hg_lfs(&temp.0, &cache, &args), dir, &log);
+        assert_eq!(fs::read(temp.0.join(dir).join("big.bin")).expect(dir), lfs_blob());
+    }
+    assert_eq!(read_log(&log).matches("LFS GET").count(), 2, "{}", read_log(&log));
+
+    let cache = temp.0.join("stream-cache");
+    let clone = hg_lfs(&temp.0, &cache, &["clone", "-U", &url, "stream"]);
+    assert_ok_with_log(&clone, "stream clone", &log);
+    let stdout = String::from_utf8_lossy(&clone.stdout);
+    assert!(stdout.contains("streaming all changes"), "{stdout}");
+    let stream = temp.0.join("stream");
+    assert_requires_lfs(&stream);
+    let store = stream.join(".hg").join("store");
+    assert!(!store.join("lfs").exists(), "stream clone sent store/lfs");
+    assert_ok_with_log(&hg_lfs(&stream, &cache, &["update"]), "update stream clone", &log);
+    assert_eq!(fs::read(stream.join("big.bin")).expect("stream big.bin"), lfs_blob());
+    assert_eq!(read_log(&log).matches("LFS GET").count(), 3, "{}", read_log(&log));
+    assert_ok_with_log(&hg_lfs(&stream, &cache, &["verify"]), "verify stream clone", &log);
+}
+
+#[test]
+fn ssh_lfs_push_with_lfs_url() {
+    let temp = TempDir::new("ls");
+    let repo = init_empty_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let _guard = lock_ports();
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let public = ["--public-url".to_string(), format!("{base}/")];
+    let _server = Running::spawn(&repo, &log, port, &public);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let lfs_url = format!("lfs.url={base}/.git/info/lfs");
+    let remote = "ssh://user@dummy/repo";
+
+    let cache = temp.0.join("client-cache");
+    let clone = hg_lfs_ssh(&temp.0, &cache, &["clone", remote, "client"], &shim);
+    assert_ok_with_log(&clone, "ssh clone of the empty repo", &log);
+    let client = temp.0.join("client");
+    fs::write(client.join("big.bin"), lfs_blob()).expect("write big.bin");
+    let commit = ["commit", "-Aqm", "big", "-u", "test"];
+    assert_hg(&hg_lfs(&client, &cache, &commit), "commit big.bin");
+    let push = ["push", "--config", &lfs_url, remote];
+    assert_ok_with_log(&hg_lfs_ssh(&client, &cache, &push, &shim), "ssh push", &log);
+    assert_requires_lfs(&repo);
+
+    let cache = temp.0.join("dest-cache");
+    let clone = ["clone", "--config", &lfs_url, remote, "dest"];
+    assert_ok_with_log(&hg_lfs_ssh(&temp.0, &cache, &clone, &shim), "ssh clone", &log);
+    assert_eq!(fs::read(temp.0.join("dest").join("big.bin")).expect("dest"), lfs_blob());
+    assert!(read_log(&log).contains("LFS GET"), "{}", read_log(&log));
+}
+
+#[test]
+fn push_with_missing_blob_is_rejected() {
+    let temp = TempDir::new("lm");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let client = lfs_client(&temp, &url);
+    let before = changelog_len(&repo);
+
+    let elsewhere = temp.0.join("elsewhere");
+    fs::create_dir(&elsewhere).expect("mkdir elsewhere");
+    let lfs_url = format!("lfs.url=file:///{}", cfg_path(&elsewhere).trim_start_matches('/'));
+    let cache = temp.0.join("client-cache");
+    let push = hg_lfs(&client, &cache, &["push", "--config", &lfs_url, &url]);
+    assert!(!push.status.success(), "push without the blob was accepted");
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    assert!(stderr.contains("is not on the server"), "{stderr}");
+    assert_eq!(changelog_len(&repo), before);
+}
+
+#[test]
+fn plain_file_over_limit_is_rejected() {
+    let temp = TempDir::new("lp");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let port = server.port;
+    let url = format!("http://127.0.0.1:{port}/");
+    assert_hg(&hg(&temp.0, &["clone", &url, "client"]), "clone");
+    let client = temp.0.join("client");
+    fs::write(client.join("big.bin"), vec![b'x'; 11_000_000]).expect("write big.bin");
+    assert_hg(&hg(&client, &["commit", "-Aqm", "big", "-u", "test"]), "commit");
+
+    let push = hg(&client, &["push", &url]);
+    assert!(!push.status.success(), "push over the limit was accepted");
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    assert!(stderr.contains("over the server's 10 MB limit"), "{stderr}");
+
+    drop(server);
+    // `spawn` waits for this file, which the killed server left behind.
+    let _ = fs::remove_file(repo.join(".hg").join("mononoke.sock"));
+    let no_limit = ["--max-plain-file-size".to_string(), "0".to_string()];
+    let _server = Running::spawn(&repo, &log, port, &no_limit);
+    assert_ok_with_log(&hg(&client, &["push", &url]), "push without a limit", &log);
+    assert_hg(&hg(&repo, &["update"]), "update served repo");
+    assert_eq!(fs::read(repo.join("big.bin")).expect("big.bin").len(), 11_000_000);
+}
+
+#[test]
+fn outside_lfs_commit_is_served() {
+    let temp = TempDir::new("lo");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let caps = || String::from_utf8_lossy(&raw_command(server.port, "cmd=capabilities")).into_owned();
+    assert!(caps().split(' ').any(|cap| cap == "lfs"), "{}", caps());
+    assert!(!caps().contains("lfs-serve"), "{}", caps());
+
+    fs::write(repo.join("big.bin"), lfs_blob()).expect("write big.bin");
+    let cache = temp.0.join("server-cache");
+    let commit = ["commit", "-Aqm", "big", "-u", "test"];
+    assert_hg(&hg_lfs(&repo, &cache, &commit), "commit in the served repo");
+    assert!(caps().contains("lfs-serve"), "{}", caps());
+
+    let cache = temp.0.join("dest-cache");
+    assert_ok_with_log(&hg_lfs(&temp.0, &cache, &["clone", &url, "dest"]), "clone", &log);
+    assert_eq!(fs::read(temp.0.join("dest").join("big.bin")).expect("dest"), lfs_blob());
+    assert!(read_log(&log).contains("LFS GET"), "{}", read_log(&log));
+}
+
+#[test]
+fn lfs_file_renamed_from_a_non_utf8_name_round_trips() {
+    let temp = TempDir::new("lr");
+    let repo = init_empty_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let client = lfs_client(&temp, &url);
+    let cache = temp.0.join("client-cache");
+
+    // Latin-1 on unix. Windows hg stores paths in the ANSI code page.
+    #[cfg(unix)]
+    let name = {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(b"caf\xe9.bin").to_owned()
+    };
+    #[cfg(not(unix))]
+    let name = std::ffi::OsString::from("caf\u{e9}.bin");
+    let addremove = ["addremove", "-q", "-s", "100"];
+    let commit = ["commit", "-qm", "rename", "-u", "test"];
+    fs::rename(client.join("big.bin"), client.join(&name)).expect("rename to the odd name");
+    assert_hg(&hg_lfs(&client, &cache, &addremove), "addremove");
+    assert_hg(&hg_lfs(&client, &cache, &commit), "commit odd name");
+    fs::rename(client.join(&name), client.join("plain.bin")).expect("rename back");
+    assert_hg(&hg_lfs(&client, &cache, &addremove), "addremove");
+    assert_hg(&hg_lfs(&client, &cache, &commit), "commit rename");
+
+    let pointer = hg_lfs(&client, &cache, &["debugdata", "plain.bin", "0"]);
+    assert_hg(&pointer, "debugdata");
+    let pointer = pointer.stdout;
+    assert!(
+        pointer.windows(10).any(|bytes| bytes == b"x-hg-copy "),
+        "no rename in {}",
+        String::from_utf8_lossy(&pointer)
+    );
+    assert!(
+        std::str::from_utf8(&pointer).is_err(),
+        "the name is utf-8 here: {}",
+        String::from_utf8_lossy(&pointer)
+    );
+
+    assert_ok_with_log(&hg_lfs(&client, &cache, &["push", &url]), "push rename", &log);
+    assert_ok_with_log(&hg(&repo, &["verify"]), "served hg verify", &log);
+    let cache = temp.0.join("dest-cache");
+    assert_ok_with_log(&hg_lfs(&temp.0, &cache, &["clone", &url, "dest"]), "clone", &log);
+    assert_eq!(fs::read(temp.0.join("dest").join("plain.bin")).expect("dest"), lfs_blob());
+}
+
+fn run_server(args: &[&str]) -> Output {
+    let mut cmd = Command::new(sibling_bin("mononoke"));
+    cmd.args(args);
+    output_timeout(&mut cmd, Duration::from_secs(30))
+}
+
+#[test]
+fn second_repo_with_lfs_is_refused() {
+    let temp = TempDir::new("l2");
+    fs::create_dir(temp.0.join("plain")).expect("mkdir plain");
+    let plain = init_zstd_repo(&temp.0.join("plain"));
+    let lfs = init_empty_repo(&temp.0);
+    fs::write(lfs.join("big.bin"), lfs_blob()).expect("write big.bin");
+    let commit = ["commit", "-Aqm", "big", "-u", "test"];
+    assert_hg(&hg_lfs(&lfs, &temp.0.join("cache"), &commit), "commit");
+
+    let port = free_port().to_string();
+    let server = run_server(&[
+        "--http-port",
+        &port,
+        plain.to_str().expect("utf-8 path"),
+        lfs.to_str().expect("utf-8 path"),
+    ]);
+    assert!(!server.status.success(), "served an lfs repo without HTTP");
+    let stderr = String::from_utf8_lossy(&server.stderr);
+    assert!(stderr.contains("lfs repositories need HTTP"), "{stderr}");
+}
+
+#[test]
+fn lfs_endpoint_without_an_s3_store_is_refused() {
+    let temp = TempDir::new("le");
+    let repo = init_empty_repo(&temp.0);
+    let port = free_port().to_string();
+    let server = run_server(&[
+        "--http-port",
+        &port,
+        "--lfs-endpoint",
+        "http://127.0.0.1:9000",
+        repo.to_str().expect("utf-8 path"),
+    ]);
+    assert!(!server.status.success(), "accepted a useless --lfs-endpoint");
+    let stderr = String::from_utf8_lossy(&server.stderr);
+    assert!(stderr.contains("--lfs-endpoint needs an s3:// --lfs-store"), "{stderr}");
+}
+
+#[test]
+fn unreachable_lfs_store_refuses_to_start() {
+    let temp = TempDir::new("lu");
+    let repo = init_empty_repo(&temp.0);
+    let closed = free_port();
+    let mut cmd = Command::new(sibling_bin("mononoke"));
+    cmd.arg("--http-port")
+        .arg(free_port().to_string())
+        .args(["--lfs-store", "s3://bucket", "--lfs-endpoint"])
+        .arg(format!("http://127.0.0.1:{closed}"))
+        .arg(&repo)
+        .env("AWS_ACCESS_KEY_ID", "test")
+        .env("AWS_SECRET_ACCESS_KEY", "test")
+        .env("AWS_REGION", "us-east-1");
+    let server = output_timeout(&mut cmd, Duration::from_secs(300));
+    assert!(!server.status.success(), "served with no store");
+    let stderr = String::from_utf8_lossy(&server.stderr);
+    assert!(stderr.contains("LFS store is not reachable: list failed: backend error"), "{stderr}");
+    assert!(!stderr.contains("127.0.0.1"), "{stderr}");
+}
+
+#[test]
+fn bad_repo_path_stops_the_server_and_stays_untouched() {
+    let temp = TempDir::new("lb");
+    let missing = temp.0.join("missing");
+    let port = free_port().to_string();
+    let server = run_server(&["--http-port", &port, missing.to_str().expect("utf-8 path")]);
+    assert!(!server.status.success(), "served a path with no repo");
+    assert!(!missing.exists(), "startup created {}", missing.display());
 }

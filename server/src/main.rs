@@ -17,8 +17,11 @@ use clap::{Arg, ArgAction, Command};
 use futures::{SinkExt, StreamExt};
 use hgproto::sshproto::HgSshCommandDecode;
 use hgproto::HgService;
+use mercurial::revlogrepo::Required;
 use mercurial_types::NodeHash;
 use mononoke::errors::{Error, Result, ResultExt};
+use mononoke::lfs::store::{LfsStore, StoreSpec};
+use mononoke::lfs::LfsServing;
 use mononoke::listener::{self, ssh_server_mux, Stdio};
 use mononoke::push;
 use mononoke::repo::{self, RepoClient};
@@ -26,14 +29,61 @@ use slog::{crit, error, info, o, Drain, Level, Logger, OwnedKVList, Record, KV};
 use slog_term::PlainSyncDecorator;
 use tokio_util::codec::Decoder;
 
-fn init_repo<P: AsRef<Path>>(parent_logger: &Logger, repopath: P) -> Result<(PathBuf, repo::Repo)> {
+struct ServeOptions {
+    lfs_store: StoreSpec,
+    lfs_endpoint: Option<String>,
+    public_url: Option<String>,
+    max_plain_file_size: u64,
+}
+
+/// `log` receives full backend errors, so it must be the server's, never a connection's.
+fn lfs_serving(log: &Logger, hg_dir: &Path, options: &ServeOptions) -> Result<LfsServing> {
+    // `LfsStore::open` creates its directories, which must not appear in a path that is no repo.
+    let store_dir = mercurial::RevlogRepo::open(hg_dir)?.store_path();
+    let endpoint = options.lfs_endpoint.as_deref();
+    let store = LfsStore::open(&options.lfs_store, endpoint, &store_dir, log)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime
+        .block_on(store.check())
+        .map_err(|err| format!("LFS store is not reachable: {err}"))?;
+    Ok(LfsServing {
+        store: Arc::new(store),
+        public_url: options.public_url.clone(),
+    })
+}
+
+fn init_repo<P: AsRef<Path>>(
+    parent_logger: &Logger,
+    repopath: P,
+    first: bool,
+    options: &ServeOptions,
+) -> Result<(PathBuf, repo::Repo)> {
     let repopath = repopath.as_ref();
 
     let mut sock = PathBuf::from(repopath);
     sock.push(".hg");
 
-    let repo = repo::Repo::new(parent_logger, &sock, repo::RepoOptions::default())
+    // Only the first repo has HTTP, which LFS blobs travel over.
+    let lfs = if first {
+        Some(lfs_serving(parent_logger, &sock, options)?)
+    } else {
+        None
+    };
+    let repo_options = repo::RepoOptions {
+        lfs,
+        max_plain_file_size: options.max_plain_file_size,
+    };
+    let repo = repo::Repo::new(parent_logger, &sock, repo_options)
         .chain_err(|| format!("Failed to initialize repo {:?}", repopath))?;
+    if !first && repo.hgrepo().get_requirements().contains(&Required::Lfs) {
+        return Err(format!(
+            "lfs repositories need HTTP; serve {} first",
+            repopath.display()
+        )
+        .into());
+    }
 
     sock.push("mononoke.sock");
 
@@ -390,58 +440,61 @@ fn run<'a, I>(
     http_addr: &str,
     http_port: u16,
     https: Option<(String, u16, PathBuf, PathBuf)>,
+    options: &ServeOptions,
     root_log: &Logger,
 ) -> Result<()>
 where
     I: IntoIterator<Item = &'a str>,
 {
+    // Every repo is checked before any listens: a repo that fails stops the server.
+    let repos = repos
+        .into_iter()
+        .enumerate()
+        .map(|(index, repopath)| {
+            let (sockname, repo) = init_repo(root_log, repopath, index == 0, options)?;
+            Ok((repopath, sockname, repo))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let mut http = Some((http_addr.to_string(), http_port));
     let mut https = https;
     let threads = repos
         .into_iter()
-        .map(|repopath| {
+        .map(|(repopath, sockname, repo)| {
             let http = http.take();
             let https = https.take();
-            init_repo(root_log, repopath).and_then(|(sockname, repo)| {
-                let repopath = PathBuf::from(repopath);
-                let listen_log = root_log.new(o!("repo" => format!("{:?}", repopath)));
-                info!(listen_log, "Listening for connections");
+            let repopath = PathBuf::from(repopath);
+            let listen_log = root_log.new(o!("repo" => format!("{:?}", repopath)));
+            info!(listen_log, "Listening for connections");
 
-                let t = thread::spawn(move || {
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(err) => return Err(Error::from(err)),
-                    };
-                    let unw = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        rt.block_on(repo_listen(&sockname, repo, &listen_log, http, https))
-                    }));
-                    match unw {
-                        Err(err) => {
-                            crit!(
-                                listen_log,
-                                "Listener thread {:?} paniced: {:?}",
-                                repopath,
-                                err
-                            );
-                            Ok(())
-                        }
-                        Ok(result) => result,
+            thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(err) => return Err(Error::from(err)),
+                };
+                let unw = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    rt.block_on(repo_listen(&sockname, repo, &listen_log, http, https))
+                }));
+                match unw {
+                    Err(err) => {
+                        crit!(
+                            listen_log,
+                            "Listener thread {:?} paniced: {:?}",
+                            repopath,
+                            err
+                        );
+                        Ok(())
                     }
-                });
-                Ok(t)
+                    Ok(result) => result,
+                }
             })
         })
         .collect::<Vec<_>>();
 
-    for err in threads.iter().filter_map(|t| t.as_ref().err()) {
-        error!(root_log, "{}", err);
-        log_causes(root_log, err, false);
-    }
-
-    for thread in threads.into_iter().filter_map(Result::ok) {
+    for thread in threads {
         if let Err(err) = thread.join().expect("thread join failed") {
             error!(root_log, "Listener failure: {:?}", err);
         }
@@ -493,6 +546,32 @@ fn main() {
                 .long("tls-key")
                 .value_name("PATH")
                 .help("PEM private key for HTTPS"),
+        )
+        .arg(
+            Arg::new("lfs-store")
+                .long("lfs-store")
+                .value_name("STORE")
+                .default_value("repo")
+                .help("LFS blob store: repo, s3://bucket[/prefix] or azure://account/container[/prefix]"),
+        )
+        .arg(
+            Arg::new("lfs-endpoint")
+                .long("lfs-endpoint")
+                .value_name("URL")
+                .help("S3-compatible endpoint, only with an s3:// --lfs-store"),
+        )
+        .arg(
+            Arg::new("max-plain-file-size")
+                .long("max-plain-file-size")
+                .value_name("BYTES")
+                .default_value("10485760")
+                .help("largest file a push may store outside LFS, 0 for no limit"),
+        )
+        .arg(
+            Arg::new("public-url")
+                .long("public-url")
+                .value_name("URL")
+                .help("base URL for LFS transfers, instead of the request's Host"),
         )
         .arg(
             Arg::new("REPODIR")
@@ -570,9 +649,38 @@ fn main() {
         }
     };
 
-    if let Err(ref err) = run(repos, http_addr, http_port, https, &root_log) {
+    let lfs_store_text = matches
+        .get_one::<String>("lfs-store")
+        .expect("lfs-store has a default");
+    let lfs_store = match lfs_store_text.parse::<StoreSpec>() {
+        Ok(spec) => spec,
+        Err(err) => {
+            error!(root_log, "{}", err);
+            std::process::exit(1);
+        }
+    };
+    let max_plain_text = matches
+        .get_one::<String>("max-plain-file-size")
+        .expect("max-plain-file-size has a default");
+    let max_plain_file_size = match max_plain_text.parse::<u64>() {
+        Ok(size) => size,
+        Err(_) => {
+            error!(root_log, "invalid --max-plain-file-size {}", max_plain_text);
+            std::process::exit(1);
+        }
+    };
+    let options = ServeOptions {
+        lfs_store,
+        lfs_endpoint: matches.get_one::<String>("lfs-endpoint").cloned(),
+        public_url: matches.get_one::<String>("public-url").cloned(),
+        max_plain_file_size,
+    };
+
+    if let Err(ref err) = run(repos, http_addr, http_port, https, &options, &root_log) {
         error!(root_log, "Failed: {}", err);
         log_causes(&root_log, err, false);
+        // The log goes to stdout, which a service manager may not show for a refused start.
+        eprintln!("mononoke: {err}");
         std::process::exit(1);
     }
 }
