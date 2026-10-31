@@ -90,8 +90,9 @@ pub fn list_store(repo: &RevlogRepo) -> Result<Vec<StoreFile>> {
 
     let fncache = match fs::read(store.join("fncache")) {
         Ok(fncache) => fncache,
-        // `hg init` writes none until the first file is stored.
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        // `hg init` writes none until the first file is stored. With filelogs
+        // on disk it is damage, and a clone without them would look complete.
+        Err(err) if err.kind() == io::ErrorKind::NotFound && sizes.is_empty() => Vec::new(),
         Err(err) => return Err(err.into()),
     };
     // Revlog names without the extension: `data/<file>` or `meta/<dir>/00manifest`.
@@ -505,6 +506,23 @@ mod tests {
             legacy.extend_from_slice(&piece.unwrap());
         }
         assert_eq!(legacy, b"0\n1 7\ndata/big.bin.i\x007\npointer");
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn missing_fncache_is_fine_only_in_a_store_without_filelogs() {
+        let dir = std::env::temp_dir().join(format!("mononoke-stream-fnc-{}", std::process::id()));
+        let store = dir.join("store");
+        fs::create_dir_all(store.join("data")).expect("data");
+        fs::write(dir.join("requires"), "store\nfncache\nrevlogv1\n").expect("requires");
+        fs::write(store.join("00changelog.i"), b"").expect("changelog");
+        fs::write(store.join("00manifest.i"), b"").expect("manifest");
+        let repo = RevlogRepo::open(&dir).expect("open");
+
+        assert!(list_store(&repo).expect("empty store").is_empty());
+
+        fs::write(store.join("data").join("a.i"), b"revlog").expect("filelog");
+        assert!(list_store(&repo).is_err(), "lost filelogs were listed as none");
         fs::remove_dir_all(&dir).expect("cleanup");
     }
 

@@ -3496,13 +3496,31 @@ fn unreachable_lfs_store_refuses_to_start() {
 }
 
 #[test]
-fn bad_repo_path_stops_the_server_and_stays_untouched() {
+fn bad_repo_path_is_logged_and_the_others_are_served() {
     let temp = TempDir::new("lb");
+    let repo = init_zstd_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
     let missing = temp.0.join("missing");
-    let port = free_port().to_string();
-    let server = run_server(&["--http-port", &port, missing.to_str().expect("utf-8 path")]);
-    assert!(!server.status.success(), "served a path with no repo");
+    let _guard = lock_ports();
+    let extra = [missing.display().to_string()];
+    let _server = Running::spawn(&repo, &log, free_port(), &extra);
+    let shim = write_ssh_shim(&temp.0, &sibling_bin("hgcli"), &repo);
+    let clone = hg_ssh(&temp.0, &["clone", "ssh://user@dummy/repo", "dest"], &shim);
+    assert_ok_with_log(&clone, "ssh clone of the good repo", &log);
+    assert!(read_log(&log).contains("Failed to initialize repo"), "{}", read_log(&log));
     assert!(!missing.exists(), "startup created {}", missing.display());
+}
+
+#[test]
+fn bad_lfs_store_is_refused() {
+    let temp = TempDir::new("lv");
+    let repo = init_empty_repo(&temp.0);
+    let port = free_port().to_string();
+    let path = repo.to_str().expect("utf-8 path");
+    let server = run_server(&["--http-port", &port, "--lfs-store", "ftp://x", path]);
+    assert!(!server.status.success(), "accepted a bad --lfs-store");
+    let stderr = String::from_utf8_lossy(&server.stderr);
+    assert!(stderr.contains("invalid --lfs-store"), "{stderr}");
 }
 
 #[test]
