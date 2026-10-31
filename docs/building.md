@@ -48,6 +48,36 @@ The `serve` tests start real servers on local ports and drive them with `hg`,
 so they run one at a time. They create repositories under the system temp
 directory, and need `hg` on `PATH`.
 
+### LFS bucket tests
+
+`s3_lfs_push_and_clone` and `azure_lfs_push_and_clone` print `skipped` and pass
+unless their variables are set. To run them, start the emulators and create the
+bucket and container first:
+
+```sh
+# MinIO: a directory under /data is a bucket
+docker run -d --name minio -p 127.0.0.1:9000:9000 --entrypoint sh minio/minio \
+  -c 'mkdir -p /data/mononoke-lfs && minio server /data'
+export MONONOKE_TEST_S3_ENDPOINT=http://127.0.0.1:9000
+export MONONOKE_TEST_S3_BUCKET=mononoke-lfs
+export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1
+
+# Azurite
+docker run -d --name azurite -p 127.0.0.1:10000:10000 \
+  mcr.microsoft.com/azure-storage/azurite azurite-blob --blobHost 0.0.0.0
+az storage container create -n mononoke-lfs --connection-string \
+  'DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;'
+export MONONOKE_TEST_AZURE_ACCOUNT=devstoreaccount1
+export MONONOKE_TEST_AZURE_CONTAINER=mononoke-lfs
+export AZURE_STORAGE_USE_EMULATOR=true
+
+cargo test -p mononoke --test serve lfs -- --test-threads=1
+docker rm -f minio azurite
+```
+
+Use a bucket and container name that does not occur in a URL path such as
+`.hg/lfs`, because the tests check that batch responses do not name them.
+
 On Windows, a running `mononoke.exe` or `hgcli.exe` locks its file. Stop any
 server started from `target/` before rebuilding.
 

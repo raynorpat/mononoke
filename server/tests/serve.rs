@@ -3341,6 +3341,98 @@ fn run_server(args: &[&str]) -> Output {
     output_timeout(&mut cmd, Duration::from_secs(30))
 }
 
+/// Pushes and clones an LFS file through a server whose blobs live in a
+/// bucket, and checks that nothing reached the repo and no batch response names
+/// the bucket. `hidden` are the strings that must stay out of those responses.
+fn lfs_bucket_round_trip(store: &str, endpoint: Option<&str>, hidden: &[&str]) {
+    use std::io::{Read, Write};
+    let temp = TempDir::new("lb");
+    let repo = init_empty_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let mut extra = vec!["--lfs-store".to_string(), store.to_string()];
+    if let Some(endpoint) = endpoint {
+        extra.extend(["--lfs-endpoint".to_string(), endpoint.to_string()]);
+    }
+    let _guard = lock_ports();
+    let port = free_port();
+    let server = Running::spawn(&repo, &log, port, &extra);
+    drop(_guard);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+
+    let client = lfs_client(&temp, &url);
+    let cache = temp.0.join("client-cache");
+    assert_ok_with_log(&hg_lfs(&client, &cache, &["push", &url]), "lfs push", &log);
+    assert_requires_lfs(&repo);
+
+    let clone_cache = temp.0.join("clone-cache");
+    let clone = hg_lfs(&temp.0, &clone_cache, &["clone", &url, "dest"]);
+    assert_ok_with_log(&clone, "lfs clone", &log);
+    assert_eq!(fs::read(temp.0.join("dest").join("big.bin")).expect("dest"), lfs_blob());
+
+    let objects = repo.join(".hg").join("store").join("lfs").join("objects");
+    let local = fs::read_dir(&objects).map(|dir| dir.count()).unwrap_or(0);
+    assert_eq!(local, 0, "a blob reached the served repo");
+
+    let pointer = hg_lfs(&client, &cache, &["debugdata", "big.bin", "0"]);
+    let pointer = String::from_utf8_lossy(&pointer.stdout).into_owned();
+    let oid = pointer.split("oid sha256:").nth(1).and_then(|rest| rest.split_whitespace().next());
+    let oid = oid.unwrap_or_else(|| panic!("no oid in {pointer}"));
+    let json = format!(
+        r#"{{"operation":"download","objects":[{{"oid":"{oid}","size":{}}}]}}"#,
+        lfs_blob().len()
+    );
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    sock.set_read_timeout(Some(Duration::from_secs(30))).expect("read timeout");
+    write!(
+        sock,
+        "POST /.git/info/lfs/objects/batch HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Accept: application/vnd.git-lfs+json\r\nContent-Type: application/vnd.git-lfs+json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+        json.len()
+    )
+    .expect("send batch");
+    let mut raw = Vec::new();
+    sock.read_to_end(&mut raw).expect("read batch response");
+    let body = String::from_utf8_lossy(&raw);
+    assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+    assert!(body.contains(oid), "{body}");
+    for secret in hidden {
+        assert!(!body.contains(secret), "batch response names {secret}: {body}");
+    }
+}
+
+fn unique_prefix() -> String {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+    format!("mononoke-test-{nanos}")
+}
+
+#[test]
+fn s3_lfs_push_and_clone() {
+    let (Ok(endpoint), Ok(bucket)) = (
+        std::env::var("MONONOKE_TEST_S3_ENDPOINT"),
+        std::env::var("MONONOKE_TEST_S3_BUCKET"),
+    ) else {
+        println!("skipped: MONONOKE_TEST_S3_ENDPOINT and MONONOKE_TEST_S3_BUCKET are not set");
+        return;
+    };
+    let host = endpoint.split("://").last().unwrap_or(&endpoint).trim_end_matches('/');
+    let store = format!("s3://{bucket}/{}", unique_prefix());
+    lfs_bucket_round_trip(&store, Some(&endpoint), &[&bucket, host]);
+}
+
+#[test]
+fn azure_lfs_push_and_clone() {
+    let (Ok(account), Ok(container)) = (
+        std::env::var("MONONOKE_TEST_AZURE_ACCOUNT"),
+        std::env::var("MONONOKE_TEST_AZURE_CONTAINER"),
+    ) else {
+        println!("skipped: MONONOKE_TEST_AZURE_ACCOUNT and MONONOKE_TEST_AZURE_CONTAINER are not set");
+        return;
+    };
+    let store = format!("azure://{account}/{container}/{}", unique_prefix());
+    lfs_bucket_round_trip(&store, None, &[&account, &container]);
+}
+
 #[test]
 fn second_repo_with_lfs_is_refused() {
     let temp = TempDir::new("l2");
@@ -3391,14 +3483,16 @@ fn unreachable_lfs_store_refuses_to_start() {
         .args(["--lfs-store", "s3://bucket", "--lfs-endpoint"])
         .arg(format!("http://127.0.0.1:{closed}"))
         .arg(&repo)
-        .env("AWS_ACCESS_KEY_ID", "test")
-        .env("AWS_SECRET_ACCESS_KEY", "test")
+        .env("AWS_ACCESS_KEY_ID", "AKIAUNREACHABLE0KEY")
+        .env("AWS_SECRET_ACCESS_KEY", "unreachable-secret-value")
         .env("AWS_REGION", "us-east-1");
     let server = output_timeout(&mut cmd, Duration::from_secs(300));
     assert!(!server.status.success(), "served with no store");
     let stderr = String::from_utf8_lossy(&server.stderr);
     assert!(stderr.contains("LFS store is not reachable: list failed: backend error"), "{stderr}");
     assert!(!stderr.contains("127.0.0.1"), "{stderr}");
+    assert!(!stderr.contains("AKIAUNREACHABLE0KEY"), "{stderr}");
+    assert!(!stderr.contains("unreachable-secret-value"), "{stderr}");
 }
 
 #[test]
