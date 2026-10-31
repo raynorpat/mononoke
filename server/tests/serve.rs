@@ -3264,6 +3264,93 @@ fn plain_file_over_limit_is_rejected() {
     assert_eq!(fs::read(repo.join("big.bin")).expect("big.bin").len(), 11_000_000);
 }
 
+/// Over 300 characters, in a commit that never touches the working copy,
+/// because Windows cannot create such a path.
+fn commit_long_path(client: &Path, config: &[&str], contents: &str) {
+    let path = format!("{}big.bin", "abcdefgh/".repeat(33));
+    let patch = client.join(".hg").join("long.patch");
+    let text = format!(
+        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,1 @@\n+{contents}\n"
+    );
+    fs::write(&patch, text).expect("write the patch");
+    let patch = patch.to_str().expect("utf-8 path");
+    let import = ["import", "--bypass", "-m", "long", "-u", "test", patch];
+    assert_hg(&hg(client, &[config, &import].concat()), "import the long path");
+}
+
+/// The value of a bundle2 parameter is limited to 255 bytes.
+fn assert_long_path_rejected(push: &Output, advice: &str) {
+    assert!(!push.status.success(), "push was accepted");
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    assert!(stderr.contains(advice), "{stderr}");
+    assert!(stderr.contains("abcdefgh/abcdefgh/"), "{stderr}");
+    assert!(!stderr.contains("exceeds max length"), "{stderr}");
+}
+
+#[test]
+fn long_path_with_missing_blob_is_rejected() {
+    let temp = TempDir::new("ll");
+    let repo = init_empty_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let cache = temp.0.join("client-cache");
+    assert_hg(&hg_lfs(&temp.0, &cache, &["clone", &url, "client"]), "clone");
+    let client = temp.0.join("client");
+    let config = lfs_config(&cache);
+    let config: Vec<&str> = config.iter().map(String::as_str).collect();
+    commit_long_path(&client, &config, &"x".repeat(2000));
+
+    let elsewhere = temp.0.join("elsewhere");
+    fs::create_dir(&elsewhere).expect("mkdir elsewhere");
+    let lfs_url = format!("lfs.url=file:///{}", cfg_path(&elsewhere).trim_start_matches('/'));
+    let push = hg_lfs(&client, &cache, &["push", "--config", &lfs_url, &url]);
+    assert_long_path_rejected(&push, "push again so hg uploads it");
+}
+
+#[test]
+fn long_path_over_the_plain_limit_is_rejected() {
+    let temp = TempDir::new("lk");
+    let repo = init_empty_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    assert_hg(&hg(&temp.0, &["clone", &url, "client"]), "clone");
+    let client = temp.0.join("client");
+    commit_long_path(&client, &[], &"x".repeat(11_000_000));
+
+    let push = hg(&client, &["push", &url]);
+    assert_long_path_rejected(&push, "track it in .hglfs");
+}
+
+#[test]
+fn more_than_a_thousand_lfs_files_push_and_clone() {
+    const FILES: usize = 1100;
+    let temp = TempDir::new("la");
+    let repo = init_empty_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+
+    let cache = temp.0.join("client-cache");
+    assert_hg(&hg_lfs(&temp.0, &cache, &["clone", &url, "client"]), "clone");
+    let client = temp.0.join("client");
+    for i in 0..FILES {
+        fs::write(client.join(format!("f{i}")), format!("{i}\n")).expect("write a file");
+    }
+    let commit = ["commit", "--config", "lfs.track=all()", "-Aqm", "many", "-u", "test"];
+    assert_hg(&hg_lfs(&client, &cache, &commit), "commit");
+    assert_ok_with_log(&hg_lfs(&client, &cache, &["push", &url]), "push", &log);
+    assert_requires_lfs(&repo);
+
+    let cache = temp.0.join("dest-cache");
+    assert_ok_with_log(&hg_lfs(&temp.0, &cache, &["clone", &url, "dest"]), "clone", &log);
+    for i in 0..FILES {
+        let got = fs::read_to_string(temp.0.join("dest").join(format!("f{i}"))).expect("a file");
+        assert_eq!(got, format!("{i}\n"));
+    }
+}
+
 #[test]
 fn outside_lfs_commit_is_served() {
     let temp = TempDir::new("lo");

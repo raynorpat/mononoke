@@ -484,7 +484,21 @@ async fn push_raced_bundle() -> Result<Bytes> {
 
 /// Reply to a push that failed, so the client shows `message`.
 pub(crate) async fn abort_bundle(message: &str) -> Result<Bytes> {
-    error_bundle("error:abort", message).await
+    error_bundle("error:abort", &bound_message(message)).await
+}
+
+/// Fits `message` in a bundle2 parameter value. A long one names a long path,
+/// so the middle goes; the last bytes hold the advice of every rejection.
+fn bound_message(message: &str) -> String {
+    const MAX_LEN: usize = u8::MAX as usize;
+    const TAIL: usize = 200;
+    const ELLIPSIS: &str = "...";
+    if message.len() <= MAX_LEN {
+        return message.to_string();
+    }
+    let head = message.floor_char_boundary(MAX_LEN - TAIL - ELLIPSIS.len());
+    let tail = message.ceil_char_boundary(message.len() - TAIL);
+    format!("{}{ELLIPSIS}{}", &message[..head], &message[tail..])
 }
 
 async fn error_bundle(kind: &str, message: &str) -> Result<Bytes> {
@@ -818,6 +832,17 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn abort_message_keeps_its_start_and_advice_within_the_limit() {
+        let advice = "; track it in .hglfs";
+        let message = format!("{}{advice}", "\u{e9}".repeat(150));
+        let bounded = bound_message(&message);
+        assert!(bounded.len() <= 255, "{}", bounded.len());
+        assert!(bounded.starts_with('\u{e9}') && bounded.contains("..."), "{bounded}");
+        assert!(bounded.ends_with(advice), "{bounded}");
+        assert_eq!(bound_message("short"), "short");
+    }
 
     struct Fixture(PathBuf);
 

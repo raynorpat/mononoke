@@ -25,8 +25,6 @@ use crate::lfs::LfsServing;
 const BATCH_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
 const TEXT: &str = "text/plain; charset=utf-8";
 const STORAGE_ERROR: &str = "LFS storage error";
-/// Each object costs at least one store call.
-const MAX_BATCH_OBJECTS: usize = 1000;
 const MAX_CONCURRENT_LOOKUPS: usize = 16;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -220,11 +218,6 @@ async fn batch(
         return Err(format!("Unsupported LFS transfer operation: {operation}"));
     }
     let count = request.objects.len();
-    if count > MAX_BATCH_OBJECTS {
-        return Err(format!(
-            "Too many LFS objects, the limit is {MAX_BATCH_OBJECTS}"
-        ));
-    }
     info!(log, "LFS batch {} {} objects", operation, count);
 
     // Collected first: a lazy map's closure makes the future fail the `Send` check.
@@ -686,23 +679,6 @@ mod tests {
         let reply = start(&repo).exchange(&batch_request("not json", "")).await;
         assert_eq!(reply.status, 400);
 
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn batch_caps_the_object_count() {
-        let root = temp_repo("batch-cap");
-        let repo = serving(&root, None);
-        let object = format!(r#"{{"oid":"{}","size":1}}"#, "a".repeat(64));
-        let json = |n: usize| {
-            let objects = vec![object.as_str(); n].join(",");
-            format!(r#"{{"operation":"download","objects":[{objects}]}}"#)
-        };
-        let reply = start(&repo).exchange(&batch_request(&json(1000), "")).await;
-        assert_eq!(reply.status, 200);
-        assert_eq!(reply.json()["objects"].as_array().unwrap().len(), 1000);
-        let reply = start(&repo).exchange(&batch_request(&json(1001), "")).await;
-        assert_eq!(reply.status, 400);
         std::fs::remove_dir_all(root).unwrap();
     }
 
