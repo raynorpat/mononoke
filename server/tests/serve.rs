@@ -1163,6 +1163,48 @@ fn stream_clone_and_changegroup_clone_match() {
 }
 
 #[test]
+fn non_generaldelta_repo_clones_over_changegroup() {
+    let temp = TempDir::new("ngd");
+    let repo = temp.0.join("repo");
+    let mut init = Command::new("hg");
+    init.current_dir(&temp.0)
+        .args(["init", "repo"])
+        .args(["--config", "format.usegeneraldelta=no"])
+        .args(["--config", "format.sparse-revlog=no"])
+        .env("HGPLAIN", "1")
+        .env("HGRCPATH", "");
+    assert_hg(&output_timeout(&mut init, Duration::from_secs(120)), "hg init");
+    let requires = fs::read_to_string(repo.join(".hg").join("requires")).expect("requires")
+        + &fs::read_to_string(repo.join(".hg").join("store").join("requires")).unwrap_or_default();
+    assert!(!requires.contains("generaldelta"), "{requires}");
+
+    // Each commit changes one line, so the revisions form one delta chain.
+    let mut lines: Vec<String> = (0..50).map(|i| format!("line {i}\n")).collect();
+    for rev in 0..6 {
+        lines[rev * 8] = format!("changed in {rev}\n");
+        fs::write(repo.join("a.txt"), lines.concat()).expect("write a.txt");
+        assert_hg(&hg(&repo, &["add", "a.txt"]), "hg add");
+        assert_hg(
+            &hg(&repo, &["commit", "-m", "change", "-u", "test"]),
+            "hg commit",
+        );
+    }
+
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&repo, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    let clone = hg(&temp.0, &["clone", "--pull", &url, "dest"]);
+    assert_hg(&clone, "clone --pull");
+    let dest = temp.0.join("dest");
+    assert_hg(&hg(&dest, &["verify"]), "verify");
+    assert_eq!(
+        fs::read(dest.join("a.txt")).expect("a.txt"),
+        lines.concat().into_bytes()
+    );
+    drop(server);
+}
+
+#[test]
 fn ssh_push_records_mercurial_fncache_names() {
     let temp = TempDir::new("fn");
     let repo = init_zstd_repo(&temp.0);

@@ -647,7 +647,16 @@ impl RevlogInner {
                             )).into(),
                         );
                     }
-                    Ok((_, deltas)) => Chunk::Deltas(baserev, deltas),
+                    Ok((_, deltas)) => {
+                        // Without generaldelta baserev is the chain start, but the
+                        // stored delta is against the previous revision.
+                        let delta_base = if self.is_general_delta() || idx == RevIdx::zero() {
+                            baserev
+                        } else {
+                            idx.pred()
+                        };
+                        Chunk::Deltas(delta_base, deltas)
+                    }
                     Err(err) => {
                         return Err(
                             ErrorKind::Revlog(format!("Failed to unpack deltas: {:?}", err)).into(),
@@ -1364,7 +1373,7 @@ fn compress_snapshot(text: &[u8], compression: RevlogCompression) -> Result<Vec<
 pub enum Chunk {
     /// Literal text of the revision
     Literal(Vec<u8>),
-    /// Vector of `Delta`s against a previous version
+    /// Vector of `Delta`s against the given previous version
     Deltas(RevIdx, Vec<Delta>),
 }
 
