@@ -28,7 +28,7 @@ use crate::lfs;
 use crate::repo::{Repo, RepoClient};
 
 const MAX_HEADERS: usize = 2 * 1024 * 1024;
-const MAX_BODY: usize = 512 * 1024 * 1024;
+pub(crate) const MAX_BODY: usize = 512 * 1024 * 1024;
 
 pub async fn serve_http(listener: TcpListener, repo: Arc<Repo>) -> Result<()> {
     let log = http_logger();
@@ -130,6 +130,16 @@ pub(crate) async fn connection<S>(
     log: Logger,
     scheme: &'static str,
 ) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let served = requests(&mut sock, repo, log, scheme).await;
+    // Sends what TLS still buffers, then `close_notify`. The peer may already be gone.
+    let _ = sock.shutdown().await;
+    served
+}
+
+async fn requests<S>(mut sock: S, repo: Arc<Repo>, log: Logger, scheme: &'static str) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -394,6 +404,7 @@ where
         .unwrap_or(false);
     if expects_continue {
         sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        sock.flush().await?;
     }
     Ok(())
 }
@@ -518,6 +529,8 @@ where
     );
     sock.write_all(header.as_bytes()).await?;
     sock.write_all(body).await?;
+    // TLS can report a write done with the bytes still in its buffer.
+    sock.flush().await?;
     Ok(())
 }
 
@@ -631,6 +644,7 @@ where
     compressor.finish(&mut out)?;
     sent += write_chunk(sock, &mut out).await?;
     sock.write_all(b"0\r\n\r\n").await?;
+    sock.flush().await?;
     Ok(sent)
 }
 
@@ -647,6 +661,7 @@ async fn write_legacy_stream<S: AsyncWrite + Unpin>(
         write_chunk(sock, &mut bytes?.to_vec()).await?;
     }
     sock.write_all(b"0\r\n\r\n").await?;
+    sock.flush().await?;
     Ok(())
 }
 

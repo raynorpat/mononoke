@@ -17,7 +17,7 @@ use slog::{error, info, Logger};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::errors::Result;
-use crate::http::{connection_closes, read_body, write_continue, write_status, Head};
+use crate::http::{connection_closes, read_body, write_continue, write_status, Head, MAX_BODY};
 use crate::lfs::pointer::Oid;
 use crate::lfs::store::{Blob, LfsStore, PutOutcome};
 use crate::lfs::LfsServing;
@@ -65,6 +65,7 @@ fn reason(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         406 => "Not Acceptable",
         411 => "Length Required",
+        413 => "Payload Too Large",
         415 => "Unsupported Media Type",
         422 => "corrupt blob",
         _ => "Internal Server Error",
@@ -123,8 +124,11 @@ where
                 reply(sock, status, "", unread).await?;
                 return Ok(unread);
             }
-            let length = usize::try_from(length).unwrap_or(usize::MAX);
-            let body = read_body(sock, buf, &head.headers, length).await?;
+            if length > MAX_BODY as u64 {
+                reply(sock, 413, "", true).await?;
+                return Ok(true);
+            }
+            let body = read_body(sock, buf, &head.headers, length as usize).await?;
             let host = head.headers.get("host").map(String::as_str);
             let base = base_url(serving, scheme, host, &prefix);
             let auth = head.headers.get("authorization").map(String::as_str);
@@ -152,8 +156,9 @@ where
             } else if head.headers.contains_key("content-length") {
                 put(sock, buf, head, &oid, length, store, close, log).await?
             } else {
-                reply(sock, 411, "", unread).await?;
-                (411, 0, unread)
+                // A client omitting the length may still have a body in mind.
+                reply(sock, 411, "", true).await?;
+                (411, 0, true)
             };
             let elapsed = started.elapsed();
             info!(
@@ -329,6 +334,7 @@ where
             }
         }
     }
+    sock.flush().await?;
     Ok(sent == blob.size)
 }
 
@@ -377,6 +383,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use bytes::Bytes;
     use futures::StreamExt;
@@ -384,10 +391,14 @@ mod tests {
     use sha2::{Digest, Sha256};
     use slog::{o, Discard, Logger};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio_rustls::client::TlsStream;
+    use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+    use tokio_rustls::TlsConnector;
 
     use super::*;
     use crate::errors::Error;
-    use crate::http::connection;
+    use crate::http::{connection, tls_acceptor};
     use crate::lfs::pointer::sha256_oid;
     use crate::lfs::store::{Blob, LfsStore, StoreSpec};
     use crate::lfs::LfsServing;
@@ -835,13 +846,95 @@ mod tests {
             assert!(client.reply().await.is_none(), "{bad}");
         }
 
-        let reply = start(&repo)
-            .exchange(format!("{head}\r\n").as_bytes())
-            .await;
+        let mut client = start(&repo);
+        let reply = client.exchange(format!("{head}\r\n").as_bytes()).await;
         assert_eq!(reply.status, 411);
+        assert_eq!(reply.headers["connection"], "close");
+        assert!(client.reply().await.is_none());
 
         let request = format!("{head}Content-Length: 5\r\nContent-Length: 5\r\n\r\nbytes");
         assert_eq!(start(&repo).exchange(request.as_bytes()).await.status, 201);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_over_max_body_is_413_and_closes() {
+        let root = temp_repo("batch-413");
+        let repo = serving(&root, None);
+        let request = String::from_utf8(batch_request("", "")).unwrap().replace(
+            "Content-Length: 0",
+            &format!("Content-Length: {}", MAX_BODY + 1),
+        );
+        let mut client = start(&repo);
+        assert_eq!(client.exchange(request.as_bytes()).await.status, 413);
+        assert!(client.reply().await.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An `https` connection over a pipe small enough that the server outruns the reader.
+    async fn tls_client(repo: &Arc<Repo>, root: &Path) -> TlsStream<DuplexStream> {
+        let names = vec!["localhost".to_owned()];
+        let certified = rcgen::generate_simple_self_signed(names).unwrap();
+        let (cert_path, key_path) = (root.join("cert.pem"), root.join("key.pem"));
+        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+        std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+        let acceptor = tls_acceptor(&cert_path, &key_path).unwrap();
+
+        let (sock, server) = tokio::io::duplex(4096);
+        let repo = Arc::clone(repo);
+        tokio::spawn(async move {
+            let tls = acceptor.accept(server).await.unwrap();
+            let _ = connection(tls, repo, logger(), "https").await;
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = ServerName::try_from("localhost").unwrap();
+        let connector = TlsConnector::from(Arc::new(config));
+        connector.connect(name, sock).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn tls_get_reaches_a_slow_reader_whole() {
+        let root = temp_repo("tls-get");
+        let repo = serving(&root, None);
+        let mut data = vec![7u8; 1 << 20];
+        data.extend_from_slice(b"the end!");
+        let oid = oid_of(&data);
+        let reply = start(&repo).exchange(&put_request(&oid, &data)).await;
+        assert_eq!(reply.status, 201);
+
+        for connection in ["keep-alive", "close"] {
+            let mut tls = tls_client(&repo, &root).await;
+            let request =
+                format!("GET /.hg/lfs/objects/{oid} HTTP/1.1\r\nConnection: {connection}\r\n\r\n");
+            tls.write_all(request.as_bytes()).await.unwrap();
+            tls.flush().await.unwrap();
+
+            let read = async {
+                let mut got = Vec::new();
+                let mut tmp = [0; 1024];
+                while !got.ends_with(b"the end!") {
+                    let n = tls.read(&mut tmp).await.unwrap();
+                    assert_ne!(n, 0, "body cut off after {} bytes", got.len());
+                    got.extend_from_slice(&tmp[..n]);
+                    tokio::task::yield_now().await;
+                }
+                got
+            };
+            let got = tokio::time::timeout(Duration::from_secs(10), read)
+                .await
+                .expect("the tail of the body never arrived");
+            assert!(got.ends_with(&data), "{connection}");
+
+            if connection == "close" {
+                // Without `close_notify` this read is an unexpected EOF error.
+                assert_eq!(tls.read(&mut [0; 16]).await.unwrap(), 0);
+            }
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
