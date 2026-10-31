@@ -3530,10 +3530,12 @@ fn convert_plain_repo_to_lfs_and_push() {
         "--config",
         "extensions.lfs=",
         "--config",
-        "lfs.track=**.psd",
+        "lfs.track=**.psd or size(\">10MB\")",
     ];
     assert_hg(&hg(&temp.0, &[&convert[..], &["convert", "old", "new"]].concat()), "hg convert");
     let new = temp.0.join("new");
+    // convert leaves `new` at the null revision, so without this `.hglfs` would be a second root.
+    assert_hg(&hg_lfs(&new, &cache, &["update"]), "hg update");
     fs::write(new.join(".hglfs"), "[track]\n**.psd = all()\n** = size(\">10MB\")\n")
         .expect("write .hglfs");
     let commit = ["commit", "-Aqm", "track large files", "-u", "test"];
@@ -3556,8 +3558,16 @@ fn convert_plain_repo_to_lfs_and_push() {
         assert_ok_with_log(&hg_lfs(&clone, &clone_cache, &args), "cat", &log);
         assert!(fs::read(&out).expect("cat output") == *bytes, "art/a.psd differs at rev {index}");
     }
-    let history = hg_lfs(&clone, &clone_cache, &["log", "-T", "{desc}\n"]);
-    assert!(String::from_utf8_lossy(&history.stdout).contains("track large files"));
+    let query = |args: &[&str]| {
+        let out = hg_lfs(&clone, &clone_cache, args);
+        assert_ok_with_log(&out, "query", &log);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert_eq!(query(&["heads", "-T", "{rev}\n"]).lines().count(), 1, "heads");
+    assert_eq!(query(&["log", "-r", "tip", "-T", "{desc}"]), "track large files");
+    assert_eq!(query(&["log", "-r", "parents(tip)", "-T", "{desc}"]), "rev 1");
+    let files = query(&["files", "-r", "tip", "-T", "{path}\n"]);
+    assert!(files.lines().any(|f| f == ".hglfs") && files.lines().any(|f| f == "art/a.psd"), "{files}");
     let objects = served.join(".hg").join("store").join("lfs").join("objects");
     let blobs = fs::read_dir(objects)
         .expect("objects")

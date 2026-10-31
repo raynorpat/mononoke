@@ -266,12 +266,20 @@ clones cannot pull from or push to the converted repository. Every user must
 re-clone.**
 
 1. Write a `.hglfs` with what goes to LFS, as above.
-2. Convert, using the same rules, then commit the `.hglfs` in `new`:
+2. Convert with the same rules, enable `lfs` in `new`, update to the tip
+   and commit the `.hglfs`. Without the update, `hg convert` leaves `new`
+   at the null revision and the `.hglfs` commit becomes a second root:
 
    ```sh
    hg convert --config extensions.convert= --config extensions.lfs= \
-       --config 'lfs.track=**.psd' old new
+       --config 'lfs.track=**.psd or size(">10MB")' old new
+   printf '[extensions]\nlfs =\n' >> new/.hg/hgrc
+   hg -R new update
+   cp .hglfs new/.hglfs
+   hg -R new commit -Am "track large files"
    ```
+
+   The push in step 4 aborts if `lfs` is not enabled in `new`.
 
 3. Create an empty repository (`hg init`) and start the server on it with
    the `--lfs-store` you chose.
