@@ -58,6 +58,9 @@ Requirements accepted in `.hg/requires` and `.hg/store/requires`:
 - `dirstate-v2`, `dirstate-tracked-key-v1`. These are working-copy formats,
   and the server reads the dirstate parent for `lookup .`. They are not
   passed on to stream clones, so each client keeps its own format.
+- `lfs`. Blobs are served through the LFS batch API on HTTP and HTTPS
+  (see [running.md](running.md#large-files-lfs)). Only the first
+  repository can have it, and clients need changegroup 03.
 - `largefiles`, `manifestv2`, `sqldirstate`. These are accepted, but nothing
   handles them specially. Largefiles blobs are not served.
 
@@ -95,7 +98,9 @@ exists. Inline bundles are read below `peer-bundle-cache-root`, which defaults
 to `.hg/bundle-cache`. Changes to the manifest and repository setting apply
 without restarting. See [running.md](running.md#clone-bundles) for setup.
 
-Largefiles (`statlfile`, `getlfile`, `putlfile`) and LFS are not served.
+Largefiles (`statlfile`, `getlfile`, `putlfile`) are not served. LFS blobs
+travel over the LFS batch API on HTTP and HTTPS, not the wire protocol,
+and stream clones do not include them.
 
 ### Phases and obsolescence
 
@@ -122,6 +127,9 @@ Largefiles (`statlfile`, `getlfile`, `putlfile`) and LFS are not served.
   the one the client used.
 - New filelogs get Mercurial fncache entries, so `hg verify` passes on a pushed
   repository.
+- A pushed file larger than `--max-plain-file-size` (10 MiB by default)
+  that is not an LFS pointer is rejected. A pointer whose blob is not in
+  the store is rejected too. `hg serve` has neither check.
 - There is no pushrebase. Stock clients require `hg push --force` to create
   additional heads, as with `hg serve`.
 

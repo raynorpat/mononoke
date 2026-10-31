@@ -72,6 +72,9 @@ list goes from the lowest layer up.
     revisions, records fncache entries and updates bookmarks.
   - `http.rs`: the HTTP/1.1 wire protocol server, also used for HTTPS, and
     compression negotiation for `getbundle`.
+  - `lfs/`: LFS serving. `pointer.rs` parses pointers and oids, `store.rs`
+    stores blobs (repo directory, S3 or Azure), `http.rs` serves the batch
+    API and blob transfers.
   - `listener.rs`, `uds.rs`: the `.hg/mononoke.sock` listener. `uds.rs` is the
     Windows `AF_UNIX` implementation, since tokio only has Unix sockets on Unix.
 - **`hgcli`**: the ssh endpoint. `serve --stdio` connects to

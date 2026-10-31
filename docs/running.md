@@ -38,6 +38,10 @@ mononoke [OPTIONS] REPODIR [REPODIR...]
 | `--https-port PORT` | `8443` | HTTPS port. Used only with `--tls-cert` and `--tls-key`. |
 | `--tls-cert PATH` | | PEM certificate chain. Give it together with `--tls-key` to enable HTTPS. |
 | `--tls-key PATH` | | PEM private key. |
+| `--lfs-store STORE` | `repo` | Where LFS blobs live: `repo`, `s3://bucket[/prefix]` or `azure://account/container[/prefix]`. See [Large files](#large-files-lfs). |
+| `--lfs-endpoint URL` | | S3-compatible endpoint (MinIO, R2). Only with an `s3://` store. |
+| `--max-plain-file-size BYTES` | `10485760` | Largest file a push may store outside LFS. `0` means no limit. |
+| `--public-url URL` | | Base URL clients use for LFS transfers, instead of the request's `Host`. |
 | `-d`, `--debug` | | Debug-level logging. |
 
 Example:
@@ -99,6 +103,8 @@ make the certificate for the name clients use.
 
 There is no authentication. Anyone who can reach the port can clone and push.
 Restrict the port with a firewall, or put an authenticating proxy in front.
+If the proxy changes the host or scheme clients see, set `--public-url` to
+the address clients use (see [Behind a proxy](#behind-a-proxy)).
 
 ## Clients over ssh
 
@@ -149,6 +155,129 @@ hg clone -r v1.0 http://server:8000/ tagged
 hg pull -r stable
 hg pull -r 1a2b3c4d
 ```
+
+## Large files (LFS)
+
+The server speaks Mercurial's `lfs` extension. Clients send large files to
+the server's LFS endpoint, and the repository holds only small pointers. The
+first push of a pointer adds `lfs` to the repository's requirements.
+
+**Upload is exactly as open as push.** There is no authentication: anyone who
+can push can upload blobs, and anyone who can reach the port can download
+them. Restrict the port or authenticate at a proxy, as for pushing.
+
+### Client setup
+
+Enable the extension and say which files are large. Commit a `.hglfs` at the
+root of the working copy, with a size catch-all so that nothing big slips
+through as a plain file:
+
+```ini
+[track]
+**.psd = all()
+** = size(">10MB")
+```
+
+```ini
+[extensions]
+lfs =
+```
+
+Clients over HTTP and HTTPS need nothing else; the LFS address is derived
+from the repository URL. Clients over ssh must point `lfs.url` at the HTTP or
+HTTPS address, because blobs only travel over HTTP:
+
+```ini
+[lfs]
+url = http://server:8000/.git/info/lfs
+```
+
+A push of a plain file larger than `--max-plain-file-size` is rejected over
+every transport, so a missing rule shows up as an error and not as a huge
+revlog. `--max-plain-file-size 0` switches the limit off.
+
+### Where blobs are stored
+
+`--lfs-store` takes three forms.
+
+```sh
+mononoke /srv/hg/myrepo                                   # repo (default)
+mononoke --lfs-store s3://my-bucket/lfs /srv/hg/myrepo
+mononoke --lfs-store azure://myaccount/mycontainer/lfs /srv/hg/myrepo
+```
+
+- `repo` keeps blobs in `.hg/store/lfs/objects`, where `hg` itself keeps
+  them. The first repository gets that directory at startup, so it must not
+  be on a read-only mount.
+- `s3://bucket[/prefix]` uses an S3 bucket. Credentials come from the
+  environment (the names `object_store` reads): `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (or `AWS_DEFAULT_REGION`) and, for
+  temporary credentials, `AWS_SESSION_TOKEN`.
+- `azure://account/container[/prefix]` uses Azure Blob Storage. Credentials
+  come from `AZURE_STORAGE_ACCOUNT_KEY`, or `AZURE_STORAGE_SAS_KEY`, or
+  `AZURE_STORAGE_CLIENT_ID`, `AZURE_STORAGE_CLIENT_SECRET` and
+  `AZURE_STORAGE_TENANT_ID`.
+
+For MinIO, Cloudflare R2 and other S3-compatible services, add the endpoint:
+
+```sh
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1 \
+  mononoke --lfs-store s3://lfs --lfs-endpoint http://minio:9000 /srv/hg/myrepo
+```
+
+A plain `http://` endpoint works without further settings. `https://`
+endpoints have their certificates verified.
+
+Only the first repository on the command line serves LFS, because only the
+first has HTTP. The server refuses to start if the store cannot be reached,
+or if a repository other than the first has `lfs` in its requirements. Any
+other repository that fails to open is logged, and the others keep serving.
+
+Notes on bucket stores:
+
+- If `hg` writes a blob on the server (a commit there), the blob goes to
+  `.hg/store/lfs/objects`. The server reads it from there when the bucket has
+  no copy, and logs a warning naming the oid once.
+- A failed upload to S3 can leave an unfinished multipart upload, which the
+  bucket listing does not show. Add a lifecycle rule that aborts incomplete
+  multipart uploads after a few days.
+- One blob can be about 80 GB on S3 (8 MiB parts, at most 10,000 of them).
+- After a crash, files can remain in `.hg/store/lfs/objects/tmp`. They are
+  safe to delete.
+- Stream clones do not send `lfs/objects/tmp`, chunks or the store. Clients
+  fetch blobs through the LFS endpoint when they update.
+- Store errors reach clients only as `LFS storage error`. The details are in
+  the server log, which can contain bucket URLs and parts of the store's
+  responses, so treat the log accordingly.
+
+### Behind a proxy
+
+The server tells clients where to send blobs using the request's `Host`. If
+a proxy changes the host or scheme, give the address clients use:
+
+```sh
+mononoke --public-url https://hg.example.com/ /srv/hg/myrepo
+```
+
+### Converting an existing repository
+
+Conversion rewrites history. **Every changeset hash changes, so existing
+clones cannot pull from or push to the converted repository. Every user must
+re-clone.**
+
+1. Write a `.hglfs` with what goes to LFS, as above.
+2. Convert, using the same rules, then commit the `.hglfs` in `new`:
+
+   ```sh
+   hg convert --config extensions.convert= --config extensions.lfs= \
+       --config 'lfs.track=**.psd' old new
+   ```
+
+3. Create an empty repository (`hg init`) and start the server on it with
+   the `--lfs-store` you chose.
+4. `hg push` from `new` to the server. The client uploads every blob first,
+   then pushes the changesets.
+5. Tell every user to clone again.
 
 ## Clone bundles
 

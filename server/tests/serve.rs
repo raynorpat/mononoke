@@ -3410,3 +3410,66 @@ fn bad_repo_path_stops_the_server_and_stays_untouched() {
     assert!(!server.status.success(), "served a path with no repo");
     assert!(!missing.exists(), "startup created {}", missing.display());
 }
+
+#[test]
+fn convert_plain_repo_to_lfs_and_push() {
+    let temp = TempDir::new("lcv");
+    let cache = temp.0.join("cache");
+    let versions: Vec<Vec<u8>> = [0u8, 1]
+        .iter()
+        .map(|seed| lfs_blob().iter().map(|byte| byte ^ seed).collect())
+        .collect();
+
+    assert_hg(&hg(&temp.0, &["init", "old"]), "hg init old");
+    let old = temp.0.join("old");
+    fs::create_dir(old.join("art")).expect("mkdir art");
+    fs::write(old.join("README"), "hello\n").expect("write README");
+    for (index, bytes) in versions.iter().enumerate() {
+        fs::write(old.join("art").join("a.psd"), bytes).expect("write a.psd");
+        let message = format!("rev {index}");
+        assert_hg(&hg(&old, &["commit", "-Aqm", &message, "-u", "test"]), "hg commit");
+    }
+
+    let convert = [
+        "--config",
+        "extensions.convert=",
+        "--config",
+        "extensions.lfs=",
+        "--config",
+        "lfs.track=**.psd",
+    ];
+    assert_hg(&hg(&temp.0, &[&convert[..], &["convert", "old", "new"]].concat()), "hg convert");
+    let new = temp.0.join("new");
+    fs::write(new.join(".hglfs"), "[track]\n**.psd = all()\n** = size(\">10MB\")\n")
+        .expect("write .hglfs");
+    let commit = ["commit", "-Aqm", "track large files", "-u", "test"];
+    assert_hg(&hg_lfs(&new, &cache, &commit), "commit .hglfs");
+
+    let served = init_empty_repo(&temp.0);
+    let log = temp.0.join("mononoke.log");
+    let server = Running::start(&served, &log);
+    let url = format!("http://127.0.0.1:{}/", server.port);
+    assert_ok_with_log(&hg_lfs(&new, &cache, &["push", &url]), "push converted", &log);
+
+    let clone_cache = temp.0.join("clone-cache");
+    assert_ok_with_log(&hg_lfs(&temp.0, &clone_cache, &["clone", &url, "clone"]), "clone", &log);
+    let clone = temp.0.join("clone");
+    for (index, bytes) in versions.iter().enumerate() {
+        let rev = index.to_string();
+        // To a file: `output_timeout` reads the pipes only after exit, and a blob fills one.
+        let out = temp.0.join(format!("a{index}.psd"));
+        let args = ["cat", "-r", &rev, "-o", &cfg_path(&out), "art/a.psd"];
+        assert_ok_with_log(&hg_lfs(&clone, &clone_cache, &args), "cat", &log);
+        assert!(fs::read(&out).expect("cat output") == *bytes, "art/a.psd differs at rev {index}");
+    }
+    let history = hg_lfs(&clone, &clone_cache, &["log", "-T", "{desc}\n"]);
+    assert!(String::from_utf8_lossy(&history.stdout).contains("track large files"));
+    let objects = served.join(".hg").join("store").join("lfs").join("objects");
+    let blobs = fs::read_dir(objects)
+        .expect("objects")
+        .map(|entry| entry.expect("entry").path())
+        .filter(|dir| dir.file_name().is_some_and(|name| name.len() == 2))
+        .map(|dir| fs::read_dir(dir).expect("fanout").count())
+        .sum::<usize>();
+    assert_eq!(blobs, 2, "blobs in the served repository");
+}
