@@ -511,16 +511,18 @@ fn apply_push(repo: &Repo, heads: &[NodeHash], bundle: &[u8]) -> Result<crate::p
 }
 
 async fn stream_clone_part(repo: &Arc<Repo>) -> hgproto::Result<PartEncodeBuilder> {
-    let requirements = stream_requirements(repo.hgrepo()).ok_or_else(|| {
-        hgproto::Error::from(
-            "stream clone requested, but this repo is not served as one".to_string(),
-        )
-    })?;
     let lister = Arc::clone(repo);
     let files = tokio::task::spawn_blocking(move || lister.stream_listing())
         .await
         .map_err(|err| hgproto::Error::from(err.to_string()))?
         .map_err(|err| hgproto::Error::from(err.to_string()))?;
+    // After the listing: a push landing between them could add flagged revlogs
+    // that requirements read earlier would not declare.
+    let requirements = stream_requirements(repo.hgrepo()).ok_or_else(|| {
+        hgproto::Error::from(
+            "stream clone requested, but this repo is not served as one".to_string(),
+        )
+    })?;
     stream_part(files, &requirements).map_err(|err| hgproto::Error::from(err.to_string()))
 }
 

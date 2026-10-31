@@ -196,6 +196,11 @@ A push of a plain file larger than `--max-plain-file-size` is rejected over
 every transport, so a missing rule shows up as an error and not as a huge
 revlog. `--max-plain-file-size 0` switches the limit off.
 
+The limit also applies to history. Pushing a plain repository with large files
+in its history to a fresh server, or pulling from one server and pushing to
+another, fails until the receiving server runs with `--max-plain-file-size 0`.
+Revisions already on the server are not rechecked.
+
 ### Where blobs are stored
 
 `--lfs-store` takes three forms.
@@ -208,7 +213,10 @@ mononoke --lfs-store azure://myaccount/mycontainer/lfs /srv/hg/myrepo
 
 - `repo` keeps blobs in `.hg/store/lfs/objects`, where `hg` itself keeps
   them. The first repository gets that directory at startup, so it must not
-  be on a read-only mount.
+  be on a read-only mount. After a crash, files can remain in
+  `.hg/store/lfs/objects/tmp`. They are safe to delete. Stream clones do not
+  send anything under `.hg/store/lfs`; clients fetch blobs through the LFS
+  endpoint when they update.
 - `s3://bucket[/prefix]` uses an S3 bucket. Credentials come from the
   environment (the names `object_store` reads): `AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` (or `AWS_DEFAULT_REGION`) and, for
@@ -229,9 +237,11 @@ A plain `http://` endpoint works without further settings. `https://`
 endpoints have their certificates verified.
 
 Only the first repository on the command line serves LFS, because only the
-first has HTTP. The server refuses to start if the store cannot be reached,
-or if a repository other than the first has `lfs` in its requirements. Any
-other repository that fails to open is logged, and the others keep serving.
+first has HTTP. LFS store and repository refusals stop the server at startup:
+an invalid `--lfs-store`, `--lfs-endpoint` without an `s3://` store, a store
+that cannot be reached, a blob directory that cannot be created, or `lfs` in
+the requirements of a repository other than the first. Any other repository
+that fails to open is logged, and the others keep serving.
 
 Notes on bucket stores:
 
@@ -242,10 +252,6 @@ Notes on bucket stores:
   bucket listing does not show. Add a lifecycle rule that aborts incomplete
   multipart uploads after a few days.
 - One blob can be about 80 GB on S3 (8 MiB parts, at most 10,000 of them).
-- After a crash, files can remain in `.hg/store/lfs/objects/tmp`. They are
-  safe to delete.
-- Stream clones do not send `lfs/objects/tmp`, chunks or the store. Clients
-  fetch blobs through the LFS endpoint when they update.
 - Store errors reach clients only as `LFS storage error`. The details are in
   the server log, which can contain bucket URLs and parts of the store's
   responses, so treat the log accordingly.

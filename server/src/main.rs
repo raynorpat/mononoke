@@ -690,6 +690,7 @@ fn main() {
     if let Err(ref err) = run(repos, http_addr, http_port, https, &options, &root_log) {
         error!(root_log, "Failed: {}", err);
         log_causes(&root_log, err, false);
-        refuse_start(&root_log, &err.to_string());
+        eprintln!("mononoke: {err}");
+        std::process::exit(1);
     }
 }
